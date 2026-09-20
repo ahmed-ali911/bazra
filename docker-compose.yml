@@ -1,0 +1,44 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: bazra-postgres
+    environment:
+      POSTGRES_USER: bazra
+      POSTGRES_PASSWORD: bazra
+      POSTGRES_DB: bazra
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infrastructure/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bazra -d bazra"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # backend:
+  #   Added in Checkpoint 2 once backend/Dockerfile and the FastAPI skeleton exist.
+  #   build: ./backend
+  #   env_file: .env
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - ./backend:/app
+
+  # frontend:
+  #   Added in Checkpoint 4 once frontend/Dockerfile and the Vite skeleton exist.
+  #   build: ./frontend
+  #   ports:
+  #     - "5173:5173"
+  #   volumes:
+  #     - ./frontend:/app
+  #     - /app/node_modules
+  #   depends_on:
+  #     - backend
+
+volumes:
+  pgdata:
