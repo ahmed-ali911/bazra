@@ -2,12 +2,15 @@ from collections.abc import Generator
 
 import psycopg
 import pytest
+from alembic import command
+from alembic.config import Config
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import settings
+from app.database import get_db
 from app.main import app
 
 TEST_DB_NAME = "bazra_test"
@@ -24,8 +27,10 @@ def _test_database_url() -> str:
 
 @pytest.fixture(scope="session", autouse=True)
 def _prepare_test_database() -> Generator[None, None, None]:
-    """Drop and recreate the test database once per test session, so every
-    run starts from a clean database rather than accumulating state.
+    """Drop and recreate the test database once per test session, then apply
+    every real migration to it, so every test — not just test_migrations.py —
+    runs against actual tables produced by the actual migration files, rather
+    than a schema improvised via Base.metadata.create_all().
     """
     admin_dsn = _psycopg_dsn(settings.database_url)
     with psycopg.connect(admin_dsn, autocommit=True) as conn:
@@ -38,6 +43,11 @@ def _prepare_test_database() -> Generator[None, None, None]:
         )
         conn.execute(f"DROP DATABASE IF EXISTS {TEST_DB_NAME}")
         conn.execute(f"CREATE DATABASE {TEST_DB_NAME}")
+
+    alembic_config = Config("alembic.ini")
+    alembic_config.set_main_option("sqlalchemy.url", _test_database_url())
+    command.upgrade(alembic_config, "head")
+
     yield
 
 
@@ -58,5 +68,21 @@ def db_session(test_engine: Engine) -> Generator[Session, None, None]:
 
 
 @pytest.fixture()
-def client() -> TestClient:
-    return TestClient(app)
+def client(test_engine: Engine) -> Generator[TestClient, None, None]:
+    """TestClient wired to the test database via a get_db override, so any
+    endpoint that touches the database — auth, and every future module —
+    runs against bazra_test rather than the dev database.
+    """
+
+    def override_get_db() -> Generator[Session, None, None]:
+        session = sessionmaker(bind=test_engine)()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.pop(get_db, None)

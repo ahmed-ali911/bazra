@@ -6,6 +6,12 @@ from sqlalchemy import engine_from_config, pool
 from app.config import settings
 from app.core.base import Base
 
+# Every module's models must be imported here so their tables register on
+# Base.metadata before autogenerate compares it against the real database —
+# SQLAlchemy only populates the declarative registry for modules that have
+# actually been imported somewhere in the process.
+from app.modules.auth import models as auth_models  # noqa: F401,E402
+
 config = context.config
 
 if config.config_file_name is not None:

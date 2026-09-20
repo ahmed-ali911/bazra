@@ -4,9 +4,9 @@ from sqlalchemy.engine import Engine
 
 
 def test_alembic_upgrade_head(test_engine: Engine) -> None:
-    """Proves migrations/env.py actually connects and runs against a clean
-    database — even though there are no migration files yet, since no
-    domain model exists to generate one from.
+    """The session-scoped _prepare_test_database fixture already ran every
+    migration once against this database, so this proves the second thing
+    that matters: upgrading to head again is a safe no-op, not an error.
     """
     config = Config("alembic.ini")
     # str(test_engine.url) masks the password with '***' by default — that would
