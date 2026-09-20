@@ -7,7 +7,7 @@ services:
       POSTGRES_PASSWORD: bazra
       POSTGRES_DB: bazra
     ports:
-      - "5432:5432"
+      - "5434:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./infrastructure/docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
