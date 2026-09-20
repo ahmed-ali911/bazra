@@ -34,16 +34,17 @@ services:
     volumes:
       - ./backend:/app
 
-  # frontend:
-  #   Added in Checkpoint 4 once frontend/Dockerfile and the Vite skeleton exist.
-  #   build: ./frontend
-  #   ports:
-  #     - "5173:5173"
-  #   volumes:
-  #     - ./frontend:/app
-  #     - /app/node_modules
-  #   depends_on:
-  #     - backend
+  frontend:
+    build: ./frontend
+    container_name: bazra-frontend
+    env_file: .env
+    ports:
+      - "5174:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    depends_on:
+      - backend
 
 volumes:
   pgdata:

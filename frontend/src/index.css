@@ -1,0 +1,10 @@
+/* Minimal reset. Design tokens (design-system/tokens.css) arrive in Checkpoint 5. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+}
