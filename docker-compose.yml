@@ -17,17 +17,22 @@ services:
       timeout: 5s
       retries: 5
 
-  # backend:
-  #   Added in Checkpoint 2 once backend/Dockerfile and the FastAPI skeleton exist.
-  #   build: ./backend
-  #   env_file: .env
-  #   depends_on:
-  #     postgres:
-  #       condition: service_healthy
-  #   ports:
-  #     - "8000:8000"
-  #   volumes:
-  #     - ./backend:/app
+  backend:
+    build: ./backend
+    container_name: bazra-backend
+    env_file: .env
+    environment:
+      # Overrides .env's host-oriented DATABASE_URL (localhost:5434, for running
+      # the backend outside Docker) with the in-network address: other containers
+      # reach Postgres via the Compose service name and its internal port.
+      DATABASE_URL: postgresql+psycopg://bazra:bazra@postgres:5432/bazra
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./backend:/app
 
   # frontend:
   #   Added in Checkpoint 4 once frontend/Dockerfile and the Vite skeleton exist.
