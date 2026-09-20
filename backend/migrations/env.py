@@ -11,7 +11,12 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# A caller (e.g. a test pointing this at a separate test database) may have
+# already set sqlalchemy.url on the Config object before invoking Alembic
+# programmatically. Only fall back to the app's own settings otherwise —
+# this is what makes the `alembic` CLI keep working unchanged.
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", settings.database_url)
 
 target_metadata = Base.metadata
 
