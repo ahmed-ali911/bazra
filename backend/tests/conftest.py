@@ -29,6 +29,13 @@ def _prepare_test_database() -> Generator[None, None, None]:
     """
     admin_dsn = _psycopg_dsn(settings.database_url)
     with psycopg.connect(admin_dsn, autocommit=True) as conn:
+        # A prior run's connection to bazra_test may not have closed cleanly
+        # (crashed process, hung pool) — terminate any survivors first, or
+        # DROP DATABASE fails with "database is being accessed by other users".
+        conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s",
+            (TEST_DB_NAME,),
+        )
         conn.execute(f"DROP DATABASE IF EXISTS {TEST_DB_NAME}")
         conn.execute(f"CREATE DATABASE {TEST_DB_NAME}")
     yield
