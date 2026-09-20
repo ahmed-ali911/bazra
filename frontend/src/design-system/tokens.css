@@ -1,5 +1,23 @@
 @import "tailwindcss";
 
+/* Two token-consumption patterns are in play in this file — every component
+ * (this file's two so far, and every Phase 1 primitive after) should follow
+ * whichever one already applies to a given token, not invent a third:
+ *
+ * 1. Tokens defined in the @theme block below get ordinary Tailwind utility
+ *    classes generated for them (e.g. --color-accent -> bg-accent, rounded-*,
+ *    shadow-*). Use the plain utility class: `bg-accent`, `rounded-md`.
+ * 2. Tokens defined in the plain :root block — because their Section-5 name
+ *    already repeats the Tailwind utility prefix (--color-bg-default,
+ *    --color-text-heading, --color-border-divider, would otherwise generate
+ *    bg-bg-default / text-text-heading) or because they're spacing values
+ *    that don't fit Tailwind's own --spacing multiplier scale (--space-*) —
+ *    are consumed via arbitrary-value syntax referencing the variable
+ *    directly: `bg-[var(--color-bg-default)]`, `p-[var(--space-5)]`.
+ *
+ * Either way: components reference a token, never a raw hex/px literal.
+ */
+
 /* Primitives, verbatim from the brief's design tokens (Section 5). */
 :root {
   --color-turquoise: #149a9a;
