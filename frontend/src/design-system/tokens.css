@@ -1,0 +1,62 @@
+@import "tailwindcss";
+
+/* Primitives, verbatim from the brief's design tokens (Section 5). */
+:root {
+  --color-turquoise: #149a9a;
+  --color-teal-deep: #075a61;
+  --color-papyrus: #f6f0df;
+  --color-orange-dark: #d86620;
+  --color-orange-light: #f39a2e;
+  --color-gold: #c89b46;
+  --color-nile-mist: #ddeeee;
+  --color-ink-blue: #123847;
+
+  /* Semantic tokens whose name already repeats the Tailwind utility prefix
+     (bg-*, text-*, border-*) stay as plain custom properties, consumed via
+     Tailwind's arbitrary-value syntax (e.g. bg-[var(--color-bg-default)])
+     rather than @theme — mapping them into @theme would generate utilities
+     like bg-bg-default / text-text-heading, which is worse than just
+     referencing the variable directly. */
+  --color-bg-default: #ffffff;
+  --color-bg-subtle: var(--color-papyrus);
+  --color-bg-accent-subtle: var(--color-nile-mist);
+  --color-text-heading: var(--color-teal-deep);
+  --color-text-body: var(--color-ink-blue);
+  --color-text-muted: #5a7a7e;
+  --color-border-divider: var(--color-turquoise);
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-8: 48px;
+
+  --divider-thickness: 2px;
+  --divider-color: var(--color-accent);
+}
+
+/* Semantic tokens that map cleanly to a Tailwind utility suffix (no
+   redundant prefix) go through @theme, so components use ordinary Tailwind
+   utilities (bg-accent, rounded-md, shadow-sm, ...) that resolve to these
+   CSS variables at runtime rather than a hardcoded hex value. Radius and
+   shadow names already match Tailwind v4's own --radius- and --shadow-
+   namespaces, so this overrides Tailwind's defaults with BAZRA's values
+   app-wide — see ADR 0002 for why @theme replaces tailwind.config.ts. */
+@theme {
+  --color-accent: var(--color-turquoise);
+  --color-accent-emphasis: var(--color-teal-deep);
+
+  --color-status-success: #2e7d32;
+  --color-status-warning: var(--color-orange-light);
+  --color-status-danger: #c0392b;
+  --color-status-info: var(--color-turquoise);
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 16px;
+
+  --shadow-sm: 0 1px 2px rgba(18, 56, 71, 0.06);
+  --shadow-md: 0 4px 12px rgba(18, 56, 71, 0.1);
+}

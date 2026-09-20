@@ -1,4 +1,5 @@
-/* Minimal reset. Design tokens (design-system/tokens.css) arrive in Checkpoint 5. */
+/* Minimal reset, applying the default background/text tokens from
+   design-system/tokens.css (imported first in main.tsx). */
 
 * {
   box-sizing: border-box;
@@ -7,4 +8,6 @@
 body {
   margin: 0;
   font-family: system-ui, sans-serif;
+  background-color: var(--color-bg-default);
+  color: var(--color-text-body);
 }

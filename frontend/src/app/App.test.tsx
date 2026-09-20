@@ -8,5 +8,6 @@ describe("App", () => {
     render(<App />);
     expect(screen.getByRole("navigation", { name: "Sidebar" })).toBeInTheDocument();
     expect(screen.getByText("Welcome to BAZRA.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Get started" })).toBeInTheDocument();
   });
 });
