@@ -1,0 +1,58 @@
+# ---- Environment / secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# ---- Python (backend) ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.sqlite3
+
+# Alembic — keep migration scripts, ignore local sqlite/test artifacts only
+backend/*.db
+
+# ---- Node / Frontend ----
+node_modules/
+frontend/dist/
+frontend/build/
+.vite/
+*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- IDE ----
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# ---- macOS ----
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+
+# ---- Docker ----
+docker-compose.override.yml
+
+# ---- Logs ----
+*.log
+logs/
