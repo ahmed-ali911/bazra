@@ -1,6 +1,7 @@
 import { Button } from "../design-system/components/Button";
 import { Card } from "../design-system/components/Card";
 import { Divider } from "../design-system/components/Divider";
+import { LivingHero } from "../design-system/components/LivingHero";
 import { StatusBadge } from "../design-system/components/StatusBadge";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../design-system/components/Table";
 
@@ -9,9 +10,16 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from ".
 export function HomePlaceholder() {
   return (
     <Card>
-      <h1 className="text-[var(--color-text-heading)]">Welcome to BAZRA.</h1>
-      <p className="text-[var(--color-text-body)]">Your personal AI companion.</p>
-      <Button>Get started</Button>
+      <div style={{ display: "flex", gap: "var(--space-4)", alignItems: "flex-start" }}>
+        <LivingHero scene="home" state="idle" mood="encouraging" />
+        <div>
+          <h1 className="text-[var(--color-text-heading)]">Welcome to BAZRA.</h1>
+          <p className="text-[var(--color-text-body)]">Your personal AI companion.</p>
+          <div style={{ marginTop: "var(--space-2)" }}>
+            <Button>Get started</Button>
+          </div>
+        </div>
+      </div>
       <div style={{ margin: "var(--space-4) 0" }}>
         <Divider />
       </div>
