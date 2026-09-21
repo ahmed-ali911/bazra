@@ -49,9 +49,15 @@ recreating it, so after adding or upgrading a frontend dependency, a plain
 rebuild silently keeps serving the *old* `node_modules` and the dev server
 fails with `Cannot find package '<new-dep>'`.
 
-Fix: drop the container and its volumes before recreating, not just rebuild:
+Fix: rebuild and explicitly recreate the anonymous volume in one step:
 
 ```bash
-docker compose rm -f -v frontend
-docker compose up -d frontend
+docker compose up -d --build -V frontend
 ```
+
+(`-V` / `--renew-anon-volumes` is the flag for exactly this.) An earlier
+version of this note suggested `docker compose rm -f -v frontend` first —
+that only works if the container has already stopped/crashed; when the dev
+server is still running (the broken import only fails lazily, on first
+browser request, not at boot), `rm` refuses to remove it and the old volume
+survives. `-V` on `up` handles both cases.

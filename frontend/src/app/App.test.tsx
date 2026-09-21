@@ -7,6 +7,7 @@ describe("App", () => {
   it("renders the app shell without crashing", () => {
     render(<App />);
     expect(screen.getByRole("navigation", { name: "Sidebar" })).toBeInTheDocument();
+    expect(screen.getByRole("searchbox", { name: "Search" })).toBeInTheDocument();
     expect(screen.getByText("Welcome to BAZRA.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Get started" })).toBeInTheDocument();
   });
