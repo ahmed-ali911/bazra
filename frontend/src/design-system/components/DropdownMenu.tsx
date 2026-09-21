@@ -1,4 +1,5 @@
 import * as RadixDropdownMenu from "@radix-ui/react-dropdown-menu";
+import { Check } from "lucide-react";
 import { forwardRef } from "react";
 
 // Thin styled wrappers around @radix-ui/react-dropdown-menu. Radix's
@@ -45,6 +46,41 @@ export const DropdownMenuItem = forwardRef<HTMLDivElement, RadixDropdownMenu.Dro
   ),
 );
 DropdownMenuItem.displayName = "DropdownMenuItem";
+
+// For multi-select filtering. Unlike DropdownMenuItem, selecting a checkbox
+// does NOT close the menu — Radix's default (close on select, same as a
+// regular item) would make picking more than one filter value painfully
+// tedious. This is the only behavioral difference from DropdownMenuItem;
+// checked-state, keyboard nav, and focus handling stay entirely Radix's own.
+export const DropdownMenuCheckboxItem = forwardRef<
+  HTMLDivElement,
+  RadixDropdownMenu.DropdownMenuCheckboxItemProps
+>(({ className = "", onSelect, children, ...props }, ref) => (
+  <RadixDropdownMenu.CheckboxItem
+    ref={ref}
+    onSelect={(event) => {
+      event.preventDefault();
+      onSelect?.(event);
+    }}
+    className={[
+      "flex items-center gap-[var(--space-2)] px-[var(--space-2)] py-[var(--space-2)] rounded-md text-[var(--color-text-body)]",
+      "data-[highlighted]:bg-[var(--color-bg-accent-subtle)] data-[highlighted]:text-accent",
+      "outline-none cursor-pointer",
+      className,
+    ].join(" ")}
+    {...props}
+  >
+    {/* Fixed-width slot so checked/unchecked items in the same menu don't
+        shift their label text depending on whether the check mark renders. */}
+    <span style={{ width: 14, display: "inline-flex" }}>
+      <RadixDropdownMenu.ItemIndicator>
+        <Check size={14} aria-hidden="true" />
+      </RadixDropdownMenu.ItemIndicator>
+    </span>
+    {children}
+  </RadixDropdownMenu.CheckboxItem>
+));
+DropdownMenuCheckboxItem.displayName = "DropdownMenuCheckboxItem";
 
 export const DropdownMenuSeparator = forwardRef<HTMLDivElement, RadixDropdownMenu.DropdownMenuSeparatorProps>(
   ({ className = "", ...props }, ref) => (
