@@ -1,16 +1,37 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useState } from "react";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 
 import { AppShell } from "./AppShell";
 import { HomePlaceholder } from "./HomePlaceholder";
+import { LoginPage } from "./LoginPage";
+import { RequireAuth } from "./RequireAuth";
 
 export function App() {
+  // Created in component state, not module scope: a fresh QueryClient per
+  // mount keeps test renders isolated from each other (no cache leaking
+  // between tests), while the real app only ever mounts App once anyway.
+  const [queryClient] = useState(
+    () =>
+      new QueryClient({
+        defaultOptions: {
+          queries: { retry: 1, refetchOnWindowFocus: false },
+        },
+      }),
+  );
+
   return (
-    <BrowserRouter>
-      <Routes>
-        <Route element={<AppShell />}>
-          <Route path="/" element={<HomePlaceholder />} />
-        </Route>
-      </Routes>
-    </BrowserRouter>
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Routes>
+          <Route path="/login" element={<LoginPage />} />
+          <Route element={<RequireAuth />}>
+            <Route element={<AppShell />}>
+              <Route path="/" element={<HomePlaceholder />} />
+            </Route>
+          </Route>
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>
   );
 }

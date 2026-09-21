@@ -11,5 +11,10 @@ class Settings(BaseSettings):
     session_cookie_name: str = "bazra_session"
     session_cookie_secure: bool = False
 
+    # Browser-facing origin of the frontend dev server — local dev fallback
+    # only; override via CORS_ALLOWED_ORIGIN if the frontend port ever
+    # changes again (see the port-remap history in the root README).
+    cors_allowed_origin: str = "http://localhost:5174"
+
 
 settings = Settings()
