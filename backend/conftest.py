@@ -86,3 +86,31 @@ def client(test_engine: Engine) -> Generator[TestClient, None, None]:
         yield TestClient(app)
     finally:
         app.dependency_overrides.pop(get_db, None)
+
+
+@pytest.fixture()
+def authenticated_client(client: TestClient, db_session: Session) -> TestClient:
+    """A TestClient with a valid session cookie already set, for tests of
+    modules that require auth but aren't testing auth itself (every module
+    from Checkpoint 2.2 onward). Idempotently ensures the single test User
+    row has a known password, regardless of what earlier tests in this
+    session left behind — same pattern as auth's own test_user fixture,
+    duplicated in this one small place rather than importing across
+    modules' test internals.
+    """
+    from app.modules.auth import service as auth_service
+    from app.modules.auth.models import User
+
+    password = "test-password-for-authenticated-client"  # noqa: S105
+    user = auth_service.get_the_user(db_session)
+    password_hash = auth_service.hash_password(password)
+    if user is None:
+        user = User(password_hash=password_hash)
+        db_session.add(user)
+    else:
+        user.password_hash = password_hash
+    db_session.commit()
+
+    response = client.post("/api/v1/auth/login", json={"password": password})
+    assert response.status_code == 200
+    return client

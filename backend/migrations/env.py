@@ -11,6 +11,9 @@ from app.core.base import Base
 # SQLAlchemy only populates the declarative registry for modules that have
 # actually been imported somewhere in the process.
 from app.modules.auth import models as auth_models  # noqa: F401,E402
+from app.modules.life_areas import models as life_areas_models  # noqa: F401,E402
+from app.modules.spaces import models as spaces_models  # noqa: F401,E402
+from app.modules.tasks import models as tasks_models  # noqa: F401,E402
 
 config = context.config
 

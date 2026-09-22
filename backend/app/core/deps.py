@@ -5,6 +5,7 @@ from app.config import settings
 from app.database import get_db
 from app.modules.auth import service
 from app.modules.auth.models import User
+from app.modules.spaces import service as spaces_service
 
 
 def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
@@ -18,3 +19,11 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
         if user is not None:
             return user
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+
+def get_current_space_id(db: Session = Depends(get_db)) -> int:
+    """Resolves to the one default space — no space-switcher UI exists yet,
+    so there is nothing for the frontend to choose. Every space-scoped
+    route depends on this alongside get_current_user.
+    """
+    return spaces_service.get_default_space(db).id

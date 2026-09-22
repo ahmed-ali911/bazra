@@ -3,10 +3,14 @@ import { Card } from "../design-system/components/Card";
 import { Divider } from "../design-system/components/Divider";
 import { LivingHero } from "../design-system/components/LivingHero";
 import { StatusBadge } from "../design-system/components/StatusBadge";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "../design-system/components/Table";
+import { TasksProbe } from "../features/tasks/TasksProbe";
 
 // The "/" route's page content, extracted from the old Layout.tsx —
-// AppShell now provides the sidebar/top-nav chrome around it.
+// AppShell now provides the sidebar/top-nav chrome around it. The task
+// list below is a real, minimum probe UI against the real Tasks API
+// (Checkpoint 2.2), not a designed Home screen — replaces the earlier
+// static demo table, which had unintentionally carried over sample
+// phrases from the Home reference image (flagged and agreed to fix here).
 export function HomePlaceholder() {
   return (
     <Card>
@@ -25,24 +29,7 @@ export function HomePlaceholder() {
       </div>
       <StatusBadge variant="success">On track</StatusBadge>
       <div style={{ marginTop: "var(--space-4)" }}>
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Task</TableHead>
-              <TableHead align="right">Due</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            <TableRow>
-              <TableCell>Review credit analysis model</TableCell>
-              <TableCell align="right">10:00 AM</TableCell>
-            </TableRow>
-            <TableRow>
-              <TableCell>German lesson A2</TableCell>
-              <TableCell align="right">2:00 PM</TableCell>
-            </TableRow>
-          </TableBody>
-        </Table>
+        <TasksProbe />
       </div>
     </Card>
   );
