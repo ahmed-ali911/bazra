@@ -16,5 +16,10 @@ class Settings(BaseSettings):
     # changes again (see the port-remap history in the root README).
     cors_allowed_origin: str = "http://localhost:5174"
 
+    # Phase 3 (AI Core), Checkpoint 3.1. Never logged, never persisted —
+    # see model_router/service.py's explicit tests that no trace row or
+    # log line ever contains this value.
+    anthropic_api_key: str | None = None
+
 
 settings = Settings()

@@ -14,6 +14,7 @@ from app.modules.auth import models as auth_models  # noqa: F401,E402
 from app.modules.calendar import models as calendar_models  # noqa: F401,E402
 from app.modules.inbox import models as inbox_models  # noqa: F401,E402
 from app.modules.life_areas import models as life_areas_models  # noqa: F401,E402
+from app.modules.model_router import models as model_router_models  # noqa: F401,E402
 from app.modules.spaces import models as spaces_models  # noqa: F401,E402
 from app.modules.tasks import models as tasks_models  # noqa: F401,E402
 
