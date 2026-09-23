@@ -30,6 +30,9 @@ export function useUpdateTask() {
       // into or out of Home's Focus Today/Coming Up/Anytime buckets, or
       // add a new Needs Attention item.
       queryClient.invalidateQueries({ queryKey: ["home"] });
+      // Reassigning life_area_id changes two areas' (or Unassigned's)
+      // open-task counts and most-urgent-task in My World.
+      queryClient.invalidateQueries({ queryKey: ["life-areas"] });
     },
   });
 }

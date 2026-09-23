@@ -89,6 +89,43 @@ def test_create_with_valid_life_area(authenticated_client: TestClient) -> None:
     assert response.json()["life_area_id"] == work["id"]
 
 
+def test_life_area_id_filter(authenticated_client: TestClient) -> None:
+    life_areas = authenticated_client.get("/api/v1/life-areas").json()
+    work = next(area for area in life_areas if area["slug"] == "work")
+
+    in_area = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "In work area", "life_area_id": work["id"]}
+    ).json()
+    unassigned = authenticated_client.post("/api/v1/tasks", json={"title": "No area"}).json()
+
+    filtered = authenticated_client.get(f"/api/v1/tasks?life_area_id={work['id']}").json()
+    ids = [t["id"] for t in filtered]
+    assert in_area["id"] in ids
+    assert unassigned["id"] not in ids
+
+
+def test_unassigned_filter(authenticated_client: TestClient) -> None:
+    life_areas = authenticated_client.get("/api/v1/life-areas").json()
+    work = next(area for area in life_areas if area["slug"] == "work")
+
+    in_area = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "In work area for unassigned test", "life_area_id": work["id"]}
+    ).json()
+    unassigned = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "No area for unassigned test"}
+    ).json()
+
+    filtered = authenticated_client.get("/api/v1/tasks?unassigned=true").json()
+    ids = [t["id"] for t in filtered]
+    assert unassigned["id"] in ids
+    assert in_area["id"] not in ids
+
+
+def test_life_area_id_and_unassigned_together_returns_422(authenticated_client: TestClient) -> None:
+    response = authenticated_client.get("/api/v1/tasks?life_area_id=1&unassigned=true")
+    assert response.status_code == 422
+
+
 def test_tasks_require_authentication(client: TestClient) -> None:
     assert client.get("/api/v1/tasks").status_code == 401
     assert client.post("/api/v1/tasks", json={"title": "x"}).status_code == 401

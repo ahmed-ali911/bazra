@@ -18,11 +18,18 @@ def _validate_life_area(db: Session, life_area_id: int | None) -> None:
 @router.get("/tasks", response_model=list[TaskResponse])
 def list_tasks(
     status_filter: TaskStatus | None = Query(default=None, alias="status"),
+    life_area_id: int | None = Query(default=None),
+    unassigned: bool | None = Query(default=None),
     db: Session = Depends(get_db),
     space_id: int = Depends(get_current_space_id),
     _user=Depends(get_current_user),
 ) -> list[TaskResponse]:
-    tasks = service.list_tasks(db, space_id, status=status_filter)
+    if unassigned and life_area_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="life_area_id and unassigned are mutually exclusive",
+        )
+    tasks = service.list_tasks(db, space_id, status=status_filter, life_area_id=life_area_id, unassigned=unassigned)
     return [TaskResponse.model_validate(task) for task in tasks]
 
 

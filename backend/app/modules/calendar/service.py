@@ -1,12 +1,23 @@
 from datetime import datetime, timezone
 
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
 from app.modules.calendar.models import CalendarEvent
 from app.modules.calendar.schemas import AgendaItem, CalendarEventCreate, CalendarEventUpdate
 from app.modules.tasks import service as tasks_service
+
+
+def count_events_by_life_area(db: Session, life_area_id: int) -> int:
+    """GLOBAL count (no space_id filter), regardless of archived_at —
+    see tasks_service.count_tasks_by_life_area's docstring for why this
+    is deliberately unscoped: it must match exactly what the database's
+    own FK constraint would block life-area deletion on.
+    """
+    return db.execute(
+        select(func.count()).select_from(CalendarEvent).where(CalendarEvent.life_area_id == life_area_id)
+    ).scalar_one()
 
 
 def get_calendar_event(db: Session, space_id: int, event_id: int) -> CalendarEvent | None:

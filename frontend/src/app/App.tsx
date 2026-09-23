@@ -2,6 +2,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 
+import { LifeAreaDetailPage } from "../features/life-areas/LifeAreaDetailPage";
+import { MyWorldPage } from "../features/life-areas/MyWorldPage";
 import { AppShell } from "./AppShell";
 import { HomePlaceholder } from "./HomePlaceholder";
 import { LoginPage } from "./LoginPage";
@@ -28,6 +30,8 @@ export function App() {
           <Route element={<RequireAuth />}>
             <Route element={<AppShell />}>
               <Route path="/" element={<HomePlaceholder />} />
+              <Route path="/my-world" element={<MyWorldPage />} />
+              <Route path="/my-world/:lifeAreaId" element={<LifeAreaDetailPage />} />
             </Route>
           </Route>
         </Routes>

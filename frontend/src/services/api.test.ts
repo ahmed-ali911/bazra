@@ -61,6 +61,24 @@ describe("api", () => {
     await expect(api.get("/test")).rejects.toMatchObject({ status: 500, message: "Internal Server Error" });
   });
 
+  it("preserves a structured (non-string) detail object on .detail, separate from .message", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 400,
+        statusText: "Bad Request",
+        json: async () => ({ detail: { error: "life_area_has_linked_items", task_count: 3 } }),
+      }),
+    );
+
+    await expect(api.get("/test")).rejects.toMatchObject({
+      status: 400,
+      message: "Bad Request", // detail isn't a string, so message falls back to statusText
+      detail: { error: "life_area_has_linked_items", task_count: 3 },
+    });
+  });
+
   it("propagates a network failure as-is, distinguishable from ApiError", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new TypeError("Failed to fetch")));
 

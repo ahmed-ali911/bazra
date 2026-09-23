@@ -1,12 +1,9 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "../../services/api";
+import type { LifeArea } from "./types";
 
-export interface LifeArea {
-  id: number;
-  name: string;
-  slug: string;
-}
+export type { LifeArea };
 
 export function useLifeAreas() {
   return useQuery({

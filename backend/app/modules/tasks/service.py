@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
@@ -8,12 +9,62 @@ from app.modules.tasks.models import Task
 from app.modules.tasks.schemas import TaskCreate, TaskUpdate
 
 
-def list_tasks(db: Session, space_id: int, status: str | None = None) -> list[Task]:
+def list_tasks(
+    db: Session,
+    space_id: int,
+    status: str | None = None,
+    life_area_id: int | None = None,
+    unassigned: bool | None = None,
+) -> list[Task]:
+    """The general task-list/filter endpoint — life_area_id and
+    unassigned are mutually exclusive by construction here (the router
+    rejects sending both before this is ever called); unassigned=True
+    filters to life_area_id IS NULL, otherwise an explicit life_area_id
+    filters to an exact match.
+    """
     query = scoped_query(Task, space_id).where(Task.archived_at.is_(None))
     if status is not None:
         query = query.where(Task.status == status)
+    if unassigned:
+        query = query.where(Task.life_area_id.is_(None))
+    elif life_area_id is not None:
+        query = query.where(Task.life_area_id == life_area_id)
     query = query.order_by(Task.due_at.asc().nulls_last(), Task.created_at.desc())
     return list(db.execute(query).scalars().all())
+
+
+def count_tasks_by_life_area(db: Session, life_area_id: int) -> int:
+    """GLOBAL count (no space_id filter) of ALL tasks referencing this
+    life area, regardless of status or archived_at — deliberately
+    unscoped and unfiltered, because this exists to answer "how many
+    rows would block deleting this life area", which is exactly what
+    Postgres's own FK constraint checks against: every row, in every
+    space, archived or not, done or not. Not to be confused with
+    summarize_open_tasks_by_life_area below, which IS space-scoped and
+    open-only, for a completely different purpose (what My World
+    displays to the current space's user).
+    """
+    return db.execute(
+        select(func.count()).select_from(Task).where(Task.life_area_id == life_area_id)
+    ).scalar_one()
+
+
+def summarize_open_tasks_by_life_area(db: Session, space_id: int) -> dict[int | None, tuple[int, datetime | None]]:
+    """count + MOST URGENT due_at (SQL MIN, which ignores NULL due_at,
+    and includes overdue tasks — an overdue task IS the most urgent
+    thing in that area, not something this hides) of OPEN, non-archived
+    tasks in this space, grouped by life_area_id. Includes a None key
+    for Unassigned. One GROUP BY query, not N+1 per area. Space-scoped
+    and open-only — the opposite of count_tasks_by_life_area above,
+    which is deliberately global and status-agnostic for a different
+    purpose (deletion-safety counting, not display).
+    """
+    rows = db.execute(
+        select(Task.life_area_id, func.count(), func.min(Task.due_at))
+        .where(Task.space_id == space_id, Task.status == "open", Task.archived_at.is_(None))
+        .group_by(Task.life_area_id)
+    ).all()
+    return {row[0]: (row[1], row[2]) for row in rows}
 
 
 def list_tasks_due_between(db: Session, space_id: int, from_at: datetime, to_at: datetime) -> list[Task]:

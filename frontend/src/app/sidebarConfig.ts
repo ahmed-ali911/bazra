@@ -1,4 +1,4 @@
-import { Home } from "lucide-react";
+import { Globe, Home } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 export interface SidebarItem {
@@ -15,4 +15,5 @@ export interface SidebarItem {
 // entry here, nothing that consumes this array needs to change.
 export const sidebarConfig: SidebarItem[] = [
   { id: "home", label: "Home", href: "/", icon: Home, enabled: true },
+  { id: "my-world", label: "My World", href: "/my-world", icon: Globe, enabled: true },
 ];

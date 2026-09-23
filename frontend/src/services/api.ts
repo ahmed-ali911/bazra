@@ -6,10 +6,13 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 // - successful JSON response -> parsed typed value
 // - successful response with no body (e.g. 204) -> undefined, no JSON parse
 //   attempted
-// - non-2xx JSON backend error -> ApiError(status, detail) using the
-//   backend's own `detail` message when present
+// - non-2xx JSON backend error -> ApiError(status, message, detail) using
+//   the backend's own `detail` as the message when it's a string; the
+//   raw `detail` value (string OR object — e.g. Life Area's blocked-
+//   deletion body) is always preserved on .detail, for callers that need
+//   structured error data, not just a display string
 // - non-2xx response without usable JSON -> ApiError with a safe fallback
-//   message (statusText, or a generic one)
+//   message (statusText, or a generic one), .detail left undefined
 // - network/fetch failure (offline, DNS, connection refused, CORS
 //   rejection, ...) never reaches an HTTP status at all — rethrown as-is,
 //   NEVER wrapped as ApiError, so callers (e.g. RequireAuth) can tell "the
@@ -17,11 +20,13 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 //   matching error messages.
 export class ApiError extends Error {
   status: number;
+  detail: unknown;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, detail?: unknown) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.detail = detail;
   }
 }
 
@@ -33,16 +38,18 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   });
 
   if (!response.ok) {
-    let detail = response.statusText || `Request failed with status ${response.status}`;
+    let message = response.statusText || `Request failed with status ${response.status}`;
+    let detail: unknown;
     try {
       const body = await response.json();
+      detail = body?.detail;
       if (typeof body?.detail === "string") {
-        detail = body.detail;
+        message = body.detail;
       }
     } catch {
       // non-JSON or empty error body — keep the statusText fallback above
     }
-    throw new ApiError(response.status, detail);
+    throw new ApiError(response.status, message, detail);
   }
 
   if (response.status === 204) {
