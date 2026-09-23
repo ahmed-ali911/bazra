@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
+from app.modules.inbox import service as inbox_service
 from app.modules.tasks.models import Task
 from app.modules.tasks.schemas import TaskCreate, TaskUpdate
 
@@ -50,19 +51,42 @@ def update_task(db: Session, space_id: int, task_id: int, data: TaskUpdate) -> T
         return None
 
     updates = data.model_dump(exclude_unset=True)
+    previous_status = task.status
 
     # completed_at is derived from a status transition, never client-supplied
     # directly — set it as a side effect here, in the one place status
     # actually changes.
+    just_completed = False
     if "status" in updates:
         new_status = updates["status"]
-        if new_status == "done" and task.status != "done":
+        if new_status == "done" and previous_status != "done":
             task.completed_at = datetime.now(timezone.utc)
-        elif new_status != "done" and task.status == "done":
+            just_completed = True
+        elif new_status != "done" and previous_status == "done":
             task.completed_at = None
 
     for field, value in updates.items():
         setattr(task, field, value)
+
+    # Fires only on the open -> done edge (never on an update that leaves
+    # status alone, and never twice for two updates that both merely keep
+    # status at "done"), so an already-done task doesn't accumulate a new
+    # InboxItem on every unrelated field edit. Runs after the field-update
+    # loop above (so a request that renames AND completes a task in one
+    # PATCH snapshots the NEW title), but with commit=False — the insert
+    # joins the SAME transaction as the Task's own field changes below, so
+    # one db.commit() persists both together, or, on failure, rolls back
+    # both. Without this, a Task could end up durably "done" with no
+    # corresponding InboxItem if the insert failed after an earlier,
+    # separate Task commit had already succeeded. This is an MVP
+    # integration trigger to establish and verify the write-time Inbox
+    # flow — not a frozen rule that every completed task must generate an
+    # inbox item; which events do so is expected to evolve with future
+    # Attention/Automation capabilities (Phase 7).
+    if just_completed:
+        inbox_service.create_item(
+            db, space_id, task_id=task.id, title=f"Completed: {task.title}", commit=False
+        )
 
     db.commit()
     db.refresh(task)

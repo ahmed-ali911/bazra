@@ -22,6 +22,10 @@ export function useUpdateTask() {
       // this task appears in Calendar's agenda — keep an open agenda view
       // in sync too.
       queryClient.invalidateQueries({ queryKey: ["calendar"] });
+      // Marking a task done can generate a new InboxItem server-side
+      // (tasks.service's open->done trigger) — an open Inbox view has no
+      // other way to know that happened.
+      queryClient.invalidateQueries({ queryKey: ["inbox"] });
     },
   });
 }

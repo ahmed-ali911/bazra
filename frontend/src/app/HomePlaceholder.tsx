@@ -4,6 +4,7 @@ import { Divider } from "../design-system/components/Divider";
 import { LivingHero } from "../design-system/components/LivingHero";
 import { StatusBadge } from "../design-system/components/StatusBadge";
 import { CalendarProbe } from "../features/calendar/CalendarProbe";
+import { InboxProbe } from "../features/inbox/InboxProbe";
 import { TasksProbe } from "../features/tasks/TasksProbe";
 
 // The "/" route's page content, extracted from the old Layout.tsx —
@@ -37,6 +38,12 @@ export function HomePlaceholder() {
       </div>
       <div>
         <CalendarProbe />
+      </div>
+      <div style={{ margin: "var(--space-4) 0" }}>
+        <Divider />
+      </div>
+      <div>
+        <InboxProbe />
       </div>
     </Card>
   );

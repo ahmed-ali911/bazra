@@ -28,6 +28,9 @@ describe("App", () => {
         if (url.includes("/life-areas")) {
           return { ok: true, status: 200, json: async () => [] };
         }
+        if (url.includes("/inbox")) {
+          return { ok: true, status: 200, json: async () => [] };
+        }
         throw new Error(`Unexpected fetch in App.test.tsx: ${url}`);
       }),
     );
@@ -45,5 +48,6 @@ describe("App", () => {
     expect(screen.getByRole("button", { name: "Get started" })).toBeInTheDocument();
     expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
     expect(await screen.findByText("Nothing on the calendar")).toBeInTheDocument();
+    expect(await screen.findByText("Inbox is empty")).toBeInTheDocument();
   });
 });
