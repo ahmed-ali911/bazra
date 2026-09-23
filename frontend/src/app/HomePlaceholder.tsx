@@ -3,6 +3,7 @@ import { Card } from "../design-system/components/Card";
 import { Divider } from "../design-system/components/Divider";
 import { LivingHero } from "../design-system/components/LivingHero";
 import { StatusBadge } from "../design-system/components/StatusBadge";
+import { CalendarProbe } from "../features/calendar/CalendarProbe";
 import { TasksProbe } from "../features/tasks/TasksProbe";
 
 // The "/" route's page content, extracted from the old Layout.tsx —
@@ -30,6 +31,12 @@ export function HomePlaceholder() {
       <StatusBadge variant="success">On track</StatusBadge>
       <div style={{ marginTop: "var(--space-4)" }}>
         <TasksProbe />
+      </div>
+      <div style={{ margin: "var(--space-4) 0" }}>
+        <Divider />
+      </div>
+      <div>
+        <CalendarProbe />
       </div>
     </Card>
   );

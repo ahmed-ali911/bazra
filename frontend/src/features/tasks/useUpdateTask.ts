@@ -18,6 +18,10 @@ export function useUpdateTask() {
     mutationFn: ({ id, ...data }: UpdateTaskInput) => api.patch<Task>(`/api/v1/tasks/${id}`, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      // due_at (or status/archival, via a future edit) can change whether
+      // this task appears in Calendar's agenda — keep an open agenda view
+      // in sync too.
+      queryClient.invalidateQueries({ queryKey: ["calendar"] });
     },
   });
 }

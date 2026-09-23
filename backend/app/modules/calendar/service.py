@@ -1,0 +1,120 @@
+from datetime import datetime, timezone
+
+from sqlalchemy import and_, or_
+from sqlalchemy.orm import Session
+
+from app.core.space_scoping import scoped_query
+from app.modules.calendar.models import CalendarEvent
+from app.modules.calendar.schemas import AgendaItem, CalendarEventCreate, CalendarEventUpdate
+from app.modules.tasks import service as tasks_service
+
+
+def get_calendar_event(db: Session, space_id: int, event_id: int) -> CalendarEvent | None:
+    query = scoped_query(CalendarEvent, space_id).where(
+        CalendarEvent.id == event_id, CalendarEvent.archived_at.is_(None)
+    )
+    return db.execute(query).scalar_one_or_none()
+
+
+def create_calendar_event(db: Session, space_id: int, data: CalendarEventCreate) -> CalendarEvent:
+    event = CalendarEvent(space_id=space_id, **data.model_dump())
+    db.add(event)
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def update_calendar_event(db: Session, space_id: int, event_id: int, data: CalendarEventUpdate) -> CalendarEvent | None:
+    event = get_calendar_event(db, space_id, event_id)
+    if event is None:
+        return None
+
+    updates = data.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(event, field, value)
+
+    # Validated against the MERGED result, not the raw payload — a partial
+    # update may only include one of starts_at/ends_at.
+    if event.ends_at is not None and event.ends_at < event.starts_at:
+        raise ValueError("ends_at must be >= starts_at")
+
+    db.commit()
+    db.refresh(event)
+    return event
+
+
+def delete_calendar_event(db: Session, space_id: int, event_id: int) -> bool:
+    """Soft delete: sets archived_at, same reasoning as Task.delete_task —
+    protects a future Inbox reference from dangling."""
+    event = get_calendar_event(db, space_id, event_id)
+    if event is None:
+        return False
+    event.archived_at = datetime.now(timezone.utc)
+    db.commit()
+    return True
+
+
+def _list_calendar_events_overlapping(
+    db: Session, space_id: int, from_at: datetime, to_at: datetime
+) -> list[CalendarEvent]:
+    """Interval-overlap semantics against the half-open agenda range
+    [from_at, to_at) — not "starts_at is inside the range". A ranged event
+    [starts_at, ends_at] (closed at both its own ends) overlaps the agenda
+    range if starts_at < to_at AND ends_at >= from_at. A point event
+    (ends_at is null) uses the same half-open point semantics as
+    Task.due_at: from_at <= starts_at < to_at.
+    """
+    overlap = or_(
+        and_(
+            CalendarEvent.ends_at.is_not(None),
+            CalendarEvent.starts_at < to_at,
+            CalendarEvent.ends_at >= from_at,
+        ),
+        and_(
+            CalendarEvent.ends_at.is_(None),
+            CalendarEvent.starts_at >= from_at,
+            CalendarEvent.starts_at < to_at,
+        ),
+    )
+    query = scoped_query(CalendarEvent, space_id).where(CalendarEvent.archived_at.is_(None)).where(overlap)
+    return list(db.execute(query).scalars().all())
+
+
+def build_agenda(db: Session, space_id: int, from_at: datetime, to_at: datetime) -> list[AgendaItem]:
+    """The read-model: CalendarEvent rows + Task rows with due_at in range,
+    merged and sorted in Python (not a SQL UNION — that would mean reaching
+    into Task's table/columns directly, breaking the "cross-module reads go
+    through the other module's service.py" convention). Nothing here
+    duplicates or stores Task data; both sources are queried fresh.
+    """
+    if to_at <= from_at:
+        raise ValueError("to must be after from")
+
+    events = _list_calendar_events_overlapping(db, space_id, from_at, to_at)
+    tasks = tasks_service.list_tasks_due_between(db, space_id, from_at, to_at)
+
+    items = [
+        AgendaItem(
+            source="event",
+            id=event.id,
+            title=event.title,
+            starts_at=event.starts_at,
+            ends_at=event.ends_at,
+            life_area_id=event.life_area_id,
+        )
+        for event in events
+    ] + [
+        AgendaItem(
+            source="task",
+            id=task.id,
+            title=task.title,
+            # due_at is guaranteed non-null here — list_tasks_due_between
+            # only returns tasks whose due_at falls in [from_at, to_at).
+            starts_at=task.due_at,  # type: ignore[arg-type]
+            ends_at=None,
+            life_area_id=task.life_area_id,
+        )
+        for task in tasks
+    ]
+    items.sort(key=lambda item: item.starts_at)
+    return items

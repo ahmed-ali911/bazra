@@ -16,6 +16,9 @@ export function useCreateTask() {
     mutationFn: (data: CreateTaskInput) => api.post<Task>("/api/v1/tasks", data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
+      // A task with a due_at can appear in Calendar's agenda read-model —
+      // an open agenda view needs to refetch too, not just the task list.
+      queryClient.invalidateQueries({ queryKey: ["calendar"] });
     },
   });
 }

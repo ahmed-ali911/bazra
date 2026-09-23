@@ -13,10 +13,13 @@ import { useTasks } from "./useTasks";
 import { useUpdateTask } from "./useUpdateTask";
 
 // Minimum probe UI proving real CRUD against the real API — not a designed
-// Tasks screen. Final composition waits for a written screen spec.
+// Tasks screen. Final composition waits for a written screen spec. due_at
+// is editable here (not just at creation) because Calendar's agenda
+// read-model depends on it changing through this real mutation path.
 export function TasksProbe() {
   const [title, setTitle] = useState("");
   const [lifeAreaId, setLifeAreaId] = useState("");
+  const [dueAt, setDueAt] = useState("");
 
   const { data: tasks, isPending, error, refetch } = useTasks();
   const { data: lifeAreas } = useLifeAreas();
@@ -28,8 +31,17 @@ export function TasksProbe() {
     event.preventDefault();
     if (!title.trim()) return;
     createTask.mutate(
-      { title, life_area_id: lifeAreaId ? Number(lifeAreaId) : undefined },
-      { onSuccess: () => setTitle("") },
+      {
+        title,
+        life_area_id: lifeAreaId ? Number(lifeAreaId) : undefined,
+        due_at: dueAt ? new Date(dueAt).toISOString() : undefined,
+      },
+      {
+        onSuccess: () => {
+          setTitle("");
+          setDueAt("");
+        },
+      },
     );
   }
 
@@ -54,6 +66,14 @@ export function TasksProbe() {
           className="rounded-md bg-[var(--color-bg-subtle)] text-[var(--color-text-body)]"
           style={{ padding: "8px 12px", border: "none", flex: 1 }}
         />
+        <input
+          type="datetime-local"
+          aria-label="Due date"
+          value={dueAt}
+          onChange={(event) => setDueAt(event.target.value)}
+          className="rounded-md bg-[var(--color-bg-subtle)] text-[var(--color-text-body)]"
+          style={{ padding: "8px 12px", border: "none" }}
+        />
         <select
           aria-label="Life area"
           value={lifeAreaId}
@@ -77,6 +97,7 @@ export function TasksProbe() {
             <TableRow>
               <TableHead>Done</TableHead>
               <TableHead>Title</TableHead>
+              <TableHead>Due</TableHead>
               <TableHead align="right">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -94,6 +115,21 @@ export function TasksProbe() {
                   />
                 </TableCell>
                 <TableCell>{task.title}</TableCell>
+                <TableCell>
+                  <input
+                    type="datetime-local"
+                    aria-label={`Due date for "${task.title}"`}
+                    defaultValue={task.due_at ? task.due_at.slice(0, 16) : ""}
+                    onBlur={(event) =>
+                      updateTask.mutate({
+                        id: task.id,
+                        due_at: event.target.value ? new Date(event.target.value).toISOString() : null,
+                      })
+                    }
+                    className="rounded-md bg-[var(--color-bg-subtle)] text-[var(--color-text-body)]"
+                    style={{ padding: "4px 8px", border: "none" }}
+                  />
+                </TableCell>
                 <TableCell align="right">
                   <button
                     type="button"

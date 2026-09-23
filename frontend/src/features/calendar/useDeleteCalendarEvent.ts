@@ -2,13 +2,11 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "../../services/api";
 
-export function useDeleteTask() {
+export function useDeleteCalendarEvent() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: number) => api.delete<void>(`/api/v1/tasks/${id}`),
+    mutationFn: (id: number) => api.delete<void>(`/api/v1/calendar/events/${id}`),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["tasks"] });
-      // Archiving removes this task from Calendar's agenda too.
       queryClient.invalidateQueries({ queryKey: ["calendar"] });
     },
   });

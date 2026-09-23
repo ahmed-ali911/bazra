@@ -15,6 +15,22 @@ def list_tasks(db: Session, space_id: int, status: str | None = None) -> list[Ta
     return list(db.execute(query).scalars().all())
 
 
+def list_tasks_due_between(db: Session, space_id: int, from_at: datetime, to_at: datetime) -> list[Task]:
+    """Narrow, single-purpose query for Calendar's agenda read-model —
+    not a general filtering API. Half-open range [from_at, to_at):
+    from_at <= due_at < to_at, so a task due exactly at from_at is
+    included and one due exactly at to_at is not, keeping adjacent
+    agenda ranges from double-counting a boundary task.
+    """
+    query = (
+        scoped_query(Task, space_id)
+        .where(Task.archived_at.is_(None))
+        .where(Task.due_at >= from_at, Task.due_at < to_at)
+        .order_by(Task.due_at.asc())
+    )
+    return list(db.execute(query).scalars().all())
+
+
 def get_task(db: Session, space_id: int, task_id: int) -> Task | None:
     query = scoped_query(Task, space_id).where(Task.id == task_id, Task.archived_at.is_(None))
     return db.execute(query).scalar_one_or_none()

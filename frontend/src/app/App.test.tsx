@@ -5,11 +5,12 @@ import { App } from "./App";
 
 describe("App", () => {
   // "/" is now gated behind RequireAuth (Checkpoint 2.1), and its content
-  // (Checkpoint 2.2's TasksProbe) fetches tasks/life-areas too — mock every
-  // endpoint it actually calls rather than one blanket response, so this
-  // test exercises the real guarded route and the real page, not a
-  // coincidentally-shaped stub. Content only appears once those async
-  // calls resolve, hence findByRole/findByText below instead of getBy*.
+  // (TasksProbe, CalendarProbe) fetches tasks/life-areas/calendar agenda
+  // too — mock every endpoint it actually calls rather than one blanket
+  // response, so this test exercises the real guarded route and the real
+  // page, not a coincidentally-shaped stub. Content only appears once
+  // those async calls resolve, hence findByRole/findByText below instead
+  // of getBy*.
   beforeEach(() => {
     vi.stubGlobal(
       "fetch",
@@ -17,6 +18,9 @@ describe("App", () => {
         const url = typeof input === "string" ? input : input.toString();
         if (url.includes("/auth/me")) {
           return { ok: true, status: 200, json: async () => ({ authenticated: true }) };
+        }
+        if (url.includes("/calendar/agenda")) {
+          return { ok: true, status: 200, json: async () => [] };
         }
         if (url.includes("/tasks")) {
           return { ok: true, status: 200, json: async () => [] };
@@ -40,5 +44,6 @@ describe("App", () => {
     expect(screen.getByText("Welcome to BAZRA.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Get started" })).toBeInTheDocument();
     expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
+    expect(await screen.findByText("Nothing on the calendar")).toBeInTheDocument();
   });
 });

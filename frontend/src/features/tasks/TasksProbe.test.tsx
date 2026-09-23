@@ -69,4 +69,23 @@ describe("TasksProbe", () => {
     expect(postCall).toBeDefined();
     expect(JSON.parse(postCall![1].body as string)).toMatchObject({ title: "New task" });
   });
+
+  it("updates due_at when the due-date input loses focus", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockFetchSequence([
+      { ok: true, status: 200, body: [{ id: 1, title: "Write report", status: "open", life_area_id: null, due_at: null }] },
+      { ok: true, status: 200, body: [] },
+    ]);
+
+    renderWithQueryClient(<TasksProbe />);
+    const dueInput = await screen.findByLabelText('Due date for "Write report"');
+
+    await user.type(dueInput, "2026-06-15T09:30");
+    await user.tab(); // blur
+
+    const patchCall = fetchMock.mock.calls.find(([, options]) => options?.method === "PATCH");
+    expect(patchCall).toBeDefined();
+    const body = JSON.parse(patchCall![1].body as string);
+    expect(body.due_at).toContain("2026-06-15");
+  });
 });
