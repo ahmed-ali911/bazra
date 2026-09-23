@@ -4,15 +4,16 @@ import { Divider } from "../design-system/components/Divider";
 import { LivingHero } from "../design-system/components/LivingHero";
 import { StatusBadge } from "../design-system/components/StatusBadge";
 import { CalendarProbe } from "../features/calendar/CalendarProbe";
+import { HomeSummaryView } from "../features/home/HomeSummaryView";
 import { InboxProbe } from "../features/inbox/InboxProbe";
 import { TasksProbe } from "../features/tasks/TasksProbe";
 
 // The "/" route's page content, extracted from the old Layout.tsx —
-// AppShell now provides the sidebar/top-nav chrome around it. The task
-// list below is a real, minimum probe UI against the real Tasks API
-// (Checkpoint 2.2), not a designed Home screen — replaces the earlier
-// static demo table, which had unintentionally carried over sample
-// phrases from the Home reference image (flagged and agreed to fix here).
+// AppShell now provides the sidebar/top-nav chrome around it. HomeSummaryView
+// is the real Home aggregation (Checkpoint 2.5a: Focus Today/Coming Up/
+// Needs Attention/Anytime). The probes below it remain — they're still the
+// only UI for creating/mutating tasks, events, and inbox items; nothing
+// here is a designed Home screen yet, just real data.
 export function HomePlaceholder() {
   return (
     <Card>
@@ -31,6 +32,12 @@ export function HomePlaceholder() {
       </div>
       <StatusBadge variant="success">On track</StatusBadge>
       <div style={{ marginTop: "var(--space-4)" }}>
+        <HomeSummaryView />
+      </div>
+      <div style={{ margin: "var(--space-4) 0" }}>
+        <Divider />
+      </div>
+      <div>
         <TasksProbe />
       </div>
       <div style={{ margin: "var(--space-4) 0" }}>

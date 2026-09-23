@@ -19,6 +19,8 @@ export function useCreateTask() {
       // A task with a due_at can appear in Calendar's agenda read-model —
       // an open agenda view needs to refetch too, not just the task list.
       queryClient.invalidateQueries({ queryKey: ["calendar"] });
+      // A new task can land in Home's Focus Today, Coming Up, or Anytime.
+      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
 }

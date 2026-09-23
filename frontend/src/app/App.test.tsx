@@ -19,6 +19,13 @@ describe("App", () => {
         if (url.includes("/auth/me")) {
           return { ok: true, status: 200, json: async () => ({ authenticated: true }) };
         }
+        if (url.includes("/home/summary")) {
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({ focus_today: [], coming_up: [], needs_attention: [], anytime: [] }),
+          };
+        }
         if (url.includes("/calendar/agenda")) {
           return { ok: true, status: 200, json: async () => [] };
         }
@@ -46,6 +53,7 @@ describe("App", () => {
     expect(screen.getByRole("searchbox", { name: "Search" })).toBeInTheDocument();
     expect(screen.getByText("Welcome to BAZRA.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Get started" })).toBeInTheDocument();
+    expect(await screen.findByText("Nothing due")).toBeInTheDocument();
     expect(await screen.findByText("No tasks yet")).toBeInTheDocument();
     expect(await screen.findByText("Nothing on the calendar")).toBeInTheDocument();
     expect(await screen.findByText("Inbox is empty")).toBeInTheDocument();

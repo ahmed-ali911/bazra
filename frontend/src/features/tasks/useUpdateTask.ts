@@ -26,6 +26,10 @@ export function useUpdateTask() {
       // (tasks.service's open->done trigger) — an open Inbox view has no
       // other way to know that happened.
       queryClient.invalidateQueries({ queryKey: ["inbox"] });
+      // Any of the above (status, due_at, archival) can move this task
+      // into or out of Home's Focus Today/Coming Up/Anytime buckets, or
+      // add a new Needs Attention item.
+      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
 }

@@ -17,6 +17,8 @@ export function useCreateCalendarEvent() {
     mutationFn: (data: CreateCalendarEventInput) => api.post<CalendarEvent>("/api/v1/calendar/events", data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["calendar"] });
+      // A new event can land in Home's Coming Up section.
+      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
 }

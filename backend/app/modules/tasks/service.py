@@ -22,12 +22,70 @@ def list_tasks_due_between(db: Session, space_id: int, from_at: datetime, to_at:
     from_at <= due_at < to_at, so a task due exactly at from_at is
     included and one due exactly at to_at is not, keeping adjacent
     agenda ranges from double-counting a boundary task.
+
+    Deliberately does NOT filter by status — Calendar's agenda is a
+    calendar-native view of "what falls on this date," and a task
+    completed the day it was due still legitimately belongs there. Home's
+    Coming Up section wants the opposite (a completed task isn't
+    "upcoming"), which is exactly why list_open_tasks_due_between below is
+    a SEPARATE function rather than this one gaining a status filter —
+    changing this function's behavior would silently change Calendar's
+    own agenda, which is out of scope here.
     """
     query = (
         scoped_query(Task, space_id)
         .where(Task.archived_at.is_(None))
         .where(Task.due_at >= from_at, Task.due_at < to_at)
         .order_by(Task.due_at.asc())
+    )
+    return list(db.execute(query).scalars().all())
+
+
+def list_open_tasks_due_before(db: Session, space_id: int, before_at: datetime) -> list[Task]:
+    """Narrow, single-purpose query for Home's Focus Today section — every
+    OPEN task due before `before_at` (the caller's local tomorrow-start),
+    with no lower bound at all, so this naturally includes anything
+    overdue however far back together with anything still due later
+    today. Not a general filtering API — see list_tasks() for that.
+    """
+    query = (
+        scoped_query(Task, space_id)
+        .where(Task.archived_at.is_(None))
+        .where(Task.status == "open")
+        .where(Task.due_at.is_not(None))
+        .where(Task.due_at < before_at)
+        .order_by(Task.due_at.asc())
+    )
+    return list(db.execute(query).scalars().all())
+
+
+def list_open_tasks_due_between(db: Session, space_id: int, from_at: datetime, to_at: datetime) -> list[Task]:
+    """Narrow, single-purpose query for Home's Coming Up section — the
+    OPEN-only counterpart to list_tasks_due_between above. Kept as its
+    own function rather than adding a status filter to that one, since
+    Calendar's own agenda deliberately does NOT exclude done tasks (see
+    that function's docstring) and must not change as a side effect of
+    building Home.
+    """
+    query = (
+        scoped_query(Task, space_id)
+        .where(Task.archived_at.is_(None))
+        .where(Task.status == "open")
+        .where(Task.due_at >= from_at, Task.due_at < to_at)
+        .order_by(Task.due_at.asc())
+    )
+    return list(db.execute(query).scalars().all())
+
+
+def list_open_tasks_without_due_date(db: Session, space_id: int) -> list[Task]:
+    """Narrow query for Home's Anytime section — open tasks with no due
+    date at all."""
+    query = (
+        scoped_query(Task, space_id)
+        .where(Task.archived_at.is_(None))
+        .where(Task.status == "open")
+        .where(Task.due_at.is_(None))
+        .order_by(Task.created_at.desc())
     )
     return list(db.execute(query).scalars().all())
 

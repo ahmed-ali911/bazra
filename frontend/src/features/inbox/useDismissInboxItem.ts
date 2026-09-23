@@ -8,6 +8,8 @@ export function useDismissInboxItem() {
     mutationFn: (id: number) => api.delete<void>(`/api/v1/inbox/${id}`),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["inbox"] });
+      // Dismissing removes it from Home's Needs Attention too.
+      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
 }

@@ -80,6 +80,26 @@ def _list_calendar_events_overlapping(
     return list(db.execute(query).scalars().all())
 
 
+def list_events_starting_between(db: Session, space_id: int, from_at: datetime, to_at: datetime) -> list[CalendarEvent]:
+    """Narrow, single-purpose query for Home's Coming Up section — a plain
+    point check on starts_at only (half-open [from_at, to_at)), NOT the
+    interval-overlap semantics _list_calendar_events_overlapping above
+    uses. Those two functions deliberately answer different questions:
+    "what's happening during this window" (agenda) vs. "what's starting
+    soon" (Coming Up). Reusing the overlap function here would silently
+    pull in an event that's already in progress (started before from_at,
+    still running) — a real, deliberate simplification: Coming Up shows
+    what's STARTING next, not everything currently underway.
+    """
+    query = (
+        scoped_query(CalendarEvent, space_id)
+        .where(CalendarEvent.archived_at.is_(None))
+        .where(CalendarEvent.starts_at >= from_at, CalendarEvent.starts_at < to_at)
+        .order_by(CalendarEvent.starts_at.asc())
+    )
+    return list(db.execute(query).scalars().all())
+
+
 def build_agenda(db: Session, space_id: int, from_at: datetime, to_at: datetime) -> list[AgendaItem]:
     """The read-model: CalendarEvent rows + Task rows with due_at in range,
     merged and sorted in Python (not a SQL UNION — that would mean reaching

@@ -19,6 +19,9 @@ export function useUpdateCalendarEvent() {
       api.patch<CalendarEvent>(`/api/v1/calendar/events/${id}`, data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["calendar"] });
+      // starts_at can move this event into or out of Home's Coming Up
+      // window.
+      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
 }

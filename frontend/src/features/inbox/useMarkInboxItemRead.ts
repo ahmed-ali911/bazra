@@ -10,6 +10,8 @@ export function useMarkInboxItemRead() {
       api.patch<InboxItem>(`/api/v1/inbox/${id}`, { read }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["inbox"] });
+      // Read state changes what Home's Needs Attention shows.
+      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
 }

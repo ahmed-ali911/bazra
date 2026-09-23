@@ -10,6 +10,8 @@ export function useDeleteTask() {
       queryClient.invalidateQueries({ queryKey: ["tasks"] });
       // Archiving removes this task from Calendar's agenda too.
       queryClient.invalidateQueries({ queryKey: ["calendar"] });
+      // ...and from whichever Home bucket it was in.
+      queryClient.invalidateQueries({ queryKey: ["home"] });
     },
   });
 }
