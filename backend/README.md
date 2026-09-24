@@ -45,6 +45,36 @@ Endpoints (all under `/api/v1`):
 - `GET /auth/me` — `{"authenticated": true}` if the cookie is valid, 401
   otherwise; the template every future protected route copies
 
+## Known Limitations & Future Work (Checkpoint 3.2)
+
+- **Arabic write-intent detection is a UX/routing heuristic, not a
+  data-safety boundary.** `app/modules/chat/write_intent.py`'s regex-based
+  `detect_clear_write_intent` was executed (not just read) against 22 real
+  Egyptian Arabic phrasings and produced 5 false positives and 5 false
+  negatives — it has no negation, tense, or question-vs-command
+  understanding, and the Arabic patterns match on bare substrings (no
+  `\b`-equivalent word boundary), which is fragile. This is NOT a
+  data-safety risk: tracing every actual import and call site from
+  `chat/` and `orchestrator/` confirms no write-capable domain function
+  is ever called, no `tools` parameter is sent to Anthropic, and no
+  model-output-to-action execution path exists — a detector error can
+  only affect routing/UX and model cost, never mutate Tasks,
+  CalendarEvents, LifeAreas, or InboxItems. Left unpatched for this
+  checkpoint deliberately, pending native-speaker review.
+
+- **Future: write-enabled Chat must revisit intent architecture before
+  any domain mutation capability is exposed.** A future checkpoint should
+  evaluate structured intent classification / policy / permissions
+  against regex heuristics before any write action is ever wired up to
+  Chat — not decided or implemented yet.
+
+- **Future: current date/time/timezone should be supplied as runtime
+  context, not guessed by the model.** Live testing showed the model
+  correctly declining to answer "what is the date of today" — its
+  context contains no current-date fact. Confirms this needs to become
+  runtime context (or a cheap local capability) in a future checkpoint,
+  not implemented here.
+
 ## Run locally (without Docker)
 
 ```bash
