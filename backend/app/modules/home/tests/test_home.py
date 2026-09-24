@@ -238,11 +238,13 @@ def test_home_requires_authentication(client: TestClient) -> None:
 def test_home_space_isolation(authenticated_client: TestClient, db_session) -> None:
     from app.core.deps import get_current_space_id
     from app.main import app
+    from app.modules.auth import service as auth_service
     from app.modules.spaces.models import Space
 
     _create_task(authenticated_client, "Space A overdue task", due_at=datetime(2020, 1, 1, tzinfo=timezone.utc))
 
-    other_space = Space(name="Other Space (Home test)", is_default=False)
+    owner = auth_service.get_the_user(db_session)
+    other_space = Space(name="Other Space (Home test)", is_default=False, user_id=owner.id)
     db_session.add(other_space)
     db_session.commit()
     db_session.refresh(other_space)

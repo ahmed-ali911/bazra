@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 
 import { api } from "../../services/api";
-import { localDayBoundaries } from "./localDayBoundaries";
+import { localDayBoundaries } from "../../utils/localDayBoundaries";
 import type { HomeSummary } from "./types";
 
 export function useHomeSummary() {

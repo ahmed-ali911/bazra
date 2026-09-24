@@ -222,13 +222,15 @@ def test_space_isolation_across_list_update_and_dismiss(
 ) -> None:
     from app.core.deps import get_current_space_id
     from app.main import app
+    from app.modules.auth import service as auth_service
     from app.modules.spaces.models import Space
 
     task = _create_task(authenticated_client, "Space A's completed task")
     _complete(authenticated_client, task["id"])
     item = _inbox_items_for(authenticated_client, "Completed: Space A's completed task")[0]
 
-    other_space = Space(name="Other Space (Inbox test)", is_default=False)
+    owner = auth_service.get_the_user(db_session)
+    other_space = Space(name="Other Space (Inbox test)", is_default=False, user_id=owner.id)
     db_session.add(other_space)
     db_session.commit()
     db_session.refresh(other_space)

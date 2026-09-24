@@ -141,11 +141,13 @@ def test_space_isolation_across_fetch_update_and_delete(
     """
     from app.core.deps import get_current_space_id
     from app.main import app
+    from app.modules.auth import service as auth_service
     from app.modules.spaces.models import Space
 
     task = authenticated_client.post("/api/v1/tasks", json={"title": "Space A's task"}).json()
 
-    other_space = Space(name="Other Space", is_default=False)
+    owner = auth_service.get_the_user(db_session)
+    other_space = Space(name="Other Space", is_default=False, user_id=owner.id)
     db_session.add(other_space)
     db_session.commit()
     db_session.refresh(other_space)

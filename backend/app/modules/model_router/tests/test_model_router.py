@@ -80,7 +80,7 @@ def _raise(exc: Exception):
 
 def test_complete_success_records_exactly_one_success_trace(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
-    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages: _FakeMessage("Hello there", 10, 20))
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("Hello there", 10, 20))
 
     before = _trace_count(db_session)
     result = model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
@@ -102,6 +102,31 @@ def test_complete_success_records_exactly_one_success_trace(db_session: Session,
     assert trace.estimated_cost_usd is not None
     assert trace.estimated_cost_usd >= 0
     assert trace.error_summary is None
+
+
+def test_complete_passes_system_prompt_through_to_the_provider_call(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.2's additive change: system is Anthropic's own
+    top-level parameter, not a role inside messages — confirms it
+    actually reaches _call_anthropic rather than being silently dropped.
+    """
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    captured = {}
+
+    def _capture(model, messages, **kwargs):
+        captured["system"] = kwargs.get("system")
+        return _FakeMessage("Hello there", 10, 20)
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _capture)
+
+    model_router_service.complete(
+        purpose="chat_completion",
+        messages=[{"role": "user", "content": "hi"}],
+        system="You are a helpful assistant.",
+    )
+
+    assert captured["system"] == "You are a helpful assistant."
 
 
 def test_provider_call_failure_records_exactly_one_error_trace(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -129,7 +154,7 @@ def test_missing_api_key_records_error_trace_without_calling_provider(
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", None)
     call_count = 0
 
-    def _track(model, messages):
+    def _track(model, messages, **kwargs):
         nonlocal call_count
         call_count += 1
 
@@ -154,7 +179,7 @@ def test_response_parsing_failure_when_usage_unreadable_records_exactly_one_erro
     original bug: a successful provider call whose parsing then fails
     must not be recorded once as success and again as error."""
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
-    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages: _FakeMessageNoUsage("some text"))
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessageNoUsage("some text"))
 
     before = _trace_count(db_session)
     with pytest.raises(model_router_service.ModelRouterError):
@@ -176,7 +201,7 @@ def test_parsing_failure_preserves_token_usage_and_cost_when_usage_was_readable(
     text extraction failed — that data must be preserved, not discarded
     as NULL, since it's genuinely available."""
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
-    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages: _FakeMessageNoText(15, 25))
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessageNoText(15, 25))
 
     before = _trace_count(db_session)
     with pytest.raises(model_router_service.ModelRouterError):
@@ -199,7 +224,7 @@ def test_cost_estimation_failure_does_not_prevent_success_trace_or_response(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
-    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages: _FakeMessage("Hello", 10, 20))
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("Hello", 10, 20))
     monkeypatch.setattr(model_router_service, "_estimate_cost", _raise(RuntimeError("bad rate table")))
 
     before = _trace_count(db_session)
@@ -221,7 +246,7 @@ def test_trace_write_failure_does_not_mask_a_successful_model_call(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
-    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages: _FakeMessage("Hello", 10, 20))
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("Hello", 10, 20))
     monkeypatch.setattr(model_router_service, "_record_trace", _raise(RuntimeError("simulated DB unavailability")))
 
     before = _trace_count(db_session)
@@ -298,7 +323,7 @@ def test_no_prompt_or_response_text_or_api_key_in_any_trace_row(
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", fake_key)
 
     monkeypatch.setattr(
-        model_router_service, "_call_anthropic", lambda model, messages: _FakeMessage(f"response containing {marker}", 5, 5)
+        model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage(f"response containing {marker}", 5, 5)
     )
     model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": marker}])
 
@@ -322,7 +347,7 @@ def test_unknown_purpose_rejected_without_any_trace_or_provider_call(
 ) -> None:
     call_count = 0
 
-    def _track(model, messages):
+    def _track(model, messages, **kwargs):
         nonlocal call_count
         call_count += 1
 

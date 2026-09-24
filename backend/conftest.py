@@ -100,6 +100,7 @@ def authenticated_client(client: TestClient, db_session: Session) -> TestClient:
     """
     from app.modules.auth import service as auth_service
     from app.modules.auth.models import User
+    from app.modules.spaces import service as spaces_service
 
     password = "test-password-for-authenticated-client"  # noqa: S105
     user = auth_service.get_the_user(db_session)
@@ -110,6 +111,12 @@ def authenticated_client(client: TestClient, db_session: Session) -> TestClient:
     else:
         user.password_hash = password_hash
     db_session.commit()
+    db_session.refresh(user)
+
+    # A default Space is no longer migration-seeded (Checkpoint 3.2 gave
+    # it a real owner, which a migration can't invent) — ensure one
+    # exists here, the same idempotent way seed.py does for a real setup.
+    spaces_service.get_or_create_default_space_for_user(db_session, user.id)
 
     response = client.post("/api/v1/auth/login", json={"password": password})
     assert response.status_code == 200

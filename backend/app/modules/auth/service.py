@@ -24,8 +24,15 @@ def _hash_token(raw_token: str) -> str:
 
 
 def get_the_user(db: Session) -> User | None:
-    """Single-user system: there is at most one User row."""
-    return db.execute(select(User)).scalars().first()
+    """Single-user system: there is at most one User row in normal
+    operation. Explicitly ordered by id — Checkpoint 3.2's own tests are
+    the first to deliberately create a second, persistent User row (to
+    prove cross-user isolation through the real auth path), which
+    exposed that an unordered .first() has no guaranteed stable pick
+    once more than one row exists. Ordering ensures this always resolves
+    to the ORIGINAL user, not whichever row Postgres happens to return.
+    """
+    return db.execute(select(User).order_by(User.id.asc())).scalars().first()
 
 
 def create_session(db: Session, user: User) -> str:

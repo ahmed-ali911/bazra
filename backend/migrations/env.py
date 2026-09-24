@@ -12,6 +12,7 @@ from app.core.base import Base
 # actually been imported somewhere in the process.
 from app.modules.auth import models as auth_models  # noqa: F401,E402
 from app.modules.calendar import models as calendar_models  # noqa: F401,E402
+from app.modules.chat import models as chat_models  # noqa: F401,E402
 from app.modules.inbox import models as inbox_models  # noqa: F401,E402
 from app.modules.life_areas import models as life_areas_models  # noqa: F401,E402
 from app.modules.model_router import models as model_router_models  # noqa: F401,E402

@@ -1,4 +1,4 @@
-import { Globe, Home } from "lucide-react";
+import { Globe, Home, MessageCircle } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 
 export interface SidebarItem {
@@ -16,4 +16,5 @@ export interface SidebarItem {
 export const sidebarConfig: SidebarItem[] = [
   { id: "home", label: "Home", href: "/", icon: Home, enabled: true },
   { id: "my-world", label: "My World", href: "/my-world", icon: Globe, enabled: true },
+  { id: "chat", label: "Chat", href: "/chat", icon: MessageCircle, enabled: true },
 ];

@@ -48,11 +48,16 @@ def _get_client() -> Anthropic:
     return Anthropic(api_key=settings.anthropic_api_key)
 
 
-def _call_anthropic(model: str, messages: list[dict[str, str]]) -> Message:
+def _call_anthropic(model: str, messages: list[dict[str, str]], system: str | None = None) -> Message:
     """The only function in this module that talks to the Anthropic SDK
     directly — everything else in complete() is boundary/bookkeeping
-    logic around this one call."""
-    return _get_client().messages.create(model=model, max_tokens=_MAX_TOKENS, messages=messages)
+    logic around this one call. system is Anthropic's own separate
+    top-level parameter, not a role inside `messages` — the Messages API
+    has no "system" message role."""
+    kwargs = {"model": model, "max_tokens": _MAX_TOKENS, "messages": messages}
+    if system is not None:
+        kwargs["system"] = system
+    return _get_client().messages.create(**kwargs)
 
 
 def _extract_text(message: Message) -> str:
@@ -142,8 +147,13 @@ def _safe_record_trace(**fields) -> bool:
         return False
 
 
-def complete(purpose: ModelCallPurpose, messages: list[dict[str, str]]) -> ModelResponse:
+def complete(purpose: ModelCallPurpose, messages: list[dict[str, str]], system: str | None = None) -> ModelResponse:
     """The only function other modules call to reach a model provider.
+
+    system is an additive, backward-compatible parameter (Checkpoint
+    3.2) — Anthropic's Messages API takes system instructions as their
+    own top-level parameter, not a role inside `messages`. Existing
+    callers that never pass it are unaffected.
 
     Guarantees, stated explicitly rather than assumed:
     - The provider call failing (auth, network, rate limit, missing key)
@@ -176,7 +186,7 @@ def complete(purpose: ModelCallPurpose, messages: list[dict[str, str]]) -> Model
     try:
         if not settings.anthropic_api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not configured")
-        raw = _call_anthropic(model, messages)
+        raw = _call_anthropic(model, messages, system=system)
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
         _safe_record_trace(

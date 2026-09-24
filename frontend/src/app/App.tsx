@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useState } from "react";
 import { BrowserRouter, Route, Routes } from "react-router-dom";
 
+import { ChatPage } from "../features/chat/ChatPage";
 import { LifeAreaDetailPage } from "../features/life-areas/LifeAreaDetailPage";
 import { MyWorldPage } from "../features/life-areas/MyWorldPage";
 import { AppShell } from "./AppShell";
@@ -32,6 +33,7 @@ export function App() {
               <Route path="/" element={<HomePlaceholder />} />
               <Route path="/my-world" element={<MyWorldPage />} />
               <Route path="/my-world/:lifeAreaId" element={<LifeAreaDetailPage />} />
+              <Route path="/chat" element={<ChatPage />} />
             </Route>
           </Route>
         </Routes>

@@ -21,9 +21,15 @@ def get_current_user(request: Request, db: Session = Depends(get_db)) -> User:
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
 
-def get_current_space_id(db: Session = Depends(get_db)) -> int:
-    """Resolves to the one default space — no space-switcher UI exists yet,
-    so there is nothing for the frontend to choose. Every space-scoped
-    route depends on this alongside get_current_user.
+def get_current_space_id(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> int:
+    """Resolves to the AUTHENTICATED USER's own default space (Checkpoint
+    3.2) — a real, structural check via Space.user_id, not merely "the
+    one space that happens to exist." No space-switcher UI exists yet,
+    so there is still nothing for the frontend to choose, but the
+    resolution itself is now genuinely tied to who's asking. Every
+    existing route already declares both get_current_user and
+    get_current_space_id as separate Depends() — FastAPI caches
+    get_current_user's result per request, so it is not re-executed
+    twice; no calling route's signature needs to change for this fix.
     """
-    return spaces_service.get_default_space(db).id
+    return spaces_service.get_default_space_for_user(db, user.id).id
