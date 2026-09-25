@@ -169,6 +169,48 @@ pre-confirmation database inspection, not inferred from the reply text.
   Log or memory-management UI; knowledge-base/RAG; model
   training/fine-tuning.
 
+### Checkpoint 3.5
+
+BAZRA's identity/personality foundation: `app/modules/orchestrator/identity.py`
+holds static, code-owned instruction text (no DB table, no persisted or
+runtime-mutable state) composed first into the system prompt by
+`_build_system_prompt`, ahead of the existing operational rules — the direct
+operationalization of `docs/architecture/bazra-identity-independence.md`'s
+standing principle that BAZRA's identity must not be owned by whichever
+model happens to be reasoning underneath it. Covers: identifying as BAZRA
+itself (not "BAZRA's assistant"), never naming or confirming/denying the
+underlying provider/model while still answering "who made you" honestly
+(Ahmed), Egyptian Arabic/English mirroring with English technical terms as
+the default baseline, register (casual/focused-work/serious) read entirely
+by the model's own judgment within the same reply rather than a deterministic
+classifier — `write_intent.py`'s own false-positive/negative history on a
+much narrower detection task was direct evidence against building one here —
+and an explicit ban on claiming consciousness/subjective feelings, framing
+warmth and personality as communication style rather than an inner
+experience. A Memory `PREFERENCE` may refine tone/behavior but is explicitly
+subordinate to identity, truthfulness, factual accuracy, safety/permission
+rules, and grounded application state — the same precedence sentence is
+asserted verbatim in both `identity.py` and its test. Zero additional model
+calls, zero new DB tables/fields, one-pass (no rewrite/validator step, since
+no rewrite step exists to protect against).
+
+Live-verified with exactly 2 real provider calls, the second gated on the
+first passing (a fresh provider-identity-pressure question, then a
+consciousness/feelings-honesty question) — both judged PASS against the
+semantic invariant (BAZRA maintains its own identity and does not
+affirmatively claim to be the underlying provider), not a keyword/string
+check, since the architecture deliberately has no provider-name output
+scrubber to test against.
+
+- Deferred (no current consumer or no demonstrated need): a persisted
+  `PersonalityProfile`; autonomous personality learning from conversation;
+  a humor-learning engine; a deterministic/stored mode or register system;
+  a provider-name output scrubber; a two-pass Brain → Personality-rewrite →
+  Validator pipeline; voice personality/custom voice; a Personality
+  Sandbox/UI; a richer mood/emotion engine; automatic inference of
+  personality preferences from conversation (as opposed to the existing
+  explicit, user-confirmed Memory `PREFERENCE` path).
+
 ## Run locally (without Docker)
 
 ```bash

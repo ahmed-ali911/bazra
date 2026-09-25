@@ -1,4 +1,5 @@
 from app.modules.model_router import service as model_router_service
+from app.modules.orchestrator.identity import BAZRA_IDENTITY_INSTRUCTIONS
 from app.modules.orchestrator.schemas import HistoryTurn, OrchestratorResult, ToolCallRequest
 
 # Prompt-level instructions only — NOT code-enforced. The code-level
@@ -13,8 +14,9 @@ from app.modules.orchestrator.schemas import HistoryTurn, OrchestratorResult, To
 # chat's adversarial test proving the database stays unchanged even
 # when the model's own text falsely claims otherwise.
 _SYSTEM_INSTRUCTIONS = (
-    "You are BAZRA's assistant, answering questions about the user's own tasks, "
-    "calendar, inbox, and life areas.\n\n"
+    "## Your job in this conversation\n"
+    "Answer questions about the user's own tasks, calendar, inbox, and life "
+    "areas, using the rules below.\n\n"
     "Rules you must follow:\n"
     "- You can only READ the data provided below in \"Current Data\" — you have NO "
     "ability to edit, delete, mark complete, or create calendar events, inbox "
@@ -77,7 +79,13 @@ class OrchestratorError(Exception):
 
 
 def _build_system_prompt(context: str, current_datetime_local: str) -> str:
+    """Identity/personality (who BAZRA is, Checkpoint 3.5) comes first,
+    establishing character before the operational tool-use/data rules —
+    then the existing turn-specific rules, then the current instant, then
+    the retrieved data itself.
+    """
     return (
+        f"{BAZRA_IDENTITY_INSTRUCTIONS}\n"
         f"{_SYSTEM_INSTRUCTIONS}\n"
         f"## Current date/time\n{current_datetime_local}\n\n"
         f"## Current Data\n{context}"

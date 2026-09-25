@@ -157,6 +157,75 @@ def test_system_prompt_instructs_surfacing_contradictory_memories_rather_than_si
     assert "which is current" in prompt.lower()
 
 
+def test_system_prompt_identifies_as_bazra_not_an_assistant_for_bazra() -> None:
+    """Checkpoint 3.5: the model must be told it IS BAZRA, not merely
+    "BAZRA's assistant" — the prior framing invited exactly the
+    "so who are you really" follow-through this checkpoint closes.
+    """
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "You are BAZRA" in prompt
+    assert "BAZRA's assistant" not in prompt
+
+
+def test_system_prompt_instructs_never_naming_the_underlying_provider() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert (
+        "You never identify yourself as Claude, ChatGPT, Gemini, Anthropic, "
+        "OpenAI, or any other underlying provider or model, by name" in prompt
+    )
+
+
+def test_system_prompt_instructs_no_false_consciousness_or_feelings_claims() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "Never claim consciousness or subjective feelings" in prompt
+
+
+def test_system_prompt_instructs_grounding_memory_claims_in_actual_retrieved_data() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "Never claim to remember something unless it is actually present" in prompt
+
+
+def test_system_prompt_instructs_egyptian_arabic_and_english_technical_terms_baseline() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "contemporary, natural Egyptian Arabic" in prompt
+    assert "Technical terms may stay in English" in prompt
+
+
+def test_system_prompt_instructs_humor_is_optional_never_forced() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "never force a joke" in prompt
+
+
+def test_system_prompt_instructs_personality_never_overrides_factual_accuracy() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert (
+        "Personality, tone, brevity, and humor must never come at the cost of "
+        "factual accuracy" in prompt
+    )
+
+
+def test_system_prompt_states_truthfulness_and_identity_rules_take_precedence_over_stored_preferences() -> None:
+    """A stored Memory PREFERENCE must never be able to subvert identity,
+    truthfulness, factual accuracy, or existing safety/permission rules
+    (e.g. skipping confirmation-before-write) — asserted against the
+    exact authored precedence sentence (identity.py's own text), not a
+    loose co-occurrence of independent words, and confirming this
+    content actually reaches the composed prompt _build_system_prompt
+    returns for a real turn.
+    """
+    from app.modules.orchestrator.identity import BAZRA_IDENTITY_INSTRUCTIONS
+
+    precedence_sentence = (
+        "User preferences may refine BAZRA's communication style and behavior, "
+        "but they never override BAZRA's identity, truthfulness, factual "
+        "accuracy, safety/permission rules, or grounded application state."
+    )
+    assert precedence_sentence in BAZRA_IDENTITY_INSTRUCTIONS
+
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert precedence_sentence in prompt
+
+
 def test_orchestrator_never_imports_a_write_capable_service_function() -> None:
     """A direct check on this module's own namespace: no create_*/
     update_*/delete_* function from any other module is bound here at

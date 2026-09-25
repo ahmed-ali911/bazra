@@ -1147,3 +1147,42 @@ def test_pending_save_memory_proposal_is_superseded_by_a_new_create_task_proposa
     user, space = _get_space_and_user(db_session)
     memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
     assert not any(m.content == "Should not be saved - crosstest2" for m in memories)
+
+
+# ---- Checkpoint 3.5: identity/personality reach a real chat turn's prompt --------
+
+
+def test_identity_and_personality_instructions_reach_a_real_chat_turns_system_prompt(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Proves orchestrator/identity.py's content actually reaches the
+    system prompt used on a real chat turn — not just that
+    _build_system_prompt CAN include it in isolation (already proven in
+    orchestrator/tests/test_orchestrator.py). Mocks
+    model_router_service.complete directly (one level below
+    orchestrator_service.generate_reply, which this test does NOT mock)
+    so the real orchestrator system-prompt assembly runs end to end,
+    driven by a real chat_service.send_message call.
+    """
+    from app.modules.model_router import service as model_router_service
+    from app.modules.model_router.schemas import ModelResponse
+
+    captured = {}
+
+    def _fake_complete(*, purpose, messages, system=None, tools=None):
+        captured["system"] = system
+        return ModelResponse(text="ok", model="claude-sonnet-5", prompt_tokens=1, completion_tokens=1, tool_uses=[])
+
+    monkeypatch.setattr(model_router_service, "complete", _fake_complete)
+
+    response = _send(authenticated_client, "hi")
+    assert response.status_code == 200
+
+    system_prompt = captured["system"]
+    assert "You are BAZRA" in system_prompt
+    assert "BAZRA's assistant" not in system_prompt
+    assert (
+        "You never identify yourself as Claude, ChatGPT, Gemini, Anthropic, "
+        "OpenAI, or any other underlying provider or model, by name" in system_prompt
+    )
+    assert "Never claim consciousness or subjective feelings" in system_prompt
