@@ -243,3 +243,134 @@ def test_cross_user_isolation_for_confirm_reject_and_lookup(db_session: Session,
 
     # The original proposal is untouched by the other user's attempts.
     assert actions_service.get_latest_pending(db_session, space.id, user.id) is not None
+
+
+# ---- Checkpoint 3.4: confirm_and_execute dispatches on action_type -----------------------
+
+
+def test_confirm_and_execute_dispatches_save_memory_creates_active_memory(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "save_memory",
+        {"type": "PREFERENCE", "content": "Prefers concise answers"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.task is None
+    assert result.memory is not None
+    assert result.memory.status == "active"
+    assert result.memory.content == "Prefers concise answers"
+
+    from app.modules.memory import service as memory_service
+    stored = memory_service.get_active_memory_for_user(db_session, space.id, user.id, result.memory.id)
+    assert stored is not None
+
+
+def test_confirm_and_execute_dispatches_save_memory_with_supersedes_retires_the_old_one(
+    db_session: Session, owner
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    old_memory = memory_service.create_memory(
+        db_session, space.id, user.id, source_id, MemoryCreate(type="FACT", content="Works at a bank")
+    )
+    db_session.commit()
+
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "save_memory",
+        {"type": "FACT", "content": "No longer works at a bank", "supersedes_memory_id": old_memory.id},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "executed"
+
+    db_session.refresh(old_memory)
+    assert old_memory.status == "superseded"
+    assert old_memory.superseded_by_id == result.memory.id
+
+
+def test_confirm_and_execute_dispatches_forget_memory_marks_forgotten(db_session: Session, owner) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    memory = memory_service.create_memory(
+        db_session, space.id, user.id, source_id, MemoryCreate(type="GOAL", content="Learn backend development")
+    )
+    db_session.commit()
+
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "forget_memory", {"memory_id": memory.id}
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.memory.id == memory.id
+    assert result.memory.status == "forgotten"
+
+    db_session.refresh(memory)
+    assert memory.status == "forgotten"
+
+
+def test_confirm_and_execute_forget_memory_race_where_target_already_gone_rolls_back_to_pending(
+    db_session: Session, owner
+) -> None:
+    """The forget_memory equivalent of the existing execution-failure
+    test above: if the target memory is no longer active by confirm
+    time (a genuine TOCTOU race — e.g. forgotten via another path
+    between proposal and confirmation), execution fails and the whole
+    transaction rolls back to 'pending', reusing the same precedented
+    semantics rather than inventing bespoke handling for this case.
+    """
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    memory = memory_service.create_memory(
+        db_session, space.id, user.id, source_id, MemoryCreate(type="FACT", content="Will be forgotten early")
+    )
+    db_session.commit()
+
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "forget_memory", {"memory_id": memory.id}
+    )
+    proposal_id = proposal.id
+
+    # Simulate the race: the target becomes inactive AFTER the proposal
+    # was created but BEFORE it's confirmed.
+    memory_service.forget_memory(db_session, space.id, user.id, memory.id)
+    db_session.commit()
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    db_session.rollback()
+    from sqlalchemy import select
+    fresh = db_session.execute(select(ProposedAction).where(ProposedAction.id == proposal_id)).scalar_one()
+    assert fresh.status == "pending"
+
+
+def test_validate_arguments_rejects_unknown_action_type(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("not_a_real_action", {})
+
+
+def test_validate_arguments_save_memory_requires_type_and_content(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("save_memory", {"content": "missing type"})
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("save_memory", {"type": "NOT_A_REAL_TYPE", "content": "x"})
+
+
+def test_validate_arguments_forget_memory_requires_memory_id(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("forget_memory", {})

@@ -129,6 +129,34 @@ def test_system_prompt_includes_current_datetime_anchor() -> None:
     assert "Current date/time" in prompt
 
 
+def test_system_prompt_describes_memory_proposal_tools_as_proposals_not_executions() -> None:
+    """Checkpoint 3.4: propose_save_memory/propose_forget_memory must be
+    described with the same "does NOT ... only proposes" language as
+    propose_create_task already gets, and confirmation must be explicit."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "propose_save_memory" in prompt
+    assert "propose_forget_memory" in prompt
+    assert "does NOT save it" in prompt
+    assert "does NOT forget it" in prompt
+
+
+def test_system_prompt_instructs_never_restating_inference_as_settled_fact() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "INFERENCE" in prompt
+    assert "never restate an" in prompt.lower() or "never silently upgrade" in prompt.lower()
+
+
+def test_system_prompt_instructs_surfacing_contradictory_memories_rather_than_silently_choosing() -> None:
+    """Point 1 of the 3.4 revision round: the model must be explicitly
+    told to surface a contradiction between two retrieved memories to
+    the user, not silently pick one as authoritative. Proves the
+    instruction reaches the actual prompt sent to the model, not just
+    that it's described somewhere in a docstring."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "contradict" in prompt.lower()
+    assert "which is current" in prompt.lower()
+
+
 def test_orchestrator_never_imports_a_write_capable_service_function() -> None:
     """A direct check on this module's own namespace: no create_*/
     update_*/delete_* function from any other module is bound here at

@@ -105,7 +105,69 @@ Endpoints (all under `/api/v1`):
   new proposal (fresh or a revision) always supersedes any existing
   pending one first (`actions/service.py`'s `_supersede_existing_pending`)
   — there is no multi-proposal queue. This is a deliberate scope
-  limitation, not an oversight.
+  limitation, not an oversight. (Checkpoint 3.4 kept this invariant
+  GLOBAL rather than scoping it per action_type — see below.)
+
+### Checkpoint 3.4
+
+BAZRA's first long-term Memory capability: explicit, user-confirmed
+memories (`FACT` | `PREFERENCE` | `GOAL` | `INFERENCE`) that persist
+across conversations and are retrieved into later context, so the user
+never has to repeat a stated preference. Shipped by generalizing the
+`actions` module rather than building a parallel proposal/confirm
+system — `ProposedAction.action_type` grew to include `save_memory` and
+`forget_memory`, reusing the same row-locked, single-transaction
+`confirm_and_execute` (and its real two-thread concurrency guarantee)
+already proven for task creation in 3.3. Both new tools
+(`propose_save_memory`, `propose_forget_memory`) are offered on every
+turn alongside `propose_create_task`, at zero additional model-call
+cost. The proposal-facing confirmation is rendered deterministically
+from validated arguments, the same 3.3 UX-fix discipline, never from
+model prose. Retrieval is structured (recency-ordered, capped, with
+explicit truncation disclosure) — no embeddings/pgvector, a deliberate
+choice: nothing in this design demonstrates a real need that semantic
+search solves and structured retrieval can't, at this app's realistic memory
+volume (explicit-only creation keeps growth naturally slow). Correction
+is a `save_memory` proposal with an optional `supersedes_memory_id`,
+not a separate action type; forgetting is a normal propose/confirm
+round trip like everything else, never an unconfirmed direct write.
+
+Live-verified end-to-end against the real provider with exactly 2 real
+calls (propose→confirm→active, then reference→propose-forget→confirm→
+forgotten) — both the classification (PREFERENCE, preserving both
+stated semantic facts) and the harder claim (exact `mem_id` reference
+resolution against live retrieved context) were confirmed by direct
+pre-confirmation database inspection, not inferred from the reply text.
+
+- **A contradicted memory outside the retrieval window can result in
+  two active, contradictory memories.** `save_memory`'s
+  `supersedes_memory_id` lets the model retire an old memory it can
+  currently SEE in the "What I remember about you" context section —
+  but retrieval is bounded (§8 of the architecture review), so a
+  correction whose target fell outside that window has no way to be
+  linked, and both rows stay active. The system prompt instructs the
+  model to surface a contradiction it CAN see rather than silently
+  picking one side, but that only covers memories retrieved together in
+  the same turn — this residual gap is the honestly-documented
+  trade-off of choosing structured/bounded retrieval over embeddings
+  for this checkpoint, in the same spirit as 3.3's "actually never
+  mind" limitation. Left unpatched deliberately.
+
+- Deferred (from the 3.4 architecture review, no current consumer or no
+  demonstrated need — each is a trivial additive migration/change
+  later if a real need appears): automatic/autonomous memory
+  extraction from every turn; embeddings/pgvector; a numeric
+  `confidence` score; a `source` provenance enum; `life_area_id` on
+  Memory; `last_used_at`; a `SHARED_HISTORY`/`IDENTITY_HISTORY` memory
+  type (BAZRA's own identity/relationship narrative is a different
+  concept from facts/preferences/goals ABOUT the user — see
+  `docs/architecture/bazra-identity-independence.md`); per-action-type
+  scoping of the at-most-one-pending-proposal invariant; a dedicated
+  deterministic "list every memory, unbounded" path for the
+  memory-inspection question; full version-history/undo beyond the
+  single `superseded_by_id` pointer; personality learning; a Learning
+  Log or memory-management UI; knowledge-base/RAG; model
+  training/fine-tuning.
 
 ## Run locally (without Docker)
 

@@ -10,6 +10,8 @@ from app.modules.actions.schemas import ConfirmResult
 from app.modules.chat import context as context_module
 from app.modules.chat.models import ChatMessage
 from app.modules.chat.write_intent import WRITE_UNAVAILABLE_MESSAGE, detect_clear_write_intent
+from app.modules.memory import service as memory_service
+from app.modules.memory.models import Memory
 from app.modules.orchestrator import service as orchestrator_service
 from app.modules.orchestrator.schemas import HistoryTurn
 
@@ -21,12 +23,17 @@ _MAX_HISTORY_CHARS = 4000  # a second, independent cap — whichever binds first
 _MAX_INCOMING_MESSAGE_CHARS = 4000  # the NEW message, on top of history, not counted inside its budget
 _MAX_ASSISTANT_MESSAGE_CHARS = 4000  # complementary, defense-in-depth: caps future history at the source
 
-# The only tool ever offered to the model (Checkpoint 3.3). Calling it
-# produces nothing but a ToolCallRequest — an inert data structure. The
-# domain fields mirror tasks.schemas.TaskCreate exactly; actions_service
-# re-validates against that same schema before ever storing a proposal,
-# so this input_schema is a hint to the model, not the enforcement
-# boundary.
+# Checkpoint 3.4: bounds on how many memories / how much memory text can
+# enter one request — the same truncated-and-said-so discipline as
+# chat/context.py's _format_section, not a silent cap.
+_MAX_MEMORIES = 20
+_MAX_MEMORY_CONTEXT_CHARS = 1500
+
+# The tools ever offered to the model. Calling one produces nothing but a
+# ToolCallRequest — an inert data structure. Domain fields mirror the
+# relevant Pydantic schema exactly; actions_service re-validates against
+# that same schema before ever storing a proposal, so these input_schemas
+# are a hint to the model, not the enforcement boundary.
 _PROPOSE_CREATE_TASK_TOOL = {
     "name": "propose_create_task",
     "description": (
@@ -50,6 +57,70 @@ _PROPOSE_CREATE_TASK_TOOL = {
         },
         "required": ["title"],
     },
+}
+
+_PROPOSE_SAVE_MEMORY_TOOL = {
+    "name": "propose_save_memory",
+    "description": (
+        "Propose saving a piece of durable memory about the user (a FACT, "
+        "PREFERENCE, GOAL, or your own tentative INFERENCE) for future "
+        "conversations. This does NOT save it — it only proposes it; the user "
+        "must explicitly confirm before it becomes durable."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "type": {
+                "type": "string",
+                "enum": ["FACT", "PREFERENCE", "GOAL", "INFERENCE"],
+                "description": (
+                    "FACT: the user directly asserted this. PREFERENCE: how the user "
+                    "wants you to behave. GOAL: something the user is working toward. "
+                    "INFERENCE: your own tentative interpretation, NOT something the "
+                    "user asserted outright — never mislabel an inference as FACT."
+                ),
+            },
+            "content": {"type": "string", "description": "The memory content, written plainly."},
+            "supersedes_memory_id": {
+                "type": "integer",
+                "description": (
+                    "Optional: set this to the mem_id shown in 'What I remember about "
+                    "you' if this memory corrects/replaces an existing one you can see "
+                    "there — the old one is retired, not left active alongside this one."
+                ),
+            },
+        },
+        "required": ["type", "content"],
+    },
+}
+
+_PROPOSE_FORGET_MEMORY_TOOL = {
+    "name": "propose_forget_memory",
+    "description": (
+        "Propose forgetting (deactivating) a specific stored memory, referenced "
+        "by its mem_id from 'What I remember about you'. This does NOT forget it "
+        "— it only proposes it; the user must explicitly confirm."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "memory_id": {
+                "type": "integer",
+                "description": "The mem_id of the memory to forget, exactly as shown above.",
+            },
+        },
+        "required": ["memory_id"],
+    },
+}
+
+_TOOLS_OFFERED = [_PROPOSE_CREATE_TASK_TOOL, _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL]
+
+# Used by _describe_pending_proposal to tell the model which tool to call
+# again for a revision, regardless of which action_type is pending.
+_ACTION_TYPE_TOOL_NAMES = {
+    "create_task": "propose_create_task",
+    "save_memory": "propose_save_memory",
+    "forget_memory": "propose_forget_memory",
 }
 
 # Deliberately narrow, closed sets — matched against the ENTIRE message
@@ -78,6 +149,32 @@ _INVALID_PROPOSAL_FALLBACK_MESSAGE = (
 _NO_REPLY_FALLBACK_MESSAGE = "Sorry, I don't have a reply for that."
 
 _ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿ]")
+
+# Type labels for the context section shown to the model — INFERENCE is
+# explicitly marked tentative in the label ITSELF, not just in the
+# system prompt, so the distinction survives even if only this line is
+# ever attended to.
+_MEMORY_TYPE_CONTEXT_LABELS = {
+    "FACT": "FACT",
+    "PREFERENCE": "PREFERENCE",
+    "GOAL": "GOAL",
+    "INFERENCE": "INFERENCE (tentative, not confirmed as fact)",
+}
+
+# Bilingual confirmation labels, selected the same way _is_arabic already
+# selects between the two create_task confirmation templates.
+_MEMORY_TYPE_CONFIRM_LABELS_AR = {
+    "FACT": "المعلومة دي",
+    "PREFERENCE": "التفضيل ده",
+    "GOAL": "الهدف ده",
+    "INFERENCE": "الاستنتاج ده (مش مؤكد منك)",
+}
+_MEMORY_TYPE_CONFIRM_LABELS_EN = {
+    "FACT": "this fact",
+    "PREFERENCE": "this preference",
+    "GOAL": "this goal",
+    "INFERENCE": "this tentative inference (not confirmed by you)",
+}
 
 
 class MessageTooLongError(Exception):
@@ -218,11 +315,12 @@ def _classify_narrow_yes_no(content: str) -> str | None:
 
 
 def _describe_pending_proposal(pending) -> str:
+    tool_name = _ACTION_TYPE_TOOL_NAMES.get(pending.action_type, pending.action_type)
     return (
         f"A '{pending.action_type}' proposal is awaiting the user's yes/no "
         f"confirmation (proposed just now, expires {pending.expires_at.isoformat()}). "
         f"Proposed arguments: {pending.arguments}. If the user's message is a "
-        f"revision request rather than a plain yes/no, call propose_create_task "
+        f"revision request rather than a plain yes/no, call {tool_name} "
         f"again with the corrected arguments — this replaces the pending proposal "
         f"above rather than creating an additional one."
     )
@@ -274,14 +372,160 @@ def _render_create_task_confirmation(arguments: dict, timezone_name: str, user_m
     return f'I\'ll add the task "{title}". Shall I go ahead?'
 
 
+def _render_save_memory_confirmation(arguments: dict, user_message: str) -> str:
+    """Same discipline as _render_create_task_confirmation: built ONLY
+    from the validated arguments that will be stored/executed, never
+    from model prose — and explicitly labels the memory's TYPE in the
+    confirmation itself, not just internally in storage, so an
+    INFERENCE is visibly tentative to the user before they confirm it,
+    not just after."""
+    labels = _MEMORY_TYPE_CONFIRM_LABELS_AR if _is_arabic(user_message) else _MEMORY_TYPE_CONFIRM_LABELS_EN
+    label = labels[arguments["type"]]
+    content = arguments["content"]
+    if _is_arabic(user_message):
+        return f'هحتفظ ب{label}: "{content}". أأكدها؟'
+    return f'I\'ll remember {label}: "{content}". Shall I save it?'
+
+
+def _render_forget_memory_confirmation(existing_content: str, user_message: str) -> str:
+    """Built from the REAL, currently-active memory's own content
+    (re-fetched from the database, not restated by the model) — the
+    same "confirmation matches what will actually happen" guarantee as
+    the other two renderers."""
+    if _is_arabic(user_message):
+        return f'هنسى إني فاكر إنك: "{existing_content}". تأكيد؟'
+    return f'I\'ll forget that I have this on record: "{existing_content}". Confirm?'
+
+
+def _format_memory_line(memory: Memory) -> str:
+    label = _MEMORY_TYPE_CONTEXT_LABELS.get(memory.type, memory.type)
+    return f"{label}: {memory.content} (mem_id={memory.id})"
+
+
+def _format_memory_context(memories: list[Memory], total_active_count: int) -> str:
+    """Same truncated-and-said-so convention as chat/context.py's own
+    _format_section — applies equally whether this is an ordinary turn
+    or the user explicitly asking "what do you remember about me?": the
+    model is never handed a capped list without being told it's capped.
+    """
+    lines = [_format_memory_line(m) for m in memories]
+    text = "## What I remember about you\n" + ("\n".join(lines) if lines else "(nothing yet)")
+    remaining = total_active_count - len(memories)
+    if remaining > 0:
+        text += f"\n... and {remaining} more not shown"
+    if len(text) > _MAX_MEMORY_CONTEXT_CHARS:
+        text = text[:_MAX_MEMORY_CONTEXT_CHARS] + "\n... (memory context truncated)"
+    return text
+
+
 def _reply_for_confirm_result(result: ConfirmResult) -> str:
     if result.outcome == "executed":
-        return f'Done — I\'ve created the task "{result.task.title}".'
+        if result.task is not None:
+            return f'Done — I\'ve created the task "{result.task.title}".'
+        if result.memory is not None:
+            if result.memory.status == "forgotten":
+                return "Done — I've forgotten that."
+            return "Done — I'll remember that."
     if result.outcome == "nothing_pending":
         return _NOTHING_PENDING_MESSAGE
     if result.outcome == "execution_failed":
         return _EXECUTION_FAILED_MESSAGE
     return _REJECTED_MESSAGE
+
+
+def _require_active_memory(db: Session, space_id: int, user_id: int, action_type: str, memory_id: int) -> Memory:
+    """Checkpoint 3.4: validate_arguments stays a pure, DB-free shape
+    validator (correct for create_task and save_memory's own scalar
+    fields), but forget_memory and save_memory's optional
+    supersedes_memory_id both reference an EXISTING memory row — this
+    is the DB lookup that resolves that reference, called right after
+    the pure shape check succeeds. A None result (id doesn't exist, or
+    belongs to another space/user, or is no longer active — one query
+    collapses all three into a single safe case) is surfaced as the
+    SAME InvalidActionArgumentsError the pure validator already raises
+    for a malformed field: a memory_id that resolves to nothing real is
+    exactly as invalid as a missing title. Raised HERE, before any
+    proposal is created — the None value itself doesn't raise anything,
+    this function does, acting on it.
+    """
+    memory = memory_service.get_active_memory_for_user(db, space_id, user_id, memory_id)
+    if memory is None:
+        raise actions_service.InvalidActionArgumentsError(
+            action_type, f"memory_id {memory_id} is not an active memory you own"
+        )
+    return memory
+
+
+def _handle_create_task_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("create_task", arguments)
+    except actions_service.InvalidActionArgumentsError:
+        # Validated before anything is persisted — nothing to roll
+        # back. There's no valid structured data to render a
+        # deterministic confirmation from here, so (only in this
+        # error case) the model's own text is used as a fallback.
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    reply_text = _render_create_task_confirmation(validated, timezone_name, user_message_content)
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "create_task", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
+def _handle_save_memory_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("save_memory", arguments)
+        supersedes_id = validated.get("supersedes_memory_id")
+        if supersedes_id is not None:
+            _require_active_memory(db, space_id, user_id, "save_memory", supersedes_id)
+    except actions_service.InvalidActionArgumentsError:
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    reply_text = _render_save_memory_confirmation(validated, user_message_content)
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "save_memory", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
+def _handle_forget_memory_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("forget_memory", arguments)
+        target = _require_active_memory(db, space_id, user_id, "forget_memory", validated["memory_id"])
+    except actions_service.InvalidActionArgumentsError:
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    reply_text = _render_forget_memory_confirmation(target.content, user_message_content)
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "forget_memory", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
+_TOOL_HANDLERS = {
+    "propose_create_task": _handle_create_task_proposal,
+    "propose_save_memory": _handle_save_memory_proposal,
+    "propose_forget_memory": _handle_forget_memory_proposal,
+}
 
 
 def send_message(
@@ -300,16 +544,19 @@ def send_message(
     "error" turn on model failure, which would pollute future context
     with a fake conversational turn that never actually happened.
 
-    Checkpoint 3.3 routing, in order:
+    Routing, in order:
     1. Message too long / timezone invalid -> reject before persisting anything.
     2. A clear write-intent phrase (delete/edit/mark-done/etc, or a
        create-something-other-than-a-task) -> deterministic decline,
        exactly as before 3.3. Unaffected by any pending proposal.
     3. A pending proposal exists AND the message is a narrow bare
-       yes/no -> deterministic confirm/reject, zero model calls.
-    4. Everything else -> the Orchestrator, with propose_create_task
-       offered and any pending proposal folded into context. A tool
-       call creates/revises a pending proposal (atomically with the
+       yes/no -> deterministic confirm/reject, zero model calls,
+       regardless of the pending proposal's action_type.
+    4. Everything else -> the Orchestrator, with propose_create_task/
+       propose_save_memory/propose_forget_memory all offered and any
+       pending proposal (of whichever type) folded into context, plus
+       (Checkpoint 3.4) the user's own active memories. A tool call
+       creates/revises a pending proposal (atomically with the
        assistant message describing it); no tool call is an ordinary
        answer that leaves any pending proposal untouched.
     """
@@ -342,6 +589,8 @@ def send_message(
         return user_message, assistant_message
 
     context = context_module.gather_context(db, space_id, tomorrow_start, window_end)
+    memories, total_active_memories = memory_service.get_relevant_memories(db, space_id, user_id, limit=_MAX_MEMORIES)
+    context = f"{context}\n\n{_format_memory_context(memories, total_active_memories)}"
     if pending is not None:
         context = f"{context}\n\n## Pending proposal awaiting confirmation\n{_describe_pending_proposal(pending)}"
     history_rows = list_recent_messages(db, space_id, user_id)
@@ -353,34 +602,21 @@ def send_message(
             context=context,
             user_message=content,
             current_datetime_local=current_datetime_local,
-            tools=[_PROPOSE_CREATE_TASK_TOOL],
+            tools=_TOOLS_OFFERED,
         )
     except orchestrator_service.OrchestratorError as exc:
         raise ChatModelCallFailed(user_message.id) from exc
 
-    if result.tool_call is not None and result.tool_call.tool_name == "propose_create_task":
-        try:
-            validated_arguments = actions_service.validate_arguments("create_task", result.tool_call.arguments)
-        except actions_service.InvalidActionArgumentsError:
-            # Validated before anything is persisted — nothing to roll
-            # back. There's no valid structured data to render a
-            # deterministic confirmation from here, so (only in this
-            # error case) the model's own text is used as a fallback.
-            assistant_message = record_assistant_message(
-                db, space_id, user_id, result.text or _INVALID_PROPOSAL_FALLBACK_MESSAGE
+    if result.tool_call is not None:
+        handler = _TOOL_HANDLERS.get(result.tool_call.tool_name)
+        if handler is not None:
+            assistant_message = handler(
+                db, space_id, user_id, result.tool_call.arguments, result.text, timezone_name, content,
             )
             return user_message, assistant_message
 
-        reply_text = _render_create_task_confirmation(validated_arguments, timezone_name, content)
-        assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
-        actions_service.create_pending_action(
-            db, space_id, user_id, assistant_message.id, "create_task",
-            validated_arguments, commit=False,
-        )
-        db.commit()
-        db.refresh(assistant_message)
-        return user_message, assistant_message
-
-    # Ordinary answer — no tool call. Any pending proposal is left untouched.
+    # Ordinary answer — no tool call (or an unrecognized one, which
+    # should never happen since only the three tools above are ever
+    # offered). Any pending proposal is left untouched.
     assistant_message = record_assistant_message(db, space_id, user_id, result.text or _NO_REPLY_FALLBACK_MESSAGE)
     return user_message, assistant_message

@@ -1,15 +1,27 @@
 from datetime import datetime, timedelta, timezone
 
+from pydantic import BaseModel as PydanticBaseModel
 from pydantic import ValidationError
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.modules.actions.models import ProposedAction
 from app.modules.actions.schemas import ConfirmResult
+from app.modules.memory import service as memory_service
+from app.modules.memory.schemas import MemoryCreate, MemoryForget, MemoryResponse
 from app.modules.tasks import service as tasks_service
 from app.modules.tasks.schemas import TaskCreate, TaskResponse
 
 _DEFAULT_TTL_MINUTES = 10
+
+# One Pydantic schema per action_type — the single source of truth for
+# what "valid arguments" means for each, shared between validate_arguments
+# below and confirm_and_execute's own re-parse at execution time.
+_ACTION_ARGUMENT_SCHEMAS: dict[str, type[PydanticBaseModel]] = {
+    "create_task": TaskCreate,
+    "save_memory": MemoryCreate,
+    "forget_memory": MemoryForget,
+}
 
 
 class InvalidActionArgumentsError(Exception):
@@ -31,16 +43,26 @@ def validate_arguments(action_type: str, arguments: dict) -> dict:
     validated data that create_pending_action below will then store —
     never from the model's own free-form reply text. Returns a plain,
     JSON-safe dict (datetimes as ISO strings) suitable for JSONB
-    storage; TaskCreate parses ISO strings back into real datetimes on
-    the way out, so this round-trips correctly.
+    storage; the matching schema parses that representation back on the
+    way out, so this round-trips correctly.
+
+    Checkpoint 3.4 note: this stays a PURE, DB-free shape validator —
+    correct for create_task and save_memory's own scalar fields, but
+    NOT sufficient on its own for forget_memory or save_memory's
+    optional supersedes_memory_id, both of which reference an EXISTING
+    memory row. Resolving those references (does this id exist, is it
+    active, is it owned by this space/user) requires a database lookup
+    and lives in chat_service, right after this shape check succeeds —
+    see chat/service.py's _require_active_memory.
     """
-    if action_type == "create_task":
-        try:
-            validated = TaskCreate(**arguments)
-        except ValidationError as exc:
-            raise InvalidActionArgumentsError(action_type, str(exc)) from exc
-        return validated.model_dump(mode="json")
-    raise InvalidActionArgumentsError(action_type, f"unknown action_type {action_type!r}")
+    schema = _ACTION_ARGUMENT_SCHEMAS.get(action_type)
+    if schema is None:
+        raise InvalidActionArgumentsError(action_type, f"unknown action_type {action_type!r}")
+    try:
+        validated = schema(**arguments)
+    except ValidationError as exc:
+        raise InvalidActionArgumentsError(action_type, str(exc)) from exc
+    return validated.model_dump(mode="json")
 
 
 def _supersede_existing_pending(db: Session, space_id: int, user_id: int) -> None:
@@ -134,9 +156,10 @@ def reject(db: Session, space_id: int, user_id: int) -> bool:
 
 def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResult:
     """Single transaction, covering both the confirm-claim and the real
-    execution — either everything commits together (Task created,
-    proposal 'executed', executed_task_id set) or everything rolls back
-    and the proposal is left exactly as it was.
+    execution — either everything commits together (the domain effect
+    for this row's action_type happens, proposal 'executed', the
+    matching executed_task_id/executed_memory_id set) or everything
+    rolls back and the proposal is left exactly as it was.
 
     The conditional UPDATE below (WHERE status='pending') is the replay
     guard: it takes a real Postgres row-level lock the moment it
@@ -154,6 +177,14 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
     waiting behind a failing first attempt will see 'pending' once the
     first rolls back, and can itself succeed — a natural retry, not
     built specially.
+
+    Checkpoint 3.4: dispatches on the row's OWN action_type, read after
+    the row-lock is already won — not on any assumption from proposal
+    time about which type would be pending. A forget_memory or
+    save_memory-with-supersedes whose target has gone inactive between
+    proposal and confirmation (memory_service returns False) is treated
+    exactly like any other execution failure: raised, caught below,
+    rolled back to 'pending' — no bespoke handling needed for that race.
     """
     stmt = (
         update(ProposedAction)
@@ -172,12 +203,43 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
         return ConfirmResult(outcome="nothing_pending")
 
     try:
-        task_data = TaskCreate(**proposal.arguments)
-        task = tasks_service.create_task(db, space_id, task_data, commit=False)
-        proposal.status = "executed"
-        proposal.executed_task_id = task.id
-        db.commit()
-        return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task))
+        if proposal.action_type == "create_task":
+            task_data = TaskCreate(**proposal.arguments)
+            task = tasks_service.create_task(db, space_id, task_data, commit=False)
+            proposal.status = "executed"
+            proposal.executed_task_id = task.id
+            db.commit()
+            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task))
+
+        if proposal.action_type == "save_memory":
+            memory_data = MemoryCreate(**proposal.arguments)
+            memory = memory_service.create_memory(
+                db, space_id, user_id, proposal.source_chat_message_id, memory_data, commit=False
+            )
+            if memory_data.supersedes_memory_id is not None:
+                superseded = memory_service.supersede_memory(
+                    db, space_id, user_id, memory_data.supersedes_memory_id, memory.id
+                )
+                if not superseded:
+                    raise RuntimeError(
+                        f"supersedes_memory_id {memory_data.supersedes_memory_id} is no longer active"
+                    )
+            proposal.status = "executed"
+            proposal.executed_memory_id = memory.id
+            db.commit()
+            return ConfirmResult(outcome="executed", memory=MemoryResponse.model_validate(memory))
+
+        if proposal.action_type == "forget_memory":
+            forget_data = MemoryForget(**proposal.arguments)
+            forgotten_memory = memory_service.forget_memory(db, space_id, user_id, forget_data.memory_id)
+            if forgotten_memory is None:
+                raise RuntimeError(f"memory_id {forget_data.memory_id} is no longer active")
+            proposal.status = "executed"
+            proposal.executed_memory_id = forgotten_memory.id
+            db.commit()
+            return ConfirmResult(outcome="executed", memory=MemoryResponse.model_validate(forgotten_memory))
+
+        raise RuntimeError(f"unknown action_type {proposal.action_type!r}")
     except Exception:
         db.rollback()
         return ConfirmResult(outcome="execution_failed")

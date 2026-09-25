@@ -54,6 +54,15 @@ def _mock_reply(text: str | None, tool_name: str | None = None, arguments: dict 
     return lambda **kwargs: OrchestratorResult(text=text, tool_call=tool_call)
 
 
+def _get_space_and_user(db_session: Session):
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+    return user, space
+
+
 # ---- persistence and model-failure behavior ------------------------------------
 
 
@@ -728,3 +737,413 @@ def test_no_prompt_or_response_or_key_in_ai_traces_for_chat_calls(
     for row in rows:
         for value in row.values():
             assert marker not in str(value)
+
+
+# ---- Checkpoint 3.4: propose / confirm / reject saving a memory -------------------
+
+
+def test_propose_save_memory_then_confirm_creates_active_memory(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("noted", tool_name="propose_save_memory",
+                    arguments={"type": "PREFERENCE", "content": "Prefers concise answers - memtest1"}),
+    )
+    propose_response = _send(authenticated_client, "remember that I prefer concise answers - memtest1")
+    assert propose_response.status_code == 200
+    assert "Prefers concise answers - memtest1" in propose_response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    before, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    assert not any(m.content == "Prefers concise answers - memtest1" for m in before)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    after, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    matching = [m for m in after if m.content == "Prefers concise answers - memtest1"]
+    assert len(matching) == 1
+    assert matching[0].status == "active"
+
+
+def test_reject_save_memory_proposal_creates_no_memory(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("noted", tool_name="propose_save_memory",
+                    arguments={"type": "FACT", "content": "Rejected memory - memtest2"}),
+    )
+    _send(authenticated_client, "remember that - memtest2")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    decline_response = _send(authenticated_client, "no")
+    assert decline_response.status_code == 200
+    assert decline_response.json()["assistant_message"]["content"] == chat_service._REJECTED_MESSAGE
+
+    user, space = _get_space_and_user(db_session)
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    assert not any(m.content == "Rejected memory - memtest2" for m in memories)
+
+
+def test_duplicate_yes_after_memory_execution_does_not_create_a_second_memory(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("noted", tool_name="propose_save_memory",
+                    arguments={"type": "GOAL", "content": "Duplicate confirm test - memtest3"}),
+    )
+    _send(authenticated_client, "remember my goal - memtest3")
+
+    first_yes = _send(authenticated_client, "yes")
+    assert first_yes.status_code == 200
+
+    # Nothing is locally pending anymore, so a second "yes" is ordinary
+    # conversation — same reasoning already established for tasks.
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply("Sure thing!"))
+    second_yes = _send(authenticated_client, "yes")
+    assert second_yes.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    matching = [m for m in memories if m.content == "Duplicate confirm test - memtest3"]
+    assert len(matching) == 1
+
+
+def test_malformed_save_memory_tool_arguments_create_no_pending_proposal_and_reply_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure, saving that", tool_name="propose_save_memory",
+                    arguments={"content": "no type given - memtest4"}),
+    )
+    response = _send(authenticated_client, "remember something unclear - memtest4")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_model_prose_with_wrong_content_does_not_appear_in_save_memory_confirmation(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "Sure, I'll remember that you love pineapple pizza!",
+            tool_name="propose_save_memory",
+            arguments={"type": "PREFERENCE", "content": "Actually correct preference - memtest5"},
+        ),
+    )
+    response = _send(authenticated_client, "remember my real preference - memtest5")
+    content = response.json()["assistant_message"]["content"]
+    assert "Actually correct preference - memtest5" in content
+    assert "pineapple pizza" not in content
+
+
+def test_end_to_end_save_memory_confirmation_matches_the_memory_later_created(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("irrelevant model prose, ignored", tool_name="propose_save_memory",
+                    arguments={"type": "GOAL", "content": "End to end memory match - memtest6"}),
+    )
+    propose_response = _send(authenticated_client, "remember my goal - memtest6")
+    shown = propose_response.json()["assistant_message"]["content"]
+    assert "End to end memory match - memtest6" in shown
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    created = next(m for m in memories if m.content == "End to end memory match - memtest6")
+    assert created.status == "active"
+    assert created.type == "GOAL"
+
+
+# ---- Checkpoint 3.4: forgetting a memory ------------------------------------------
+
+
+def test_forget_memory_propose_then_confirm_marks_forgotten(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+    memory = memory_service.create_memory(
+        db_session, space.id, user.id, source_id, MemoryCreate(type="GOAL", content="Learn Rust - memtest7")
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure", tool_name="propose_forget_memory", arguments={"memory_id": memory.id}),
+    )
+    propose_response = _send(authenticated_client, "forget that I wanted to learn Rust - memtest7")
+    assert "Learn Rust - memtest7" in propose_response.json()["assistant_message"]["content"]
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    db_session.refresh(memory)
+    assert memory.status == "forgotten"
+
+
+def test_forget_memory_with_nonexistent_memory_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point 5 of the 3.4 revision round: a memory_id that doesn't
+    resolve to anything real (not just belonging to another user — see
+    memory/tests/test_memory.py's own cross-user test for that case) is
+    caught by _require_active_memory before any proposal is created —
+    a safe, honest fallback, not an unhandled exception.
+    """
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure, forgetting that", tool_name="propose_forget_memory", arguments={"memory_id": 999999}),
+    )
+    response = _send(authenticated_client, "forget that thing I mentioned - memtest8")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+# ---- Checkpoint 3.4: retrieval and context assembly -------------------------------
+
+
+def test_relevant_memory_appears_in_a_later_conversations_context(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+    memory_service.create_memory(
+        db_session, space.id, user.id, source_id,
+        MemoryCreate(type="PREFERENCE", content="Explain in Egyptian Arabic, keep terms in English - memtest9"),
+    )
+    db_session.commit()
+
+    captured = {}
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None)),
+    )
+    _send(authenticated_client, "اشرحلي الـ Model Router")
+
+    assert "Explain in Egyptian Arabic, keep terms in English - memtest9" in captured["context"]
+    assert "PREFERENCE" in captured["context"]
+
+
+def test_forgotten_memory_does_not_appear_in_context(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+    memory = memory_service.create_memory(
+        db_session, space.id, user.id, source_id,
+        MemoryCreate(type="FACT", content="Forgotten before retrieval - memtest10"),
+    )
+    memory_service.forget_memory(db_session, space.id, user.id, memory.id)
+    db_session.commit()
+
+    captured = {}
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None)),
+    )
+    _send(authenticated_client, "what's up?")
+
+    assert "Forgotten before retrieval - memtest10" not in captured["context"]
+
+
+def test_inference_type_memory_is_labeled_tentative_in_context(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+    memory_service.create_memory(
+        db_session, space.id, user.id, source_id,
+        MemoryCreate(type="INFERENCE", content="Might be interested in Rust - memtest11"),
+    )
+    db_session.commit()
+
+    captured = {}
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None)),
+    )
+    _send(authenticated_client, "what's up?")
+
+    assert "INFERENCE (tentative, not confirmed as fact): Might be interested in Rust - memtest11" in captured["context"]
+
+
+def test_memory_context_discloses_truncation_when_active_count_exceeds_the_cap(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Point 3 of the 3.4 revision round: applies the same
+    truncated-and-said-so convention already proven for Home's Anytime
+    section (2.5a) to the memory context — including when the user asks
+    the explicit inspection question. Seeds enough ACTIVE memories to
+    exceed chat_service._MAX_MEMORIES regardless of what earlier tests
+    in this shared database left behind (delta-based, not an absolute
+    count), then asserts the deterministic CONTEXT fed to the model
+    (not a live model reply, which we can't assert on) discloses the
+    truncation.
+    """
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+
+    _, baseline_total = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=0)
+    needed = max(0, (chat_service._MAX_MEMORIES + 5) - baseline_total)
+    for i in range(needed):
+        memory_service.create_memory(
+            db_session, space.id, user.id, source_id, MemoryCreate(type="FACT", content=f"Truncation test fact {i}")
+        )
+    db_session.commit()
+
+    captured = {}
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="...", tool_call=None)),
+    )
+    _send(authenticated_client, "إيه اللي فاكره عني؟")
+
+    assert "more not shown" in captured["context"]
+
+
+def test_correction_via_chat_supersedes_the_previous_active_memory(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+    old = memory_service.create_memory(
+        db_session, space.id, user.id, source_id, MemoryCreate(type="FACT", content="Works at a bank - memtest12")
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "got it, updating that",
+            tool_name="propose_save_memory",
+            arguments={
+                "type": "FACT", "content": "No longer works at a bank - memtest12",
+                "supersedes_memory_id": old.id,
+            },
+        ),
+    )
+    _send(authenticated_client, "I don't work at a bank anymore - memtest12")
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    db_session.refresh(old)
+    assert old.status == "superseded"
+
+    # The superseded memory is NOT retrieved as current truth — only the
+    # new one appears in an active-memory read.
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    assert not any(m.id == old.id for m in memories)
+    assert any(m.content == "No longer works at a bank - memtest12" for m in memories)
+    assert old.superseded_by_id == next(m.id for m in memories if m.content == "No longer works at a bank - memtest12")
+
+
+# ---- Checkpoint 3.4: cross-action-type proposal supersession ----------------------
+
+
+def test_pending_create_task_proposal_is_superseded_by_a_new_save_memory_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("ok", tool_name="propose_create_task", arguments={"title": "Draft task - crosstest1"}),
+    )
+    _send(authenticated_client, "make a task called Draft task - crosstest1")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("ok", tool_name="propose_save_memory",
+                    arguments={"type": "PREFERENCE", "content": "Cross type memory - crosstest1"}),
+    )
+    _send(authenticated_client, "actually, remember that I prefer X - crosstest1")
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "Draft task - crosstest1" for t in tasks)
+
+    user, space = _get_space_and_user(db_session)
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    assert any(m.content == "Cross type memory - crosstest1" for m in memories)
+
+
+def test_pending_save_memory_proposal_is_superseded_by_a_new_create_task_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("ok", tool_name="propose_save_memory",
+                    arguments={"type": "PREFERENCE", "content": "Should not be saved - crosstest2"}),
+    )
+    _send(authenticated_client, "remember that I prefer Y - crosstest2")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("ok", tool_name="propose_create_task", arguments={"title": "Real task - crosstest2"}),
+    )
+    _send(authenticated_client, "actually, make a task called Real task - crosstest2")
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "Real task - crosstest2" for t in tasks)
+
+    user, space = _get_space_and_user(db_session)
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    assert not any(m.content == "Should not be saved - crosstest2" for m in memories)

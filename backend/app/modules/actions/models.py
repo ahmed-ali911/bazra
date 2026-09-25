@@ -37,9 +37,24 @@ class ProposedAction(BaseModel, SpaceScopedMixin):
     'pending' rather than reaching a terminal failure state.
 
     expires_at bounds how long a "yes" can retroactively execute
-    something the user might have forgotten about. executed_task_id is
-    set only after real execution — the concrete link
-    "verify after execution" checks against.
+    something the user might have forgotten about. executed_task_id/
+    executed_memory_id are set only after real execution — the concrete
+    link "verify after execution" checks against.
+
+    Checkpoint 3.4 generalized this module (rather than building a
+    parallel memory-specific proposal/confirm system) to also cover
+    save_memory/forget_memory: the row-lock/single-transaction design
+    above is safety-critical and took real iteration to get right in
+    3.3 — reusing it here, with confirm_and_execute dispatching on
+    action_type, means that guarantee (and its real two-thread
+    concurrency test) extends to Memory for free rather than being
+    re-derived and re-tested from scratch. executed_task_id and
+    executed_memory_id are two separate, real, type-safe FK columns —
+    not a single polymorphic (entity_type, entity_id) pair — matching
+    this project's established preference for concrete FK constraints
+    over loosely-typed generic references (see LifeArea's own docstring
+    for the same reasoning applied elsewhere). At most one of the two
+    is ever set, depending on this row's action_type.
     """
 
     __tablename__ = "proposed_actions"
@@ -51,3 +66,4 @@ class ProposedAction(BaseModel, SpaceScopedMixin):
     status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     executed_task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), nullable=True, index=True)
+    executed_memory_id: Mapped[int | None] = mapped_column(ForeignKey("memories.id"), nullable=True, index=True)
