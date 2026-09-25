@@ -11,8 +11,21 @@ VALID_PURPOSES: frozenset[str] = frozenset({"chat_completion", "memory_extractio
 
 
 @dataclass
+class ToolUseBlock:
+    """One structured tool-call the model made, if any — Checkpoint 3.3.
+    name/input come straight from the provider's own tool_use content
+    block; input is NOT re-validated here (that happens at the domain
+    boundary, e.g. against TaskCreate, in whichever module owns the
+    tool)."""
+
+    name: str
+    input: dict
+
+
+@dataclass
 class ModelResponse:
-    text: str
+    text: str | None
     model: str
     prompt_tokens: int
     completion_tokens: int
+    tool_uses: list[ToolUseBlock]

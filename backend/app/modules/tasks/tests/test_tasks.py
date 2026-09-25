@@ -174,3 +174,48 @@ def test_space_isolation_across_fetch_update_and_delete(
     ).one()
     assert row.title == "Space A's task"
     assert row.archived_at is None
+
+
+def test_create_task_with_commit_false_defers_to_the_callers_own_commit(db_session: Session) -> None:
+    """The Checkpoint 3.3 escape hatch, mirroring inbox_service.create_item's
+    own commit=False parameter — the row must not be durably visible
+    until the CALLER commits, but task.id must already be populated
+    (via flush) so the caller can reference it (e.g. as a FK) before
+    that commit happens.
+    """
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+
+    task = tasks_service.create_task(
+        db_session, space.id, TaskCreate(title="Uncommitted task"), commit=False
+    )
+    assert task.id is not None  # flushed, not just added
+
+    # A FRESH session must not see it yet — nothing was committed.
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    fresh_session = sessionmaker(bind=db_session.get_bind())()
+    try:
+        row = fresh_session.execute(
+            text("SELECT count(*) FROM tasks WHERE id = :id"), {"id": task.id}
+        ).scalar_one()
+        assert row == 0
+    finally:
+        fresh_session.close()
+
+    db_session.commit()  # the caller's own covering commit
+
+    fresh_session = sessionmaker(bind=db_session.get_bind())()
+    try:
+        row = fresh_session.execute(
+            text("SELECT count(*) FROM tasks WHERE id = :id"), {"id": task.id}
+        ).scalar_one()
+        assert row == 1
+    finally:
+        fresh_session.close()

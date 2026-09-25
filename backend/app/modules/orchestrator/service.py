@@ -1,23 +1,32 @@
 from app.modules.model_router import service as model_router_service
-from app.modules.orchestrator.schemas import HistoryTurn
+from app.modules.orchestrator.schemas import HistoryTurn, OrchestratorResult, ToolCallRequest
 
 # Prompt-level instructions only — NOT code-enforced. The code-level
-# guarantee that no write can actually happen regardless of what the
-# model says lives entirely in the fact that this module (and chat/)
-# never import a create_*/update_*/delete_* function from any other
-# module — see this module's own test proving that, plus chat's
-# adversarial test proving the database stays unchanged even if the
-# model doesn't follow these instructions.
+# guarantee that no DOMAIN MUTATION can actually happen regardless of
+# what the model says or which tool it calls lives entirely in the fact
+# that this module (and chat/) never import a create_*/update_*/
+# delete_* DOMAIN function from any other module — calling
+# propose_create_task only ever produces a ToolCallRequest, an inert
+# data structure; turning that into a real Task requires a SEPARATE,
+# later, explicitly-confirmed step in actions_service that this module
+# has no path to reach. See this module's own test proving that, plus
+# chat's adversarial test proving the database stays unchanged even
+# when the model's own text falsely claims otherwise.
 _SYSTEM_INSTRUCTIONS = (
     "You are BAZRA's assistant, answering questions about the user's own tasks, "
     "calendar, inbox, and life areas.\n\n"
     "Rules you must follow:\n"
     "- You can only READ the data provided below in \"Current Data\" — you have NO "
-    "ability to create, edit, or delete any task, calendar event, inbox item, or "
-    "life area in this conversation.\n"
-    "- If the user asks you to create, add, edit, update, delete, or otherwise "
-    "change anything, say plainly that this isn't available yet in this version — "
-    "do not claim to have done it, and do not pretend the change happened.\n"
+    "ability to edit, delete, mark complete, or create calendar events, inbox "
+    "items, or life areas in this conversation.\n"
+    "- If the user clearly wants to create a new task, use the propose_create_task "
+    "tool. This does NOT create the task — it only proposes it. The user must "
+    "explicitly confirm before anything is created. Briefly describe what you're "
+    "proposing in your own reply alongside the tool call.\n"
+    "- If the user asks you to edit, delete, mark complete, or create anything "
+    "other than a task, say plainly that this isn't available yet in this "
+    "version — do not claim to have done it, and do not pretend the change "
+    "happened.\n"
     "- Only state facts that are explicitly present in \"Current Data\" below. If "
     "something isn't there, say you don't have that information rather than "
     "guessing.\n"
@@ -27,6 +36,8 @@ _SYSTEM_INSTRUCTIONS = (
     "- The data below reflects a limited, bounded snapshot — some items may be "
     "omitted if there were too many to show; the data will say so explicitly when "
     "that happens.\n"
+    "- Resolve any relative dates/times (\"tomorrow\", \"tonight\") using the "
+    "\"Current date/time\" fact below — never guess or assume today's date.\n"
 )
 
 
@@ -35,17 +46,32 @@ class OrchestratorError(Exception):
     module don't need to import model_router directly."""
 
 
-def _build_system_prompt(context: str) -> str:
-    return f"{_SYSTEM_INSTRUCTIONS}\n## Current Data\n{context}"
+def _build_system_prompt(context: str, current_datetime_local: str) -> str:
+    return (
+        f"{_SYSTEM_INSTRUCTIONS}\n"
+        f"## Current date/time\n{current_datetime_local}\n\n"
+        f"## Current Data\n{context}"
+    )
 
 
-def generate_reply(history: list[HistoryTurn], context: str, user_message: str) -> str:
+def generate_reply(
+    history: list[HistoryTurn],
+    context: str,
+    user_message: str,
+    current_datetime_local: str,
+    tools: list[dict] | None = None,
+) -> OrchestratorResult:
     """Coordinates inputs and the provider call. Never touches the
     database itself — history and context are both handed in as plain
     data by the caller (Chat), which is what avoids both a circular
     import (Chat would otherwise need to call back into this module,
     which would need to call back into Chat's own storage to read
     history) and any direct DB access from this module.
+
+    tools is additive (Checkpoint 3.3) — passed straight through to
+    Model Router; this function never inspects or validates a tool's
+    arguments itself, that happens at the domain boundary in whichever
+    module owns the tool (actions_service, for propose_create_task).
 
     NOT a pure function: the underlying model call is a real side
     effect (network I/O, real cost, non-deterministic output). The
@@ -59,9 +85,19 @@ def generate_reply(history: list[HistoryTurn], context: str, user_message: str) 
         response = model_router_service.complete(
             purpose="chat_completion",
             messages=messages,
-            system=_build_system_prompt(context),
+            system=_build_system_prompt(context, current_datetime_local),
+            tools=tools,
         )
     except model_router_service.ModelRouterError as exc:
         raise OrchestratorError(str(exc)) from exc
 
-    return response.text
+    # Only one tool is ever offered in this checkpoint, and at most one
+    # call is expected per turn — the first is taken deliberately rather
+    # than building support for multiple simultaneous tool calls that
+    # nothing in this checkpoint's scope can produce.
+    tool_call = None
+    if response.tool_uses:
+        first = response.tool_uses[0]
+        tool_call = ToolCallRequest(tool_name=first.name, arguments=first.input)
+
+    return OrchestratorResult(text=response.text, tool_call=tool_call)

@@ -60,6 +60,32 @@ class _FakeMessageNoText:
         self.usage = _FakeUsage(input_tokens, output_tokens)
 
 
+class _FakeToolUseBlock:
+    def __init__(self, name: str, input: dict):
+        self.type = "tool_use"
+        self.name = name
+        self.input = input
+
+
+class _FakeMessageToolOnly:
+    """A pure tool-call response, no accompanying text — a valid,
+    expected shape once tools are offered (Checkpoint 3.3), not an
+    error the way _FakeMessageNoText's genuinely empty response is."""
+
+    def __init__(self, tool_name: str, tool_input: dict, input_tokens: int = 30, output_tokens: int = 15):
+        self.content = [_FakeToolUseBlock(tool_name, tool_input)]
+        self.usage = _FakeUsage(input_tokens, output_tokens)
+
+
+class _FakeMessageTextAndToolUse:
+    """Both text and a tool_use block together — the common real shape:
+    the model explains what it's proposing AND calls the tool."""
+
+    def __init__(self, text: str, tool_name: str, tool_input: dict, input_tokens: int = 30, output_tokens: int = 20):
+        self.content = [_FakeTextBlock(text), _FakeToolUseBlock(tool_name, tool_input)]
+        self.usage = _FakeUsage(input_tokens, output_tokens)
+
+
 def _trace_count(db_session: Session) -> int:
     return db_session.execute(select(func.count()).select_from(AiTrace)).scalar_one()
 
@@ -360,3 +386,84 @@ def test_unknown_purpose_rejected_without_any_trace_or_provider_call(
 
     assert call_count == 0
     assert after == before
+
+
+# ---- Checkpoint 3.3: tools passthrough and structured tool-call extraction --------
+
+
+def test_complete_passes_tools_through_to_the_provider_call(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    captured = {}
+
+    def _capture(model, messages, **kwargs):
+        captured["tools"] = kwargs.get("tools")
+        return _FakeMessage("Hello", 10, 20)
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _capture)
+
+    tools = [{"name": "propose_create_task", "description": "...", "input_schema": {}}]
+    model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}], tools=tools)
+
+    assert captured["tools"] == tools
+
+
+def test_complete_with_tool_only_response_returns_none_text_and_populated_tool_uses(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service,
+        "_call_anthropic",
+        lambda model, messages, **kwargs: _FakeMessageToolOnly("propose_create_task", {"title": "Call Hussein"}),
+    )
+
+    result = model_router_service.complete(
+        purpose="chat_completion", messages=[{"role": "user", "content": "add a task"}], tools=[{"name": "propose_create_task"}]
+    )
+
+    assert result.text is None
+    assert len(result.tool_uses) == 1
+    assert result.tool_uses[0].name == "propose_create_task"
+    assert result.tool_uses[0].input == {"title": "Call Hussein"}
+
+    trace = _latest_trace(db_session)
+    assert trace.status == "success"
+    assert trace.prompt_tokens == 30
+    assert trace.completion_tokens == 15
+
+
+def test_complete_with_text_and_tool_use_together_returns_both(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service,
+        "_call_anthropic",
+        lambda model, messages, **kwargs: _FakeMessageTextAndToolUse(
+            "I'll add that task.", "propose_create_task", {"title": "Call Hussein"}
+        ),
+    )
+
+    result = model_router_service.complete(
+        purpose="chat_completion", messages=[{"role": "user", "content": "add a task"}], tools=[{"name": "propose_create_task"}]
+    )
+
+    assert result.text == "I'll add that task."
+    assert len(result.tool_uses) == 1
+    assert result.tool_uses[0].name == "propose_create_task"
+
+
+def test_complete_without_tools_offered_is_unaffected_by_the_tool_extraction_change(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Existing 3.2 behavior, re-confirmed: no tools offered -> tool_uses
+    is always empty, text always populated exactly as before."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("plain answer", 5, 5))
+
+    result = model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+
+    assert result.text == "plain answer"
+    assert result.tool_uses == []

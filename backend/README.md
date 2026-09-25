@@ -45,7 +45,9 @@ Endpoints (all under `/api/v1`):
 - `GET /auth/me` — `{"authenticated": true}` if the cookie is valid, 401
   otherwise; the template every future protected route copies
 
-## Known Limitations & Future Work (Checkpoint 3.2)
+## Known Limitations & Future Work
+
+### Checkpoint 3.2
 
 - **Arabic write-intent detection is a UX/routing heuristic, not a
   data-safety boundary.** `app/modules/chat/write_intent.py`'s regex-based
@@ -56,24 +58,54 @@ Endpoints (all under `/api/v1`):
   `\b`-equivalent word boundary), which is fragile. This is NOT a
   data-safety risk: tracing every actual import and call site from
   `chat/` and `orchestrator/` confirms no write-capable domain function
-  is ever called, no `tools` parameter is sent to Anthropic, and no
-  model-output-to-action execution path exists — a detector error can
-  only affect routing/UX and model cost, never mutate Tasks,
-  CalendarEvents, LifeAreas, or InboxItems. Left unpatched for this
-  checkpoint deliberately, pending native-speaker review.
+  is ever called outside the single, explicitly-confirmed path added in
+  Checkpoint 3.3 (see below) — a detector error can only affect
+  routing/UX and model cost, never mutate Tasks, CalendarEvents,
+  LifeAreas, or InboxItems directly. Left unpatched deliberately, pending
+  native-speaker review. (Checkpoint 3.3 narrowed the CREATE patterns to
+  no longer match task-creation phrasing at all — see below — but the
+  same substring/negation weaknesses remain for the delete/edit/mark-done
+  patterns this heuristic still gates.)
 
-- **Future: write-enabled Chat must revisit intent architecture before
-  any domain mutation capability is exposed.** A future checkpoint should
-  evaluate structured intent classification / policy / permissions
-  against regex heuristics before any write action is ever wired up to
-  Chat — not decided or implemented yet.
+- ~~Future: write-enabled Chat must revisit intent architecture before any
+  domain mutation capability is exposed.~~ **Resolved in Checkpoint
+  3.3**: task creation is now a real (if narrow) capability, gated by an
+  explicit user confirmation step rather than a policy/permissions layer
+  — see below.
 
-- **Future: current date/time/timezone should be supplied as runtime
-  context, not guessed by the model.** Live testing showed the model
-  correctly declining to answer "what is the date of today" — its
-  context contains no current-date fact. Confirms this needs to become
-  runtime context (or a cheap local capability) in a future checkpoint,
-  not implemented here.
+- ~~Future: current date/time/timezone should be supplied as runtime
+  context, not guessed by the model.~~ **Resolved in Checkpoint 3.3**:
+  the client sends its resolved IANA timezone name; the server computes
+  its own trustworthy current instant and folds the local date/time into
+  the system prompt as a `## Current date/time` fact.
+
+### Checkpoint 3.3
+
+- **A cancellation embedded in a longer message ("actually, never mind,
+  let's talk about something else") is not recognized as a decline.**
+  `chat/service.py`'s `_classify_narrow_yes_no` only recognizes a message
+  when, after trimming whitespace/punctuation, its ENTIRE content is one
+  of a small closed set of bare confirm/decline phrases ("yes", "no",
+  "cancel", "نعم", "لا", ...) — deliberately narrow, to avoid
+  misclassifying an ordinary sentence that merely contains one of these
+  words as a confirmation or cancellation. A decline phrase mixed into a
+  longer sentence therefore falls through to the Orchestrator instead:
+  the pending proposal is still described in its context, but nothing
+  code-level forces the model to treat the message as a cancellation, so
+  the proposal may simply be left pending until it expires on its own
+  (10 minutes by default — see `actions/service.py`'s
+  `_DEFAULT_TTL_MINUTES`). No incorrect task is ever created by this gap
+  — the failure mode is an unwanted pending proposal sitting inert until
+  expiry, not a false mutation. Left unpatched deliberately for this
+  checkpoint; a real intent classifier (or a dedicated
+  cancel/reject tool offered alongside `propose_create_task`) would be
+  the natural fix.
+
+- **Only one pending proposal at a time, per (space, user).** Creating a
+  new proposal (fresh or a revision) always supersedes any existing
+  pending one first (`actions/service.py`'s `_supersede_existing_pending`)
+  — there is no multi-proposal queue. This is a deliberate scope
+  limitation, not an oversight.
 
 ## Run locally (without Docker)
 

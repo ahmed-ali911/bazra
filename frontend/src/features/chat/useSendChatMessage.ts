@@ -13,6 +13,7 @@ export function useSendChatMessage() {
         content,
         tomorrow_start: tomorrowStart,
         window_end: windowEnd,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       });
     },
     onSettled: () => {

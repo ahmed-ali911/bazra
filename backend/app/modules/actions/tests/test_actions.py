@@ -1,0 +1,245 @@
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from sqlalchemy.orm import Session
+
+from app.modules.actions import service as actions_service
+from app.modules.actions.models import ProposedAction
+from app.modules.auth import service as auth_service
+from app.modules.chat import service as chat_service
+from app.modules.spaces import service as spaces_service
+
+
+@pytest.fixture()
+def owner(db_session: Session):
+    """Self-contained user+space setup — does not rely on some other test
+    file having run first (and possibly created the single User row),
+    the same idempotent lazy-creation idiom authenticated_client uses.
+    """
+    from app.modules.auth.models import User
+
+    user = auth_service.get_the_user(db_session)
+    if user is None:
+        user = User(password_hash=auth_service.hash_password("owner-fixture-password"))
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    space = spaces_service.get_or_create_default_space_for_user(db_session, user.id)
+    return user, space
+
+
+def _seed_source_message(db_session: Session, space_id: int, user_id: int) -> int:
+    message = chat_service.record_assistant_message(db_session, space_id, user_id, "proposal text")
+    return message.id
+
+
+# ---- create_pending_action --------------------------------------------------------
+
+
+def test_create_pending_action_stores_validated_arguments(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task",
+        {"title": "Call Hussein", "due_at": "2030-06-16T10:00:00+00:00"},
+    )
+
+    assert proposal.status == "pending"
+    assert proposal.arguments["title"] == "Call Hussein"
+    assert proposal.source_chat_message_id == source_id
+    assert proposal.expires_at > datetime.now(timezone.utc)
+
+
+def test_create_pending_action_rejects_malformed_arguments_and_creates_no_row(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.create_pending_action(
+            db_session, space.id, user.id, source_id, "create_task", {}  # missing required "title"
+        )
+
+    count = db_session.query(ProposedAction).filter(ProposedAction.source_chat_message_id == source_id).count()
+    assert count == 0
+
+
+def test_create_pending_action_supersedes_any_existing_pending(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+
+    first = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "First"}
+    )
+    second_source_id = _seed_source_message(db_session, space.id, user.id)
+    second = actions_service.create_pending_action(
+        db_session, space.id, user.id, second_source_id, "create_task", {"title": "Second"}
+    )
+
+    db_session.refresh(first)
+    assert first.status == "superseded"
+    assert second.status == "pending"
+    assert actions_service.get_latest_pending(db_session, space.id, user.id).id == second.id
+
+
+# ---- confirm_and_execute -----------------------------------------------------------
+
+
+def test_confirm_and_execute_creates_the_real_task(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "Call Hussein"}
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.task.title == "Call Hussein"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is None  # no longer pending
+
+    from app.modules.tasks import service as tasks_service
+    task = tasks_service.get_task(db_session, space.id, result.task.id)
+    assert task is not None
+    assert task.title == "Call Hussein"
+
+
+def test_confirm_and_execute_with_nothing_pending(db_session: Session, owner) -> None:
+    user, space = owner
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "nothing_pending"
+    assert result.task is None
+
+
+def test_confirm_and_execute_expired_proposal_is_treated_as_nothing_pending(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "Too late"}, ttl_minutes=10
+    )
+    proposal.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db_session.commit()
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "nothing_pending"
+
+    from app.modules.tasks import service as tasks_service
+    tasks = tasks_service.list_tasks(db_session, space.id)
+    assert not any(t.title == "Too late" for t in tasks)
+
+
+def test_confirm_and_execute_failure_rolls_back_to_pending_not_a_terminal_state(
+    db_session: Session, owner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chosen MVP semantics: an execution failure rolls the WHOLE
+    transaction back, including the confirmed-transition itself — the
+    proposal ends up genuinely 'pending' again, not a separate 'failed'
+    state, and is safely re-confirmable (retry = say yes again).
+    """
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "Will fail"}
+    )
+    proposal_id = proposal.id
+
+    from app.modules.tasks import service as tasks_service
+
+    monkeypatch.setattr(
+        tasks_service, "create_task", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("simulated DB failure"))
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    db_session.rollback()  # ensure we read the durable, post-rollback state, not any leftover session cache
+    from sqlalchemy import select
+
+    fresh = db_session.execute(select(ProposedAction).where(ProposedAction.id == proposal_id)).scalar_one()
+    assert fresh.status == "pending"  # NOT 'failed' — rolled back to pending, per the chosen MVP semantics
+    assert fresh.executed_task_id is None
+
+    real_tasks = tasks_service.list_tasks(db_session, space.id)
+    assert not any(t.title == "Will fail" for t in real_tasks)
+
+
+def test_confirm_and_execute_retry_after_failure_succeeds(
+    db_session: Session, owner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The retry model IS the confirmation model: after a failed
+    attempt leaves the proposal pending, confirming again (as if the
+    user just said "yes" a second time) succeeds normally once the
+    underlying problem is gone."""
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "Retry me"}
+    )
+
+    from app.modules.tasks import service as tasks_service
+
+    real_create_task = tasks_service.create_task
+    monkeypatch.setattr(tasks_service, "create_task", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    first_attempt = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert first_attempt.outcome == "execution_failed"
+
+    monkeypatch.setattr(tasks_service, "create_task", real_create_task)
+    second_attempt = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert second_attempt.outcome == "executed"
+    assert second_attempt.task.title == "Retry me"
+
+
+# ---- reject --------------------------------------------------------------------------
+
+
+def test_reject_marks_pending_as_rejected_and_creates_no_task(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "Never mind"}
+    )
+
+    rejected = actions_service.reject(db_session, space.id, user.id)
+    assert rejected is True
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    from app.modules.tasks import service as tasks_service
+    tasks = tasks_service.list_tasks(db_session, space.id)
+    assert not any(t.title == "Never mind" for t in tasks)
+
+
+def test_reject_with_nothing_pending_returns_false(db_session: Session, owner) -> None:
+    user, space = owner
+    assert actions_service.reject(db_session, space.id, user.id) is False
+
+
+# ---- cross-user / cross-space isolation ------------------------------------------------
+
+
+def test_cross_user_isolation_for_confirm_reject_and_lookup(db_session: Session, owner) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "User A's task"}
+    )
+
+    from app.modules.auth.models import User
+    from app.modules.spaces.models import Space
+
+    other_user = User(password_hash=auth_service.hash_password("other"))
+    db_session.add(other_user)
+    db_session.commit()
+    db_session.refresh(other_user)
+    other_space = Space(name="Other space", is_default=True, user_id=other_user.id)
+    db_session.add(other_space)
+    db_session.commit()
+    db_session.refresh(other_space)
+
+    assert actions_service.get_latest_pending(db_session, other_space.id, other_user.id) is None
+    assert actions_service.confirm_and_execute(db_session, other_space.id, other_user.id).outcome == "nothing_pending"
+    assert actions_service.reject(db_session, other_space.id, other_user.id) is False
+
+    # The original proposal is untouched by the other user's attempts.
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is not None

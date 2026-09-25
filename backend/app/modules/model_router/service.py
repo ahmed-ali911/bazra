@@ -10,7 +10,7 @@ from sqlalchemy.orm import sessionmaker
 from app.config import settings
 from app.database import SessionLocal
 from app.modules.model_router.models import AiTrace
-from app.modules.model_router.schemas import ModelCallPurpose, ModelResponse, VALID_PURPOSES
+from app.modules.model_router.schemas import ModelCallPurpose, ModelResponse, ToolUseBlock, VALID_PURPOSES
 
 logger = logging.getLogger(__name__)
 
@@ -48,23 +48,47 @@ def _get_client() -> Anthropic:
     return Anthropic(api_key=settings.anthropic_api_key)
 
 
-def _call_anthropic(model: str, messages: list[dict[str, str]], system: str | None = None) -> Message:
+def _call_anthropic(
+    model: str,
+    messages: list[dict[str, str]],
+    system: str | None = None,
+    tools: list[dict] | None = None,
+) -> Message:
     """The only function in this module that talks to the Anthropic SDK
     directly — everything else in complete() is boundary/bookkeeping
     logic around this one call. system is Anthropic's own separate
     top-level parameter, not a role inside `messages` — the Messages API
-    has no "system" message role."""
+    has no "system" message role. tools is additive (Checkpoint 3.3) —
+    omitted entirely when not passed, so existing callers see no change
+    in the request shape at all."""
     kwargs = {"model": model, "max_tokens": _MAX_TOKENS, "messages": messages}
     if system is not None:
         kwargs["system"] = system
+    if tools is not None:
+        kwargs["tools"] = tools
     return _get_client().messages.create(**kwargs)
 
 
-def _extract_text(message: Message) -> str:
+def _extract_response_parts(message: Message) -> tuple[str | None, list[ToolUseBlock]]:
+    """Replaces the old _extract_text (Checkpoint 3.2) now that a
+    response can legitimately contain a tool_use block instead of, or
+    alongside, text — a pure tool-call response with no text at all is
+    an expected, valid shape when tools were offered, not an error.
+    Still raises if there is NEITHER text NOR a tool use at all, which
+    remains a genuinely malformed/empty response — the same failure
+    boundary as before, just no longer over-triggering on the new,
+    valid tool-only case.
+    """
     text_parts = [block.text for block in message.content if getattr(block, "type", None) == "text"]
-    if not text_parts:
-        raise ValueError("No text content in provider response")
-    return "".join(text_parts)
+    tool_uses = [
+        ToolUseBlock(name=block.name, input=block.input)
+        for block in message.content
+        if getattr(block, "type", None) == "tool_use"
+    ]
+    text = "".join(text_parts) if text_parts else None
+    if text is None and not tool_uses:
+        raise ValueError("No text content or tool use in provider response")
+    return text, tool_uses
 
 
 def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> Decimal | None:
@@ -147,13 +171,24 @@ def _safe_record_trace(**fields) -> bool:
         return False
 
 
-def complete(purpose: ModelCallPurpose, messages: list[dict[str, str]], system: str | None = None) -> ModelResponse:
+def complete(
+    purpose: ModelCallPurpose,
+    messages: list[dict[str, str]],
+    system: str | None = None,
+    tools: list[dict] | None = None,
+) -> ModelResponse:
     """The only function other modules call to reach a model provider.
 
     system is an additive, backward-compatible parameter (Checkpoint
     3.2) — Anthropic's Messages API takes system instructions as their
     own top-level parameter, not a role inside `messages`. Existing
     callers that never pass it are unaffected.
+
+    tools is additive (Checkpoint 3.3) — when provided, the model may
+    respond with a tool_use block instead of, or alongside, text; when
+    omitted, behavior is byte-for-byte identical to before this
+    checkpoint. ModelResponse.text may be None only when tools were
+    offered and the model chose to call one with no accompanying text.
 
     Guarantees, stated explicitly rather than assumed:
     - The provider call failing (auth, network, rate limit, missing key)
@@ -186,7 +221,7 @@ def complete(purpose: ModelCallPurpose, messages: list[dict[str, str]], system: 
     try:
         if not settings.anthropic_api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not configured")
-        raw = _call_anthropic(model, messages, system=system)
+        raw = _call_anthropic(model, messages, system=system, tools=tools)
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
         _safe_record_trace(
@@ -213,7 +248,7 @@ def complete(purpose: ModelCallPurpose, messages: list[dict[str, str]], system: 
     try:
         prompt_tokens = raw.usage.input_tokens
         completion_tokens = raw.usage.output_tokens
-        text = _extract_text(raw)
+        text, tool_uses = _extract_response_parts(raw)
     except Exception as exc:
         # prompt_tokens/completion_tokens survive from above even if the
         # failure happened on the _extract_text line — real,
@@ -254,4 +289,10 @@ def complete(purpose: ModelCallPurpose, messages: list[dict[str, str]], system: 
     ):
         logger.error("model_router: trace persistence failed for a successful call (purpose=%s)", purpose)
 
-    return ModelResponse(text=text, model=model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+    return ModelResponse(
+        text=text,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        tool_uses=tool_uses,
+    )

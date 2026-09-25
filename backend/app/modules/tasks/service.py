@@ -146,11 +146,25 @@ def get_task(db: Session, space_id: int, task_id: int) -> Task | None:
     return db.execute(query).scalar_one_or_none()
 
 
-def create_task(db: Session, space_id: int, data: TaskCreate) -> Task:
+def create_task(db: Session, space_id: int, data: TaskCreate, commit: bool = True) -> Task:
+    """commit=True by default so this remains directly callable/committing
+    on its own. A caller that needs this insert as part of its OWN atomic
+    write (Checkpoint 3.3's actions_service.confirm_and_execute, so a
+    ProposedAction can never end up durably 'executed' with no
+    corresponding Task, or vice versa) passes commit=False and performs
+    the single covering db.commit() itself — the same escape hatch
+    already established for inbox_service.create_item in Checkpoint 2.4.
+    """
     task = Task(space_id=space_id, **data.model_dump())
     db.add(task)
-    db.commit()
-    db.refresh(task)
+    if commit:
+        db.commit()
+        db.refresh(task)
+    else:
+        # The caller needs task.id (e.g. to set a FK to it) before its own
+        # covering commit — flush assigns the PK without ending the
+        # transaction, unlike commit.
+        db.flush()
     return task
 
 

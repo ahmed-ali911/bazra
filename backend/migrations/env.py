@@ -10,6 +10,7 @@ from app.core.base import Base
 # Base.metadata before autogenerate compares it against the real database —
 # SQLAlchemy only populates the declarative registry for modules that have
 # actually been imported somewhere in the process.
+from app.modules.actions import models as actions_models  # noqa: F401,E402
 from app.modules.auth import models as auth_models  # noqa: F401,E402
 from app.modules.calendar import models as calendar_models  # noqa: F401,E402
 from app.modules.chat import models as chat_models  # noqa: F401,E402

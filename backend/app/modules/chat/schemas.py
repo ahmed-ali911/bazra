@@ -16,6 +16,7 @@ class SendMessageRequest(BaseModel):
     content: str
     tomorrow_start: datetime
     window_end: datetime
+    timezone: str
 
 
 class SendMessageResponse(BaseModel):

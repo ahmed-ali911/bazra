@@ -1,3 +1,4 @@
+import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -9,9 +10,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.modules.chat import service as chat_service
 from app.modules.chat.models import ChatMessage
 from app.modules.orchestrator import service as orchestrator_service
+from app.modules.orchestrator.schemas import OrchestratorResult, ToolCallRequest
 
 TOMORROW_START = datetime(2030, 6, 15, 0, 0, tzinfo=timezone.utc)
 WINDOW_END = TOMORROW_START + timedelta(days=7)
+_DEFAULT_TIMEZONE = "Africa/Cairo"
 
 
 @pytest.fixture(autouse=True)
@@ -29,16 +32,26 @@ def _redirect_model_router_trace_session(test_engine: Engine, monkeypatch: pytes
     monkeypatch.setattr(model_router_service, "_trace_session_factory", sessionmaker(bind=test_engine))
 
 
-def _send(client: TestClient, content: str) -> dict:
+def _send(client: TestClient, content: str, timezone_name: str = _DEFAULT_TIMEZONE) -> dict:
     response = client.post(
         "/api/v1/chat/messages",
-        json={"content": content, "tomorrow_start": TOMORROW_START.isoformat(), "window_end": WINDOW_END.isoformat()},
+        json={
+            "content": content,
+            "tomorrow_start": TOMORROW_START.isoformat(),
+            "window_end": WINDOW_END.isoformat(),
+            "timezone": timezone_name,
+        },
     )
     return response
 
 
 def _message_count(db_session: Session) -> int:
     return db_session.execute(select(func.count()).select_from(ChatMessage)).scalar_one()
+
+
+def _mock_reply(text: str | None, tool_name: str | None = None, arguments: dict | None = None):
+    tool_call = ToolCallRequest(tool_name, arguments or {}) if tool_name else None
+    return lambda **kwargs: OrchestratorResult(text=text, tool_call=tool_call)
 
 
 # ---- persistence and model-failure behavior ------------------------------------
@@ -63,8 +76,12 @@ def test_chat_persists_user_message_immediately_even_on_model_failure(
     ).one()
     assert row.role == "user"
 
+    # Scoped to id > this user_message's own id, not a bare global count —
+    # other test files in this shared database may have already created
+    # assistant messages of their own before this test runs.
     assistant_rows = db_session.execute(
-        text("SELECT count(*) FROM chat_messages WHERE role = 'assistant'")
+        text("SELECT count(*) FROM chat_messages WHERE role = 'assistant' AND id > :uid"),
+        {"uid": user_message_id},
     ).scalar_one()
     assert assistant_rows == 0
 
@@ -83,10 +100,10 @@ def test_chat_answers_grounded_in_real_seeded_data(
 
     captured = {}
 
-    def _fake_generate_reply(*, history, context, user_message):
-        captured["context"] = context
-        captured["user_message"] = user_message
-        return "Your task list shows File Q3 taxes is overdue."
+    def _fake_generate_reply(**kwargs):
+        captured["context"] = kwargs["context"]
+        captured["user_message"] = kwargs["user_message"]
+        return OrchestratorResult(text="Your task list shows File Q3 taxes is overdue.", tool_call=None)
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -102,22 +119,22 @@ def test_chat_answers_grounded_in_real_seeded_data(
 def test_clear_write_request_gets_unavailability_message_without_calling_model(
     authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Checkpoint 3.3: task CREATION no longer declines deterministically
+    (see the propose/confirm tests below) — delete/edit/mark-done
+    phrasings are unaffected and still decline without a model call."""
     call_count = 0
 
     def _track(**kwargs):
         nonlocal call_count
         call_count += 1
-        return "should never be called"
+        return OrchestratorResult(text="should never be called", tool_call=None)
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _track)
 
-    response = _send(authenticated_client, "please create a task called Buy milk")
+    response = _send(authenticated_client, "delete my meeting with Bob")
     assert response.status_code == 200
     assert call_count == 0
     assert response.json()["assistant_message"]["content"] == chat_service.WRITE_UNAVAILABLE_MESSAGE
-
-    tasks = authenticated_client.get("/api/v1/tasks").json()
-    assert not any(t["title"] == "Buy milk" for t in tasks)
 
 
 def test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds(
@@ -125,8 +142,9 @@ def test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds
 ) -> None:
     """The undetected case. Seeds real Task/CalendarEvent/InboxItem/
     LifeArea data, sends a phrasing detect_clear_write_intent does NOT
-    catch, mocks the model to falsely claim an action was taken, and
-    proves the actual database is byte-for-byte unchanged regardless.
+    catch, mocks the model to falsely claim an action was taken (with no
+    tool call attached), and proves the actual database is byte-for-byte
+    unchanged regardless.
     """
     from app.modules.chat.write_intent import detect_clear_write_intent
 
@@ -145,7 +163,8 @@ def test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds
     life_areas_before = authenticated_client.get("/api/v1/life-areas").json()
 
     monkeypatch.setattr(
-        orchestrator_service, "generate_reply", lambda **kwargs: "I've canceled your dentist appointment for you."
+        orchestrator_service, "generate_reply",
+        _mock_reply("I've canceled your dentist appointment for you."),
     )
 
     response = _send(authenticated_client, ambiguous_message)
@@ -166,6 +185,349 @@ def test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds
     assert life_area_before["id"] in [a["id"] for a in life_areas_after]
 
 
+# ---- Checkpoint 3.3: propose / confirm / reject a task creation -------------------
+
+
+def test_propose_then_confirm_creates_the_task(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.3's proposal-UX fix: the proposal-facing confirmation
+    is now rendered deterministically from the validated tool arguments,
+    NOT from the mocked model's own text — see the dedicated tests below
+    for that guarantee in detail. This test just needs the confirmation
+    to mention the real title, whatever its exact wording.
+    """
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll create a task to call Hussein tomorrow — confirm?",
+            tool_name="propose_create_task", arguments={"title": "Call Hussein tomorrow"},
+        ),
+    )
+
+    propose_response = _send(authenticated_client, "please make a task to call Hussein tomorrow")
+    assert propose_response.status_code == 200
+    assert "Call Hussein tomorrow" in propose_response.json()["assistant_message"]["content"]
+
+    tasks_before = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "Call Hussein tomorrow" for t in tasks_before)
+
+    # The confirmation itself never reaches the model — no mock needed;
+    # the previous mock would raise if it were somehow called again.
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply", lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'"))
+    )
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    assert "Call Hussein tomorrow" in confirm_response.json()["assistant_message"]["content"]
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "Call Hussein tomorrow" for t in tasks_after)
+
+
+def test_propose_then_no_declines_and_creates_no_task(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("I'll create a task to buy milk — confirm?", tool_name="propose_create_task", arguments={"title": "Buy milk"}),
+    )
+    _send(authenticated_client, "add a task to buy milk")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply", lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'"))
+    )
+    decline_response = _send(authenticated_client, "no")
+    assert decline_response.status_code == 200
+    assert decline_response.json()["assistant_message"]["content"] == chat_service._REJECTED_MESSAGE
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "Buy milk" for t in tasks)
+
+
+def test_revision_before_confirming_supersedes_the_earlier_proposal(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Create a task titled 'Draft A'?", tool_name="propose_create_task", arguments={"title": "Draft A"}),
+    )
+    _send(authenticated_client, "make a task called Draft A")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Got it, 'Draft B' instead — confirm?", tool_name="propose_create_task", arguments={"title": "Draft B"}),
+    )
+    _send(authenticated_client, "actually call it Draft B instead")
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert "Draft B" in confirm_response.json()["assistant_message"]["content"]
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "Draft B" for t in tasks)
+    assert not any(t["title"] == "Draft A" for t in tasks)
+
+
+def test_unrelated_message_after_a_proposal_leaves_it_pending_and_still_confirmable(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Create a task to call Hussein about the invoice — confirm?", tool_name="propose_create_task", arguments={"title": "Call Hussein about the invoice"}),
+    )
+    _send(authenticated_client, "make a task to call Hussein about the invoice")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Your task list currently has 3 open items."),
+    )
+    unrelated_response = _send(authenticated_client, "how many open tasks do I have?")
+    assert unrelated_response.json()["assistant_message"]["content"] == "Your task list currently has 3 open items."
+
+    tasks_after_unrelated = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "Call Hussein about the invoice" for t in tasks_after_unrelated)  # still just pending
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert "Call Hussein about the invoice" in confirm_response.json()["assistant_message"]["content"]
+    tasks_final = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "Call Hussein about the invoice" for t in tasks_final)
+
+
+def test_confirming_after_expiry_creates_no_task(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A proposal past its TTL is treated as though nothing were
+    pending — including at chat's own local pending-lookup gate, not
+    just inside actions_service (already covered directly in
+    actions/tests/test_actions.py). Since chat's own lookup also finds
+    nothing pending once expired, a bare "yes" here is ordinary
+    conversation rather than a special confirmation — exactly as it
+    would be if no proposal had ever been made — so the mock for this
+    second call answers plainly rather than reusing the propose mock.
+    """
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Create a task to water the plants — confirm?", tool_name="propose_create_task", arguments={"title": "Water the plants"}),
+    )
+    _send(authenticated_client, "make a task to water the plants")
+
+    db_session.execute(
+        text("UPDATE proposed_actions SET expires_at = now() - interval '1 minute' WHERE status = 'pending'")
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply("Sure thing!"))
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "Water the plants" for t in tasks)
+
+
+def test_duplicate_yes_after_execution_does_not_create_a_second_task(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After the first "yes" executes, nothing is locally pending
+    anymore — a second "yes" is ordinary conversation, not a special
+    confirmation (see test_confirming_after_expiry_creates_no_task's
+    docstring for the same reasoning). The important invariant here is
+    simply: no second Task gets created."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Create a task to renew passport — confirm?", tool_name="propose_create_task", arguments={"title": "Renew passport"}),
+    )
+    _send(authenticated_client, "make a task to renew my passport")
+
+    first_yes = _send(authenticated_client, "yes")
+    assert "Renew passport" in first_yes.json()["assistant_message"]["content"]
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply("Sure thing!"))
+    second_yes = _send(authenticated_client, "yes")
+    assert second_yes.status_code == 200
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    matching = [t for t in tasks if t["title"] == "Renew passport"]
+    assert len(matching) == 1  # not created twice
+
+
+def test_malformed_tool_arguments_create_no_pending_proposal_and_reply_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Adversarial-style check for the write-enabled path: the model
+    calls propose_create_task with arguments that fail TaskCreate
+    validation (missing the required title). No ProposedAction row and
+    no Task are ever created — the user's own message is still
+    persisted, and the reply is honest rather than a stored half-valid
+    proposal. Checks get_latest_pending directly rather than counting
+    all proposed_actions rows, since earlier tests in this file leave
+    their own (non-pending) rows behind in the same shared database.
+    """
+    from app.modules.actions import service as actions_service
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Sure, creating that now!", tool_name="propose_create_task", arguments={"description": "no title given"}),
+    )
+
+    response = _send(authenticated_client, "make a task with no clear title, xyz-malformed-test")
+    assert response.status_code == 200
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t.get("description") == "no title given" for t in tasks)
+
+
+# ---- Checkpoint 3.3 proposal-UX fix: deterministic confirmation rendering --------
+
+
+def test_confirmation_message_reflects_the_validated_arguments_exactly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The confirmation text must be built from the SAME validated
+    arguments that get stored — not the model's own prose. Checked by
+    independently fetching the persisted ProposedAction and confirming
+    both the title and the formatted date appear in the message shown.
+    """
+    from app.modules.actions import service as actions_service
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure, on it",  # deliberately unrelated to the real details — must not leak through
+            tool_name="propose_create_task",
+            arguments={"title": "Confirmation reflects arguments test", "due_at": "2030-07-04T14:30:00+00:00"},
+        ),
+    )
+
+    response = _send(authenticated_client, "make a task: confirmation reflects arguments test")
+    content = response.json()["assistant_message"]["content"]
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+
+    assert pending.arguments["title"] in content
+    expected_when = chat_service._format_due_at_local(pending.arguments["due_at"], _DEFAULT_TIMEZONE)
+    assert expected_when in content
+
+
+def test_confirmation_omits_date_clause_when_due_at_is_null(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("ok", tool_name="propose_create_task", arguments={"title": "No due date test"}),
+    )
+
+    response = _send(authenticated_client, "make a task with no due date: No due date test")
+    content = response.json()["assistant_message"]["content"]
+
+    assert "No due date test" in content
+    assert "?" in content  # still ends with a confirmation question
+    assert not re.search(r"\d{2}/\d{2}/\d{4}", content)  # no date-shaped substring at all
+
+
+def test_confirmation_language_matches_the_arabic_or_english_of_the_triggering_message(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("some english model prose", tool_name="propose_create_task", arguments={"title": "لغة الاختبار"}),
+    )
+    arabic_response = _send(authenticated_client, "ضيف مهمة لغة الاختبار")
+    arabic_content = arabic_response.json()["assistant_message"]["content"]
+    assert chat_service._is_arabic(arabic_content)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("بعض النص العربي", tool_name="propose_create_task", arguments={"title": "Language test EN"}),
+    )
+    english_response = _send(authenticated_client, "add a task: Language test EN")
+    english_content = english_response.json()["assistant_message"]["content"]
+    assert not chat_service._is_arabic(english_content)
+
+
+def test_model_prose_with_wrong_or_missing_details_does_not_appear_in_the_confirmation(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduces the live-run failure mode and pushes it further: the
+    model's accompanying text is not just incomplete but flatly wrong.
+    Proves the renderer never reads result.text on the success path —
+    not just that it's unused in the happy case, but that it CANNOT
+    override the shown confirmation even when it actively contradicts
+    the real, validated, soon-to-be-executed arguments.
+    """
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "Sure, I've added a reminder called WRONG NAME for next week!",
+            tool_name="propose_create_task",
+            arguments={"title": "Actually Correct Title", "due_at": "2030-08-01T09:00:00+00:00"},
+        ),
+    )
+
+    response = _send(authenticated_client, "make a task called Actually Correct Title")
+    content = response.json()["assistant_message"]["content"]
+
+    assert "Actually Correct Title" in content
+    assert "WRONG NAME" not in content
+    assert "next week" not in content
+
+
+def test_end_to_end_executed_task_matches_the_confirmation_shown_before_yes(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The strongest form of the invariant: not just "the confirmation
+    was built from validated arguments" in isolation, but that the
+    REAL, LATER-EXECUTED Task's title and due_at are exactly what the
+    confirmation text displayed before the user ever said yes.
+    """
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "irrelevant model prose, ignored",
+            tool_name="propose_create_task",
+            arguments={"title": "End to end confirmation match", "due_at": "2030-09-15T16:45:00+00:00"},
+        ),
+    )
+
+    propose_response = _send(authenticated_client, "make a task: End to end confirmation match")
+    shown_confirmation = propose_response.json()["assistant_message"]["content"]
+    expected_when = chat_service._format_due_at_local("2030-09-15T16:45:00+00:00", _DEFAULT_TIMEZONE)
+    assert "End to end confirmation match" in shown_confirmation
+    assert expected_when in shown_confirmation
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    created = next(t for t in tasks if t["title"] == "End to end confirmation match")
+    # The Task's real due_at, reformatted the same deterministic way,
+    # must match exactly what was shown in the confirmation.
+    created_due_at_local = chat_service._format_due_at_local(created["due_at"], _DEFAULT_TIMEZONE)
+    assert created_due_at_local == expected_when
+
+
+def test_invalid_timezone_is_rejected_with_422_and_persists_nothing(
+    authenticated_client: TestClient, db_session: Session
+) -> None:
+    before = _message_count(db_session)
+    response = _send(authenticated_client, "hello", timezone_name="Not/AZone")
+    assert response.status_code == 422
+
+    after = _message_count(db_session)
+    assert after == before
+
+
 # ---- bounded conversation history ------------------------------------------------
 
 
@@ -179,9 +541,9 @@ def test_history_capped_at_max_message_count(
     """
     captured = {}
 
-    def _fake_generate_reply(*, history, context, user_message):
-        captured["history"] = history
-        return "ok"
+    def _fake_generate_reply(**kwargs):
+        captured["history"] = kwargs["history"]
+        return OrchestratorResult(text="ok", tool_call=None)
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -243,7 +605,7 @@ def test_assistant_reply_over_length_cap_is_truncated_before_persisting(
     authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     oversized_reply = "y" * (chat_service._MAX_ASSISTANT_MESSAGE_CHARS + 500)
-    monkeypatch.setattr(orchestrator_service, "generate_reply", lambda **kwargs: oversized_reply)
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply(oversized_reply))
 
     response = _send(authenticated_client, "tell me something long")
     assert response.status_code == 200
@@ -257,9 +619,9 @@ def test_incoming_and_history_budgets_are_independent(
 ) -> None:
     captured = {}
 
-    def _fake_generate_reply(*, history, context, user_message):
-        captured["history_len"] = len(history)
-        return "ok"
+    def _fake_generate_reply(**kwargs):
+        captured["history_len"] = len(kwargs["history"])
+        return OrchestratorResult(text="ok", tool_call=None)
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -271,6 +633,7 @@ def test_incoming_and_history_budgets_are_independent(
                 "content": "y" * 1000,
                 "tomorrow_start": TOMORROW_START.isoformat(),
                 "window_end": WINDOW_END.isoformat(),
+                "timezone": _DEFAULT_TIMEZONE,
             },
         )
 
@@ -321,7 +684,12 @@ def test_chat_history_excludes_other_users_messages_even_with_matching_space_id(
 def test_chat_requires_authentication(client: TestClient) -> None:
     response = client.post(
         "/api/v1/chat/messages",
-        json={"content": "hi", "tomorrow_start": TOMORROW_START.isoformat(), "window_end": WINDOW_END.isoformat()},
+        json={
+            "content": "hi",
+            "tomorrow_start": TOMORROW_START.isoformat(),
+            "window_end": WINDOW_END.isoformat(),
+            "timezone": _DEFAULT_TIMEZONE,
+        },
     )
     assert response.status_code == 401
     assert client.get("/api/v1/chat/messages").status_code == 401

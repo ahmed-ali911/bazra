@@ -1,8 +1,8 @@
 import re
 
 # Deterministic, NOT a general intent classifier. Catches only phrasings
-# explicit enough to match a fixed regex with confidence — "create a
-# task called X", "delete my meeting with Bob", "mark X as done". It is
+# explicit enough to match a fixed regex with confidence — "delete my
+# meeting with Bob", "mark X as done", "create an event tomorrow". It is
 # EXPECTED to miss less direct phrasings ("I won't be free Tuesday
 # anymore, can you sort that out"). Those still reach the model — this
 # function protects the user experience for the clear cases; it does
@@ -10,8 +10,14 @@ import re
 # it misses. That's what the adversarial test in chat/tests/test_chat.py
 # is for, and it's a genuinely separate guarantee (structural, not
 # dependent on this detection).
+#
+# Checkpoint 3.3: task CREATION deliberately no longer matches here (the
+# CREATE patterns' noun list dropped "task"/"مهمة") — that phrasing now
+# reaches the Orchestrator, which may offer propose_create_task. Delete/
+# edit/mark-done phrasings for tasks are unaffected and still decline
+# here, since only proposing a CREATE is implemented this checkpoint.
 _WRITE_INTENT_PATTERNS_EN = [
-    re.compile(r"\b(create|add|schedule|make)\b.{0,40}\b(task|event|meeting|reminder)\b", re.IGNORECASE),
+    re.compile(r"\b(create|add|schedule|make)\b.{0,40}\b(event|meeting|reminder)\b", re.IGNORECASE),
     re.compile(r"\b(delete|remove|cancel)\b.{0,40}\b(task|event|meeting|reminder|life area)\b", re.IGNORECASE),
     re.compile(r"\b(update|edit|change|reschedule|rename|move)\b.{0,40}\b(task|event|due date|life area)\b", re.IGNORECASE),
     re.compile(r"\bmark\b.{0,40}\b(done|complete|finished)\b", re.IGNORECASE),
@@ -24,7 +30,7 @@ _WRITE_INTENT_PATTERNS_EN = [
 # English; this is a real, stated limitation, not a solved problem.
 # Flagged for native-speaker review before this ships to real usage.
 _WRITE_INTENT_PATTERNS_AR = [
-    re.compile(r"(ضيف|أضف|اضافة|سجل)\s+.{0,20}(مهمة|حدث|موعد|تذكير)"),
+    re.compile(r"(ضيف|أضف|اضافة|سجل)\s+.{0,20}(حدث|موعد|تذكير)"),
     re.compile(r"(احذف|امسح|الغاء|إلغاء)\s+.{0,20}(مهمة|حدث|موعد|تذكير)"),
     re.compile(r"(عدل|غير|غيّر)\s+.{0,20}(مهمة|حدث|موعد|تاريخ)"),
 ]

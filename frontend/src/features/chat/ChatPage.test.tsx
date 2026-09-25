@@ -75,6 +75,7 @@ describe("ChatPage", () => {
     expect(body.content).toBe("hi");
     expect(body.tomorrow_start).toBeDefined();
     expect(body.window_end).toBeDefined();
+    expect(body.timezone).toBeDefined();
 
     expect(screen.getByLabelText("Chat message")).toHaveValue("");
   });

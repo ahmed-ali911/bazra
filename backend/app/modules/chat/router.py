@@ -19,9 +19,11 @@ def send_message(
 ) -> SendMessageResponse:
     try:
         user_message, assistant_message = service.send_message(
-            db, space_id, user.id, body.content, body.tomorrow_start, body.window_end
+            db, space_id, user.id, body.content, body.tomorrow_start, body.window_end, body.timezone
         )
     except service.MessageTooLongError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
+    except service.InvalidTimezoneError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc
     except service.ChatModelCallFailed as exc:
         raise HTTPException(
