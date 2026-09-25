@@ -226,6 +226,34 @@ def test_system_prompt_states_truthfulness_and_identity_rules_take_precedence_ov
     assert precedence_sentence in prompt
 
 
+def test_system_prompt_describes_get_weather_as_a_read_not_a_proposal() -> None:
+    """Checkpoint 3.7: unlike propose_create_task/propose_save_memory/
+    propose_forget_memory, get_weather must be described as executing
+    immediately — no confirmation step — so the model doesn't treat it
+    like the write tools it sits alongside in the same offered list."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "get_weather" in prompt
+    assert "executes immediately" in prompt
+    assert "no confirmation needed" in prompt
+
+
+def test_system_prompt_instructs_never_inferring_a_weather_location() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "Never guess, default, or infer a location" in prompt
+    assert "ask the user which place they mean" in prompt
+
+
+def test_system_prompt_lists_exactly_the_supported_weather_horizons() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "'now', 'today', 'tonight', and 'tomorrow' are supported" in prompt
+
+
+def test_system_prompt_instructs_weather_facts_only_no_advice() -> None:
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "get_weather returns facts only" in prompt
+    assert "never add your own advice or recommendation" in prompt
+
+
 def test_orchestrator_never_imports_a_write_capable_service_function() -> None:
     """A direct check on this module's own namespace: no create_*/
     update_*/delete_* function from any other module is bound here at

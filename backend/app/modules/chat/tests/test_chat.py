@@ -11,6 +11,8 @@ from app.modules.chat import service as chat_service
 from app.modules.chat.models import ChatMessage
 from app.modules.orchestrator import service as orchestrator_service
 from app.modules.orchestrator.schemas import OrchestratorResult, ToolCallRequest
+from app.modules.weather import service as weather_service
+from app.modules.weather.schemas import ResolvedLocation, WeatherProviderError, WeatherResult
 
 TOMORROW_START = datetime(2030, 6, 15, 0, 0, tzinfo=timezone.utc)
 WINDOW_END = TOMORROW_START + timedelta(days=7)
@@ -1186,3 +1188,206 @@ def test_identity_and_personality_instructions_reach_a_real_chat_turns_system_pr
         "OpenAI, or any other underlying provider or model, by name" in system_prompt
     )
     assert "Never claim consciousness or subjective feelings" in system_prompt
+
+
+# ---- Checkpoint 3.7: get_weather — BAZRA's first External Read Tool --------------
+
+_WEATHER_NOW_RESULT = WeatherResult(
+    resolved_location="Cairo, Egypt",
+    horizon="now",
+    period_start=datetime(2026, 9, 25, 15, 0, tzinfo=timezone.utc),
+    period_end=None,
+    timezone="Africa/Cairo",
+    temperature=29.4,
+    temperature_low=None,
+    temperature_high=None,
+    feels_like=31.2,
+    condition="clear",
+    precipitation_probability=None,
+    units="C",
+)
+
+
+def _proposed_action_count(db_session: Session) -> int:
+    return db_session.execute(text("SELECT count(*) FROM proposed_actions")).scalar_one()
+
+
+def test_get_weather_tool_offered_with_required_location_and_horizon() -> None:
+    tool = next(t for t in chat_service._TOOLS_OFFERED if t["name"] == "get_weather")
+    schema = tool["input_schema"]
+    assert schema["required"] == ["location", "horizon"]
+    assert schema["properties"]["horizon"]["enum"] == ["now", "today", "tonight", "tomorrow"]
+
+
+def test_missing_location_asks_and_makes_no_weather_http_call(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fail_if_called(*args, **kwargs):
+        raise AssertionError("weather provider must not be called without a location")
+
+    monkeypatch.setattr(weather_service, "geocode_location", _fail_if_called)
+    monkeypatch.setattr(weather_service, "fetch_weather", _fail_if_called)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Which city do you mean?", tool_name="get_weather", arguments={"horizon": "now"}),
+    )
+
+    response = _send(authenticated_client, "what's the weather like?")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "Which city do you mean?"
+
+
+def test_successful_weather_read_creates_no_proposed_action_and_exactly_one_model_completion(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply(
+            "Let me check.", tool_name="get_weather", arguments={"location": "Cairo", "horizon": "now"},
+        )(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
+        display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
+    ))
+    monkeypatch.setattr(weather_service, "fetch_weather", lambda resolved, horizon: _WEATHER_NOW_RESULT)
+
+    before = _proposed_action_count(db_session)
+    response = _send(authenticated_client, "what's the weather in Cairo right now?")
+    assert response.status_code == 200
+    after = _proposed_action_count(db_session)
+
+    assert after == before  # read-only: never creates a ProposedAction
+    assert call_count["n"] == 1  # exactly one model completion for this turn
+
+
+def test_weather_reply_renders_english_facts_deterministically(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("checking", tool_name="get_weather", arguments={"location": "Cairo", "horizon": "now"}),
+    )
+    monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
+        display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
+    ))
+    monkeypatch.setattr(weather_service, "fetch_weather", lambda resolved, horizon: _WEATHER_NOW_RESULT)
+
+    response = _send(authenticated_client, "what's the weather in Cairo right now?")
+    content = response.json()["assistant_message"]["content"]
+    assert "Cairo, Egypt" in content
+    assert "clear" in content
+    assert "29" in content  # rounded temperature
+    assert "31" in content  # rounded feels-like
+    assert "Weather data by Open-Meteo.com (https://open-meteo.com/)" in content
+
+
+def test_weather_reply_renders_arabic_facts_deterministically(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("checking", tool_name="get_weather", arguments={"location": "القاهرة", "horizon": "now"}),
+    )
+    monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
+        display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
+    ))
+    monkeypatch.setattr(weather_service, "fetch_weather", lambda resolved, horizon: _WEATHER_NOW_RESULT)
+
+    response = _send(authenticated_client, "الجو عامل إيه في القاهرة دلوقتي؟")
+    content = response.json()["assistant_message"]["content"]
+    assert "صحو" in content
+    assert "29" in content
+    assert "Weather data by Open-Meteo.com (https://open-meteo.com/)" in content
+
+
+def test_no_attribution_when_location_missing(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Which city?", tool_name="get_weather", arguments={"horizon": "now"}),
+    )
+    response = _send(authenticated_client, "what's the weather like?")
+    assert "Open-Meteo" not in response.json()["assistant_message"]["content"]
+
+
+def test_location_not_found_reply_is_honest_and_unattributed(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("checking", tool_name="get_weather", arguments={"location": "Nowhereville", "horizon": "now"}),
+    )
+    monkeypatch.setattr(weather_service, "geocode_location", lambda location: None)
+
+    response = _send(authenticated_client, "what's the weather in Nowhereville?")
+    content = response.json()["assistant_message"]["content"]
+    assert "Nowhereville" in content
+    assert "Open-Meteo" not in content
+
+
+def test_provider_failure_produces_one_truthful_reply_never_fabricated(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("checking", tool_name="get_weather", arguments={"location": "Cairo", "horizon": "now"}),
+    )
+
+    def _raise(location):
+        raise WeatherProviderError("timeout")
+
+    monkeypatch.setattr(weather_service, "geocode_location", _raise)
+
+    response = _send(authenticated_client, "what's the weather in Cairo?")
+    content = response.json()["assistant_message"]["content"]
+    assert content == chat_service._render_weather_unavailable("what's the weather in Cairo?")
+    assert "Open-Meteo" not in content
+    assert "29" not in content  # no fabricated data
+
+
+def test_ai_traces_contain_no_weather_location_or_payload_for_a_weather_turn(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors test_no_prompt_or_response_or_key_in_ai_traces_for_chat_calls,
+    but drives a REAL get_weather tool call through a mocked provider
+    response at the lowest level (_call_anthropic), so a real AiTrace
+    row is actually written — then confirms it carries none of the
+    location/coordinates/weather content."""
+    from app.modules.model_router import service as model_router_service
+
+    class _FakeUsage:
+        input_tokens = 5
+        output_tokens = 5
+
+    class _FakeToolUseBlock:
+        type = "tool_use"
+        name = "get_weather"
+        input = {"location": "Cairo", "horizon": "now"}
+
+    class _FakeMessage:
+        content = [_FakeToolUseBlock()]
+        usage = _FakeUsage()
+
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage())
+    monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
+        display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
+    ))
+    monkeypatch.setattr(weather_service, "fetch_weather", lambda resolved, horizon: _WEATHER_NOW_RESULT)
+
+    response = _send(authenticated_client, "weather-trace-marker-test what's the weather in Cairo?")
+    assert response.status_code == 200
+
+    rows = db_session.execute(text("SELECT * FROM ai_traces")).mappings().all()
+    assert len(rows) >= 1
+    for row in rows:
+        for value in row.values():
+            text_value = str(value)
+            assert "Cairo" not in text_value
+            assert "30.06" not in text_value
+            assert "31.25" not in text_value
+            assert "weather-trace-marker-test" not in text_value

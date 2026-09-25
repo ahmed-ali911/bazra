@@ -2,6 +2,7 @@ import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
@@ -14,6 +15,8 @@ from app.modules.memory import service as memory_service
 from app.modules.memory.models import Memory
 from app.modules.orchestrator import service as orchestrator_service
 from app.modules.orchestrator.schemas import HistoryTurn
+from app.modules.weather import service as weather_service
+from app.modules.weather.schemas import GetWeatherArguments, WeatherProviderError, WeatherResult
 
 # Four independent bounds, per the explicit review requirement — none of
 # these were defined before, and the conversation would otherwise grow
@@ -113,7 +116,36 @@ _PROPOSE_FORGET_MEMORY_TOOL = {
     },
 }
 
-_TOOLS_OFFERED = [_PROPOSE_CREATE_TASK_TOOL, _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL]
+_GET_WEATHER_TOOL = {
+    "name": "get_weather",
+    "description": (
+        "Get real, current factual weather information (temperature, condition, chance of rain) for "
+        "a specific place and time period. This is a READ — it executes immediately and needs no "
+        "confirmation, unlike the propose_* tools. Only call this when the user's OWN message "
+        "explicitly names a location; if no location was given, ask the user which place they mean "
+        "instead of calling this — never guess or default one. Only 'now', 'today', 'tonight', and "
+        "'tomorrow' are supported — for anything further out, say plainly that it isn't available yet. "
+        "This tool returns facts only; never add your own advice or recommendation (e.g. about "
+        "clothing or activities) on top of the returned weather."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "location": {
+                "type": "string",
+                "description": "The place name exactly as the user stated it (e.g. a city). Never guess or default this.",
+            },
+            "horizon": {
+                "type": "string",
+                "enum": ["now", "today", "tonight", "tomorrow"],
+                "description": "Which time period the user is asking about.",
+            },
+        },
+        "required": ["location", "horizon"],
+    },
+}
+
+_TOOLS_OFFERED = [_PROPOSE_CREATE_TASK_TOOL, _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL]
 
 # Used by _describe_pending_proposal to tell the model which tool to call
 # again for a revision, regardless of which action_type is pending.
@@ -175,6 +207,39 @@ _MEMORY_TYPE_CONFIRM_LABELS_EN = {
     "GOAL": "this goal",
     "INFERENCE": "this tentative inference (not confirmed by you)",
 }
+
+# Checkpoint 3.7: the 8 fixed condition buckets weather/service.py
+# normalizes every Open-Meteo WMO code into, mapped to bilingual
+# display phrasing — same convention as the memory-type labels above.
+_WEATHER_CONDITION_LABELS_EN = {
+    "clear": "clear",
+    "partly_cloudy": "partly cloudy",
+    "cloudy": "cloudy",
+    "fog": "foggy",
+    "drizzle": "light drizzle",
+    "rain": "rain",
+    "snow": "snow",
+    "thunderstorm": "thunderstorms",
+}
+_WEATHER_CONDITION_LABELS_AR = {
+    "clear": "صحو",
+    "partly_cloudy": "غائم جزئيًا",
+    "cloudy": "غائم",
+    "fog": "شبورة",
+    "drizzle": "رذاذ خفيف",
+    "rain": "مطر",
+    "snow": "تلج",
+    "thunderstorm": "عواصف رعدية",
+}
+
+# CC BY 4.0 attribution — required by Open-Meteo's licence for the free
+# endpoint this project uses; see weather/service.py's module docstring.
+# Fixed/untranslated per the Checkpoint 3.7 decision (official wording,
+# not a conversational phrase) — appended only when real weather data
+# was actually displayed, never on an ask-for-location or failure reply.
+_WEATHER_ATTRIBUTION_LINE = "Weather data by Open-Meteo.com (https://open-meteo.com/)"
+
+_WEATHER_MISSING_LOCATION_FALLBACK_MESSAGE = "Which place would you like the weather for?"
 
 
 class MessageTooLongError(Exception):
@@ -397,6 +462,70 @@ def _render_forget_memory_confirmation(existing_content: str, user_message: str)
     return f'I\'ll forget that I have this on record: "{existing_content}". Confirm?'
 
 
+def _render_weather_location_not_found(location: str, user_message: str) -> str:
+    if _is_arabic(user_message):
+        return f'معرفتش ألاقي مكان اسمه "{location}" — ممكن تتأكد من الاسم أو تضيف اسم الدولة؟'
+    return f'I couldn\'t find a place called "{location}" — could you double-check the spelling or add a country?'
+
+
+def _render_weather_unavailable(user_message: str) -> str:
+    if _is_arabic(user_message):
+        return "معرفتش أوصل لخدمة الطقس دلوقتي — جرب تاني بعد شوية."
+    return "I can't reach the weather service right now — try again in a bit."
+
+
+def _render_weather_reply(result: WeatherResult, user_message: str) -> str:
+    """Deterministic, code-owned rendering (Checkpoint 3.7) — reads
+    ONLY WeatherResult's own normalized fields, the same discipline as
+    _render_create_task_confirmation. Facts only: no clothing/activity
+    advice is ever composed here. Temperatures are rounded for display
+    only; WeatherResult itself keeps the unrounded values.
+    """
+    arabic = _is_arabic(user_message)
+    labels = _WEATHER_CONDITION_LABELS_AR if arabic else _WEATHER_CONDITION_LABELS_EN
+    condition = labels[result.condition]
+
+    if result.horizon == "now":
+        temperature = round(result.temperature)
+        feels_like = round(result.feels_like)
+        if arabic:
+            body = f"الجو في {result.resolved_location} دلوقتي: {condition}، {temperature}° (حرارة محسوسة {feels_like}°)."
+        else:
+            body = f"The weather in {result.resolved_location} right now: {condition}, {temperature}°C (feels like {feels_like}°C)."
+
+    elif result.horizon in ("today", "tomorrow"):
+        low, high = round(result.temperature_low), round(result.temperature_high)
+        if arabic:
+            period_label = "النهارده" if result.horizon == "today" else "بكرة"
+            body = f"الجو {period_label} في {result.resolved_location}: {condition}، من {low}° لحد {high}°"
+            if result.precipitation_probability is not None:
+                body += f"، واحتمال مطر {round(result.precipitation_probability)}٪"
+            body += "."
+        else:
+            period_label = "Today's" if result.horizon == "today" else "Tomorrow's"
+            body = f"{period_label} weather in {result.resolved_location}: {condition}, {low}–{high}°C"
+            if result.precipitation_probability is not None:
+                body += f", with a {round(result.precipitation_probability)}% chance of rain"
+            body += "."
+
+    else:  # tonight
+        low, high = round(result.temperature_low), round(result.temperature_high)
+        window = f"{result.period_start:%H:%M}–{result.period_end:%H:%M}"
+        if arabic:
+            body = (
+                f"الجو الليلة في {result.resolved_location} (من {result.period_start:%H:%M} "
+                f"لحد {result.period_end:%H:%M}): {condition}، من {low}° لحد {high}°، "
+                f"احتمال مطر {round(result.precipitation_probability)}٪."
+            )
+        else:
+            body = (
+                f"Tonight in {result.resolved_location} ({window} local): {condition}, "
+                f"{low}–{high}°C, {round(result.precipitation_probability)}% chance of rain."
+            )
+
+    return f"{body}\n{_WEATHER_ATTRIBUTION_LINE}"
+
+
 def _format_memory_line(memory: Memory) -> str:
     label = _MEMORY_TYPE_CONTEXT_LABELS.get(memory.type, memory.type)
     return f"{label}: {memory.content} (mem_id={memory.id})"
@@ -521,10 +650,50 @@ def _handle_forget_memory_proposal(
     return assistant_message
 
 
+def _handle_get_weather(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str,
+) -> ChatMessage:
+    """Checkpoint 3.7 — READ, not a write proposal: executes directly,
+    in this same handler call, and NEVER calls
+    actions_service.create_pending_action at any point — that omission
+    IS the code-level enforcement of the read/write boundary (see
+    docs/architecture/bazra-capability-routing.md), not a separate
+    dispatch dictionary. Registered in the same _TOOL_HANDLERS dict as
+    every write handler below.
+    """
+    try:
+        validated = GetWeatherArguments(**arguments)
+    except ValidationError:
+        return record_assistant_message(
+            db, space_id, user_id, model_text or _WEATHER_MISSING_LOCATION_FALLBACK_MESSAGE
+        )
+
+    try:
+        resolved = weather_service.geocode_location(validated.location)
+    except WeatherProviderError:
+        return record_assistant_message(db, space_id, user_id, _render_weather_unavailable(user_message_content))
+
+    if resolved is None:
+        return record_assistant_message(
+            db, space_id, user_id,
+            _render_weather_location_not_found(validated.location, user_message_content),
+        )
+
+    try:
+        result = weather_service.fetch_weather(resolved, validated.horizon)
+    except WeatherProviderError:
+        return record_assistant_message(db, space_id, user_id, _render_weather_unavailable(user_message_content))
+
+    reply_text = _render_weather_reply(result, user_message_content)
+    return record_assistant_message(db, space_id, user_id, reply_text)
+
+
 _TOOL_HANDLERS = {
     "propose_create_task": _handle_create_task_proposal,
     "propose_save_memory": _handle_save_memory_proposal,
     "propose_forget_memory": _handle_forget_memory_proposal,
+    "get_weather": _handle_get_weather,
 }
 
 

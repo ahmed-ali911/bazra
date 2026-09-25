@@ -211,6 +211,74 @@ scrubber to test against.
   personality preferences from conversation (as opposed to the existing
   explicit, user-confirmed Memory `PREFERENCE` path).
 
+### Checkpoint 3.7
+
+BAZRA's first External Read Tool (see `docs/architecture/bazra-capability-routing.md`
+for the taxonomy this operationalizes): `get_weather`, grounded factual
+weather only — no lifestyle/advice reasoning. Provider: Open-Meteo's
+free Forecast + Geocoding APIs (`app/modules/weather/`), chosen for
+needing no API key on their non-commercial-use tier. Flow:
+`geocode_location` (free-text place name → resolved name/coordinates/
+IANA timezone, `count=1`, no disambiguation UI) → `fetch_weather`
+(minimum-necessary request shape per horizon — never requests
+`current`+`daily`+`hourly` together, and omits `forecast_days` entirely
+for `now`, which has no consumer for it). Supported horizons: `now`,
+`today`, `tonight`, `tomorrow` — deliberately no weekly/general hourly
+forecast. All period semantics (including "tonight") are computed
+against the **resolved location's own** IANA timezone via `zoneinfo`,
+never the server's or requester's — "weather tonight in Cairo" is
+evaluated against Cairo's clock regardless of where the request comes
+from. "Tonight" excludes already-passed hours (window starts at the
+later of 18:00 local or the current moment) and aggregates the selected
+hourly slice deterministically: min/max temperature, max precipitation
+probability, and the highest-priority condition present (thunderstorm >
+snow > rain > drizzle > fog > cloudy > partly_cloudy > clear) — data
+normalization, not advice. Read-only: executes directly, in the tool's
+own handler, and never calls `actions_service.create_pending_action` —
+enforced by simply never calling it, not by a second dispatch
+dictionary (`get_weather` shares the same `_TOOL_HANDLERS` dict as
+every write tool). Location is required in the tool schema and must
+come from the user's own message — the model is instructed to ask
+rather than guess/default/infer one from timezone, language, Memory, or
+history. Rendering is fully deterministic and bilingual (Arabic/
+English), reading only the normalized `WeatherResult`'s own fields —
+structurally incapable of advice, since no advice field exists on that
+contract at all. Every successful reply appends the required CC BY 4.0
+attribution line ("Weather data by Open-Meteo.com"); never appended
+when no real data was displayed (missing-location or failure replies).
+Zero additional LLM calls — the existing single conversation call
+already carries this tool-selection decision, same as every other tool.
+No new DB table, no migration, no persistence, no cache; `AiTrace`
+remains model-call-only, and weather calls get a separate,
+payload-free structured log line instead.
+
+**Licensing (REQUIRED, revisit before any commercial deployment):** the
+free Open-Meteo endpoints used here require no API key but are
+documented as non-commercial use only. If BAZRA's deployment model ever
+becomes commercial, this integration must be explicitly revisited (a
+paid subscription + API key + a different host, or a different
+provider) — never assumed to silently remain valid.
+
+Live-verified with 3 gates: a direct real-provider adapter call (no
+model involved), a real LLM turn with an explicit location ("weather in
+Cairo right now" → correct tool call, grounded code-rendered reply
+matching the real fetched data, exactly one `AiTrace` row, zero new
+`ProposedAction` rows), and a real LLM turn with no location (the model
+asked for one in plain text, made no tool call, zero provider requests).
+All three passed on the first attempt.
+
+- Deferred (no current consumer or no demonstrated need): lifestyle/
+  advice reasoning (jacket/umbrella/activity recommendations, or
+  weather + Calendar/Task combined reasoning) — requires Model Router's
+  currently-unbuilt tool-result continuation (preserving `tool_use.id`
+  and structured multi-block message content, deliberately not built in
+  this checkpoint); weekly forecast; a general hourly-forecast feature;
+  a saved/default location (would go through the existing explicit
+  Memory `PREFERENCE` path, never a silent default); browser/device
+  geolocation; caching; a capability-execution telemetry table; a
+  weather-specific API key/config entry (not needed for Open-Meteo's
+  free tier); geocoding disambiguation UI.
+
 ## Run locally (without Docker)
 
 ```bash

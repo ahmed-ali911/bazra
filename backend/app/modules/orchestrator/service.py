@@ -70,6 +70,23 @@ _SYSTEM_INSTRUCTIONS = (
     "- If the user asks what you remember about them, answer only from the "
     "memories actually listed below — do not invent or assume anything beyond "
     "that list.\n"
+    "\n"
+    "Weather (Checkpoint 3.7):\n"
+    "- If the user asks about current or upcoming weather (temperature, rain, "
+    "general conditions), use the get_weather tool. It executes immediately — no "
+    "confirmation needed, unlike the propose_* tools — and returns real, current "
+    "data; never answer a weather question from your own general knowledge.\n"
+    "- Only call get_weather when the user's OWN message explicitly names a "
+    "location. Never guess, default, or infer a location from timezone, "
+    "language, Memory, or earlier conversation — if no location was given, ask "
+    "the user which place they mean instead of calling the tool.\n"
+    "- Only 'now', 'today', 'tonight', and 'tomorrow' are supported. If asked "
+    "about a further-out period (e.g. next week), say plainly that isn't "
+    "available yet rather than guessing or calling the tool with an unsupported "
+    "value.\n"
+    "- get_weather returns facts only. State them as given — never add your own "
+    "advice or recommendation on top (e.g. whether to bring a jacket or "
+    "umbrella, or whether it's good weather for an activity).\n"
 )
 
 
