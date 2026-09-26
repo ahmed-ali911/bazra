@@ -1967,3 +1967,269 @@ def test_model_prose_with_wrong_details_does_not_appear_in_update_task_confirmat
     assert "totally different" not in content
     assert "Real task title - 310f" in content
     assert "mark it as done" in content
+
+
+# ---- Checkpoint 3.11: authoritative current action state -----------------------
+
+
+def _capture_context(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Mocks generate_reply one level above the real model call (the
+    same technique test_relevant_memory_appears_in_a_later_conversations_context
+    already uses) so context/history can be inspected directly without
+    depending on any stochastic model behavior."""
+    captured: dict = {}
+
+    def _fake(**kwargs):
+        captured["context"] = kwargs["context"]
+        captured["history"] = kwargs["history"]
+        return OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _fake)
+    return captured
+
+
+def _ensure_no_pending_proposal(db_session: Session) -> None:
+    """Test-isolation guard, not product behavior: this shared test
+    database is never rolled back between tests (see conftest.py), and
+    a prior test in this same file may have left its own proposal
+    pending (deliberately, to test the positive branch) — reject
+    unconditionally (a safe no-op if nothing is pending) so each test
+    below starts from a genuinely clean slate regardless of run order,
+    the same defensive pattern the existing 3.9 tests already use."""
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    actions_service.reject(db_session, space.id, user.id)
+
+
+def test_negative_action_state_present_when_nothing_ever_pending(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ensure_no_pending_proposal(db_session)
+    captured = _capture_context(monkeypatch)
+    _send(authenticated_client, "hello there")
+
+    assert "## Current action state" in captured["context"]
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE in captured["context"]
+    assert "## Pending proposal awaiting confirmation" not in captured["context"]
+
+
+def test_positive_pending_context_unchanged_when_a_real_proposal_is_pending(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 1/3: the EXISTING positive branch is untouched, and
+    the two states are mutually exclusive."""
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll add the task — confirm?", tool_name="propose_create_task",
+            arguments={"title": "Action-state positive test - 311a"},
+        ),
+    )
+    _send(authenticated_client, "add a task, action-state positive test 311a")
+
+    captured = _capture_context(monkeypatch)
+    _send(authenticated_client, "how many tasks do I have?")
+
+    assert "## Pending proposal awaiting confirmation" in captured["context"]
+    assert "is awaiting the user's yes/no confirmation" in captured["context"]
+    assert "## Current action state" not in captured["context"]
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE not in captured["context"]
+
+    _ensure_no_pending_proposal(db_session)  # leave a clean slate for tests that follow
+
+
+def test_stale_proposal_like_history_does_not_override_negative_action_state(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The direct regression test for the demonstrated 3.10 anchoring
+    condition: an assistant message that LOOKS like a proposal offer
+    (plain text, no tool_call — so NO real ProposedAction was ever
+    created, exactly as observed live) remains visible in history, while
+    the authoritative, DB-grounded context must still say nothing is
+    pending. This does not depend on any model choosing a correct
+    natural-language response — it tests the deterministic context
+    contract directly.
+    """
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply('I\'ll add the task "Prepare the report". Shall I go ahead?'),
+    )
+    _send(authenticated_client, "please add a task called Prepare the report")
+
+    captured = _capture_context(monkeypatch)
+    _send(authenticated_client, "add a task to review the notes instead")
+
+    assert any("Prepare the report" in turn.content for turn in captured["history"])
+    assert "## Current action state" in captured["context"]
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE in captured["context"]
+    assert "## Pending proposal awaiting confirmation" not in captured["context"]
+
+
+def test_confirmed_proposal_produces_negative_state_on_a_later_turn(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_task",
+            arguments={"title": "Confirmed then later note test - 311b"},
+        ),
+    )
+    _send(authenticated_client, "add a task, confirmed then later note test 311b")
+    _send(authenticated_client, "yes")  # 0 LLM, deterministic confirm
+
+    captured = _capture_context(monkeypatch)
+    _send(authenticated_client, "what's on my list today?")
+
+    assert any("Confirmed then later note test - 311b" in turn.content for turn in captured["history"])
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE in captured["context"]
+    assert "## Pending proposal awaiting confirmation" not in captured["context"]
+
+
+def test_rejected_proposal_produces_negative_state_on_a_later_turn(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_task",
+            arguments={"title": "Rejected then later note test - 311c"},
+        ),
+    )
+    _send(authenticated_client, "add a task, rejected then later note test 311c")
+    _send(authenticated_client, "no")  # 0 LLM, deterministic reject
+
+    captured = _capture_context(monkeypatch)
+    _send(authenticated_client, "what's on my list today?")
+
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE in captured["context"]
+    assert "## Pending proposal awaiting confirmation" not in captured["context"]
+
+
+def test_superseded_proposal_does_not_become_current_via_remaining_history_text(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 7: a REVISED (superseded) proposal's own offering
+    text also remains in history, but once the revision is confirmed,
+    a later turn must still see the negative state, not be confused by
+    either historical message."""
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "Draft A — confirm?", tool_name="propose_create_task",
+            arguments={"title": "Draft A - 311d"},
+        ),
+    )
+    _send(authenticated_client, "make a task called Draft A - 311d")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "Draft B instead — confirm?", tool_name="propose_create_task",
+            arguments={"title": "Draft B - 311d"},
+        ),
+    )
+    _send(authenticated_client, "actually call it Draft B - 311d instead")
+    _send(authenticated_client, "yes")
+
+    captured = _capture_context(monkeypatch)
+    _send(authenticated_client, "what's on my list today?")
+
+    assert any("Draft A - 311d" in turn.content for turn in captured["history"])
+    assert any("Draft B - 311d" in turn.content for turn in captured["history"])
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE in captured["context"]
+    assert "## Pending proposal awaiting confirmation" not in captured["context"]
+
+
+def test_expired_proposal_results_in_the_same_negative_state_no_separate_mechanism(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Requirement 8: expiry produces the exact SAME
+    _NO_ACTIVE_PROPOSAL_NOTE as every other resolved/never-existed
+    case — no separate expiry-specific string or mechanism."""
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_task",
+            arguments={"title": "Expiry note test - 311e"},
+        ),
+    )
+    _send(authenticated_client, "add a task, expiry note test 311e")
+
+    db_session.execute(
+        text("UPDATE proposed_actions SET expires_at = now() - interval '1 minute' WHERE status = 'pending'")
+    )
+    db_session.commit()
+
+    captured = _capture_context(monkeypatch)
+    _send(authenticated_client, "what's on my list today?")
+
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE in captured["context"]
+    assert "## Pending proposal awaiting confirmation" not in captured["context"]
+
+
+def test_bare_yes_no_with_no_pending_reaches_model_and_sees_negative_state(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Extends the existing 3.9 regression guard
+    (test_bare_yes_no_with_no_pending_proposal_reaches_the_model_path):
+    proves the turn that reaches the model ALSO sees the authoritative
+    negative state — a bare "yes"/"no" with nothing really pending is
+    never deterministically treated as confirming or rejecting
+    historical proposal-like text; it reaches the model, which sees the
+    same explicit "nothing is pending" fact as any other ordinary turn.
+    """
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    actions_service.reject(db_session, space.id, user.id)  # guarantee no pending, regardless of prior tests
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    captured = _capture_context(monkeypatch)
+    response = _send(authenticated_client, "yes")
+
+    assert response.status_code == 200
+    assert chat_service._NO_ACTIVE_PROPOSAL_NOTE in captured["context"]
+    assert "## Pending proposal awaiting confirmation" not in captured["context"]
+
+
+def test_no_active_proposal_branch_adds_no_extra_ai_trace(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Requirement 16: the new context branch is pure string
+    construction — proves exactly ONE new AiTrace row (the ordinary
+    conversation call itself), not zero, not two, for a turn that
+    exercises the new negative-state branch via a REAL (mocked
+    provider-boundary) call, the same low-level technique the existing
+    AiTrace-content tests already use."""
+    _ensure_no_pending_proposal(db_session)
+    from app.modules.model_router import service as model_router_service
+
+    class _FakeUsage:
+        input_tokens = 5
+        output_tokens = 5
+
+    class _FakeTextBlock:
+        type = "text"
+        text = "ok"
+
+    class _FakeMessage:
+        content = [_FakeTextBlock()]
+        usage = _FakeUsage()
+
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage())
+
+    before = _max_ai_trace_id(db_session)
+    response = _send(authenticated_client, "action-state-ai-trace-marker-test hello")
+    assert response.status_code == 200
+    after = _max_ai_trace_id(db_session)
+
+    assert after - before == 1

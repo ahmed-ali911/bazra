@@ -436,6 +436,45 @@ unaffected.
   line (only Focus Today/Anytime widened — the sections most naturally
   used to reference a task for a status change).
 
+### Checkpoint 3.11
+
+Authoritative current action state — closes a gap the 3.10 live gates
+surfaced: an assistant message that merely *looks like* a proposal
+offer (whether from a real, now-resolved `ProposedAction`, or just the
+model's own free text with no backing row at all) can remain visible
+in conversation history indefinitely, with nothing marking it as no
+longer active. A later turn had no explicit signal distinguishing that
+from a genuinely pending action.
+
+`chat/service.py::send_message` already computed `pending =
+actions_service.get_latest_pending(...)` every ordinary turn and, when
+it found a real row, folded it into context as `## Pending proposal
+awaiting confirmation` — unchanged, still exactly that. The `else`
+branch (`pending is None`) was previously silent; it now adds one
+short, deterministic `## Current action state` note stating plainly
+that nothing is pending, that historical proposal-like text is not
+currently actionable, that a genuine re-request should be proposed
+again fresh, and that ordinary conversational reference to history
+remains unaffected. Both branches share the exact same `pending`
+lookup already computed — no new query, no new table, no session or
+state-machine concept, no change to `ProposedAction`'s lifecycle or the
+global one-pending-proposal invariant, and no additional model call:
+the note is pure context text, assembled deterministically alongside
+Tasks/Calendar/Inbox/Memory exactly as before.
+
+Live-verified: a real turn whose model reply resembled a proposal
+offer without an actual tool call (no `ProposedAction` was created) was
+followed by a genuinely unrelated new task request — the model tracked
+the *new* request correctly rather than anchoring on the earlier,
+stale text. A real create_task propose → confirm cycle alongside it
+remained exactly 1 model call to propose, 0 to confirm, unaffected.
+
+- Note: whether the model chooses to call a tool at all for a given
+  message remains inherently stochastic (already observed and accepted
+  in earlier checkpoints) — this checkpoint does not attempt to change
+  that. What it does guarantee is that whenever nothing is genuinely
+  pending, the model is explicitly, deterministically told so.
+
 ## Run locally (without Docker)
 
 ```bash

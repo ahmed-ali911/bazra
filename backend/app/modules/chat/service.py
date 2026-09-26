@@ -459,6 +459,28 @@ def _describe_pending_proposal(pending) -> str:
     )
 
 
+# Checkpoint 3.11 — the authoritative negative counterpart to
+# _describe_pending_proposal above. Injected whenever get_latest_pending
+# returns None, for ANY reason (never proposed, confirmed, rejected,
+# superseded, or expired — all collapse into the same simple, true-right-now
+# fact, deterministically, with no new query beyond the existing `pending`
+# lookup send_message already performs every turn). This directly closes the
+# gap the 3.10 live-gate observation surfaced: an earlier assistant message
+# that merely LOOKS like a proposal offer, still visible in raw conversation
+# history, must never be mistaken for something currently confirmable. It
+# does NOT ask the model to ignore, forget, or stop discussing that history —
+# only to distinguish "not currently actionable" from "irrelevant."
+_NO_ACTIVE_PROPOSAL_NOTE = (
+    "No ProposedAction is currently pending confirmation. If an earlier "
+    "assistant message in this conversation offered to create or change "
+    "something and the user never explicitly confirmed it, that offer is no "
+    "longer active — do not treat a new message as confirming it unless the "
+    "user is clearly and specifically asking for it again, in which case "
+    "propose it again as a fresh action. You may still refer to, explain, or "
+    "discuss earlier parts of the conversation normally."
+)
+
+
 def _is_arabic(text: str) -> bool:
     """Deterministic, script-based, no model call — same style as
     write_intent.py's own bilingual pattern lists. Checked against the
@@ -980,6 +1002,8 @@ def send_message(
     context = f"{context}\n\n{_format_memory_context(memories, total_active_memories)}"
     if pending is not None:
         context = f"{context}\n\n## Pending proposal awaiting confirmation\n{_describe_pending_proposal(pending)}"
+    else:
+        context = f"{context}\n\n## Current action state\n{_NO_ACTIVE_PROPOSAL_NOTE}"
     history_rows = list_recent_messages(db, space_id, user_id)
     history = _trim_to_char_budget(history_rows, _MAX_HISTORY_CHARS)
 
