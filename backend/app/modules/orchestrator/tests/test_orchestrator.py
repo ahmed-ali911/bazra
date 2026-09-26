@@ -134,6 +134,46 @@ def test_system_prompt_describes_propose_update_task_referencing_task_id() -> No
     assert "task_id" in prompt
 
 
+def test_system_prompt_requires_the_tool_call_for_supported_task_writes() -> None:
+    """Checkpoint 3.12b: the model must be told plainly that it MUST call
+    the tool for a supported create/update request — a reliability fix
+    for the observed failure mode where the model sometimes replies with
+    proposal-like text without ever calling propose_create_task/
+    propose_update_task."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "you MUST call the propose_create_task tool" in prompt
+    assert "you MUST call the propose_update_task tool" in prompt
+
+
+def test_system_prompt_states_plain_text_is_not_a_substitute_for_the_tool_call() -> None:
+    """Checkpoint 3.12b: plain-text promises/offers/descriptions must be
+    explicitly ruled out as satisfying the requirement above."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "is NOT a substitute for actually calling it" in prompt
+    assert "is NOT a substitute for calling it" in prompt
+
+
+def test_system_prompt_excludes_read_only_and_hypothetical_requests_from_the_tool_requirement() -> None:
+    """Checkpoint 3.12b: the MUST-call requirement only applies when the
+    user is actually asking for that creation/change right now — not for
+    a read-only question, hypothetical discussion, or explanation."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "actually asking for that specific creation or change right now" in prompt
+    assert "never" in prompt
+    assert "read-only question, hypothetical discussion, an explanation" in prompt
+
+
+def test_system_prompt_still_requires_explicit_confirmation_before_execution() -> None:
+    """Checkpoint 3.12b changes only how strongly the tool call itself is
+    required — it must not weaken the separate, pre-existing guarantee
+    that calling propose_create_task/propose_update_task never executes
+    anything by itself."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "This does NOT create the task — it only proposes it" in prompt
+    assert "This does NOT change it — it only proposes it" in prompt
+    assert "must explicitly confirm before anything is created" in prompt
+
+
 def test_system_prompt_no_longer_claims_tasks_cannot_be_edited_or_marked_complete() -> None:
     """Checkpoint 3.10 narrows the old blanket 'no ability to edit,
     delete, mark complete... in this conversation' claim — that remains
