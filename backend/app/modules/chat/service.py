@@ -1,3 +1,4 @@
+import json
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -119,14 +120,12 @@ _PROPOSE_FORGET_MEMORY_TOOL = {
 _GET_WEATHER_TOOL = {
     "name": "get_weather",
     "description": (
-        "Get real, current factual weather information (temperature, condition, chance of rain) for "
-        "a specific place and time period. This is a READ — it executes immediately and needs no "
+        "Get real, current weather information (temperature, condition, chance of rain) for a "
+        "specific place and time period. This is a READ — it executes immediately and needs no "
         "confirmation, unlike the propose_* tools. Only call this when the user's OWN message "
         "explicitly names a location; if no location was given, ask the user which place they mean "
         "instead of calling this — never guess or default one. Only 'now', 'today', 'tonight', and "
-        "'tomorrow' are supported — for anything further out, say plainly that it isn't available yet. "
-        "This tool returns facts only; never add your own advice or recommendation (e.g. about "
-        "clothing or activities) on top of the returned weather."
+        "'tomorrow' are supported — for anything further out, say plainly that it isn't available yet."
     ),
     "input_schema": {
         "type": "object",
@@ -140,8 +139,20 @@ _GET_WEATHER_TOOL = {
                 "enum": ["now", "today", "tonight", "tomorrow"],
                 "description": "Which time period the user is asking about.",
             },
+            "response_mode": {
+                "type": "string",
+                "enum": ["factual", "reason"],
+                "description": (
+                    "'factual' if the user is asking to be told the weather itself (temperature, rain, "
+                    "conditions) — you will receive a ready-made factual reply, verbatim. 'reason' if "
+                    "the user is asking for judgment or a recommendation BASED ON the weather (e.g. what "
+                    "to wear, whether to go out, whether it's good for an activity) — you will be given "
+                    "the real weather facts and asked to answer the original question yourself, grounded "
+                    "in them."
+                ),
+            },
         },
-        "required": ["location", "horizon"],
+        "required": ["location", "horizon", "response_mode"],
     },
 }
 
@@ -523,7 +534,38 @@ def _render_weather_reply(result: WeatherResult, user_message: str) -> str:
                 f"{low}–{high}°C, {round(result.precipitation_probability)}% chance of rain."
             )
 
-    return f"{body}\n{_WEATHER_ATTRIBUTION_LINE}"
+    return _append_weather_attribution(body)
+
+
+def _append_weather_attribution(text: str) -> str:
+    """Shared by the factual renderer and the Checkpoint 3.8 reasoning
+    path — code-owned and deterministic either way, never relying on
+    the model to remember or restate licensing text (see
+    weather/service.py's module docstring for the CC BY 4.0
+    requirement this satisfies)."""
+    return f"{text}\n{_WEATHER_ATTRIBUTION_LINE}"
+
+
+def _weather_tool_result_payload(result: WeatherResult) -> str:
+    """Checkpoint 3.8: the ONLY weather data the reasoning continuation
+    ever sees — a small, explicit, JSON-serialized subset of
+    WeatherResult's own already-normalized fields. Never the raw
+    Open-Meteo payload, never Tasks/Calendar/Memory/history."""
+    payload = {
+        "source": "open-meteo",
+        "resolved_location": result.resolved_location,
+        "horizon": result.horizon,
+        "period_start": result.period_start.isoformat(),
+        "period_end": result.period_end.isoformat() if result.period_end else None,
+        "timezone": result.timezone,
+        "temperature_c": result.temperature,
+        "temperature_low_c": result.temperature_low,
+        "temperature_high_c": result.temperature_high,
+        "feels_like_c": result.feels_like,
+        "condition": result.condition,
+        "precipitation_probability_percent": result.precipitation_probability,
+    }
+    return json.dumps(payload)
 
 
 def _format_memory_line(memory: Memory) -> str:
@@ -587,7 +629,7 @@ def _require_active_memory(db: Session, space_id: int, user_id: int, action_type
 
 def _handle_create_task_proposal(
     db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
-    timezone_name: str, user_message_content: str,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
 ) -> ChatMessage:
     try:
         validated = actions_service.validate_arguments("create_task", arguments)
@@ -610,7 +652,7 @@ def _handle_create_task_proposal(
 
 def _handle_save_memory_proposal(
     db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
-    timezone_name: str, user_message_content: str,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
 ) -> ChatMessage:
     try:
         validated = actions_service.validate_arguments("save_memory", arguments)
@@ -632,7 +674,7 @@ def _handle_save_memory_proposal(
 
 def _handle_forget_memory_proposal(
     db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
-    timezone_name: str, user_message_content: str,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
 ) -> ChatMessage:
     try:
         validated = actions_service.validate_arguments("forget_memory", arguments)
@@ -652,7 +694,7 @@ def _handle_forget_memory_proposal(
 
 def _handle_get_weather(
     db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
-    timezone_name: str, user_message_content: str,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
 ) -> ChatMessage:
     """Checkpoint 3.7 — READ, not a write proposal: executes directly,
     in this same handler call, and NEVER calls
@@ -661,6 +703,15 @@ def _handle_get_weather(
     docs/architecture/bazra-capability-routing.md), not a separate
     dispatch dictionary. Registered in the same _TOOL_HANDLERS dict as
     every write handler below.
+
+    Checkpoint 3.8: response_mode branches AFTER a successful fetch —
+    "factual" is byte-for-byte the 3.7 path (unaffected); "reason" adds
+    exactly one more, terminal model call
+    (orchestrator_service.generate_tool_result_reply, tools=None) that
+    reasons ONLY from this fetch's own normalized WeatherResult. A
+    location/geocoding/fetch failure is identical regardless of
+    response_mode — the reasoning path never even begins without a
+    real, already-fetched result to ground it in.
     """
     try:
         validated = GetWeatherArguments(**arguments)
@@ -684,6 +735,27 @@ def _handle_get_weather(
         result = weather_service.fetch_weather(resolved, validated.horizon)
     except WeatherProviderError:
         return record_assistant_message(db, space_id, user_id, _render_weather_unavailable(user_message_content))
+
+    if validated.response_mode == "reason":
+        try:
+            reasoning_text = orchestrator_service.generate_tool_result_reply(
+                user_message=user_message_content,
+                tool_use_id=tool_use_id,
+                tool_name="get_weather",
+                tool_arguments=arguments,
+                assistant_text=model_text,
+                tool_result_content=_weather_tool_result_payload(result),
+                correlation_id=correlation_id,
+            )
+        except orchestrator_service.OrchestratorError:
+            reasoning_text = None
+
+        if reasoning_text:
+            return record_assistant_message(db, space_id, user_id, _append_weather_attribution(reasoning_text))
+        # Continuation failed or returned nothing usable — degrade to
+        # the factual reply rather than a generic error: the facts
+        # were genuinely fetched, only the interpretation step failed.
+        # No retry, no third model call.
 
     reply_text = _render_weather_reply(result, user_message_content)
     return record_assistant_message(db, space_id, user_id, reply_text)
@@ -781,6 +853,7 @@ def send_message(
         if handler is not None:
             assistant_message = handler(
                 db, space_id, user_id, result.tool_call.arguments, result.text, timezone_name, content,
+                result.tool_call.tool_use_id, result.correlation_id,
             )
             return user_message, assistant_message
 

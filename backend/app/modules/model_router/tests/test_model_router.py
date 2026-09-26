@@ -61,8 +61,9 @@ class _FakeMessageNoText:
 
 
 class _FakeToolUseBlock:
-    def __init__(self, name: str, input: dict):
+    def __init__(self, name: str, input: dict, id: str = "toolu_test"):
         self.type = "tool_use"
+        self.id = id
         self.name = name
         self.input = input
 
@@ -72,8 +73,8 @@ class _FakeMessageToolOnly:
     expected shape once tools are offered (Checkpoint 3.3), not an
     error the way _FakeMessageNoText's genuinely empty response is."""
 
-    def __init__(self, tool_name: str, tool_input: dict, input_tokens: int = 30, output_tokens: int = 15):
-        self.content = [_FakeToolUseBlock(tool_name, tool_input)]
+    def __init__(self, tool_name: str, tool_input: dict, input_tokens: int = 30, output_tokens: int = 15, id: str = "toolu_test"):
+        self.content = [_FakeToolUseBlock(tool_name, tool_input, id=id)]
         self.usage = _FakeUsage(input_tokens, output_tokens)
 
 
@@ -467,3 +468,132 @@ def test_complete_without_tools_offered_is_unaffected_by_the_tool_extraction_cha
 
     assert result.text == "plain answer"
     assert result.tool_uses == []
+
+
+# ---- Checkpoint 3.8: tool_use.id, structured content, correlation_id -----------
+
+
+def test_tool_use_id_is_preserved_from_the_provider_response(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service, "_call_anthropic",
+        lambda model, messages, **kwargs: _FakeMessageToolOnly(
+            "get_weather", {"location": "Cairo"}, id="toolu_specific_id"
+        ),
+    )
+
+    result = model_router_service.complete(
+        purpose="chat_completion", messages=[{"role": "user", "content": "weather?"}], tools=[{"name": "get_weather"}]
+    )
+
+    assert result.tool_uses[0].id == "toolu_specific_id"
+
+
+def test_complete_generates_a_correlation_id_when_none_is_supplied(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("hi", 5, 5))
+
+    result = model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+
+    assert result.correlation_id
+    assert isinstance(result.correlation_id, str)
+
+    trace = _latest_trace(db_session)
+    assert trace.correlation_id == result.correlation_id
+
+
+def test_complete_reuses_a_caller_supplied_correlation_id(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The one real consumer: a tool_result_reasoning continuation
+    reusing its initiating chat_completion call's own correlation_id —
+    proving complete() honors an explicit input rather than always
+    generating a fresh one."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("hi", 5, 5))
+
+    result = model_router_service.complete(
+        purpose="tool_result_reasoning", messages=[{"role": "user", "content": "hi"}], correlation_id="corr_reused_123",
+    )
+
+    assert result.correlation_id == "corr_reused_123"
+    trace = _latest_trace(db_session)
+    assert trace.correlation_id == "corr_reused_123"
+
+
+def test_correlation_id_contains_no_user_or_tool_content(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cheap but real guard: the generated id must never embed the
+    purpose string, message content, or anything else recognizable —
+    it is meant to be an opaque, content-free grouping key."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("hi", 5, 5))
+
+    marker = "SUPER_SECRET_USER_CONTENT_MARKER"
+    result = model_router_service.complete(
+        purpose="chat_completion", messages=[{"role": "user", "content": marker}]
+    )
+
+    assert marker not in result.correlation_id
+    assert "chat_completion" not in result.correlation_id
+
+
+def test_error_path_also_records_the_resolved_correlation_id(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service, "_call_anthropic",
+        lambda model, messages, **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+
+    with pytest.raises(model_router_service.ModelRouterError):
+        model_router_service.complete(
+            purpose="chat_completion", messages=[{"role": "user", "content": "hi"}], correlation_id="corr_error_case",
+        )
+
+    trace = _latest_trace(db_session)
+    assert trace.status == "error"
+    assert trace.correlation_id == "corr_error_case"
+
+
+def test_existing_ai_trace_rows_with_null_correlation_id_remain_valid(db_session: Session) -> None:
+    """Additive-migration guarantee: a pre-3.8 row (no correlation_id at
+    all) must still read back correctly, not be treated as invalid or
+    require a backfill."""
+    row = AiTrace(
+        provider="anthropic", model="claude-sonnet-5", purpose="chat_completion", status="success", latency_ms=100,
+    )
+    db_session.add(row)
+    db_session.commit()
+    db_session.refresh(row)
+
+    assert row.correlation_id is None
+
+
+def test_serialize_messages_converts_blocks_to_anthropic_dict_shape() -> None:
+    from app.modules.model_router.schemas import TextBlock, ToolResultBlock, ToolUseBlock
+
+    messages = [
+        {"role": "user", "content": "plain string unaffected"},
+        {"role": "assistant", "content": [TextBlock(text="I'll check."), ToolUseBlock(id="toolu_1", name="get_weather", input={"location": "Cairo"})]},
+        {"role": "user", "content": [ToolResultBlock(tool_use_id="toolu_1", content='{"temp": 20}')]},
+        {"role": "user", "content": [ToolResultBlock(tool_use_id="toolu_1", content="boom", is_error=True)]},
+    ]
+
+    serialized = model_router_service._serialize_messages(messages)
+
+    assert serialized[0] == {"role": "user", "content": "plain string unaffected"}
+    assert serialized[1]["content"] == [
+        {"type": "text", "text": "I'll check."},
+        {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"location": "Cairo"}},
+    ]
+    assert serialized[2]["content"] == [{"type": "tool_result", "tool_use_id": "toolu_1", "content": '{"temp": 20}'}]
+    assert serialized[3]["content"] == [
+        {"type": "tool_result", "tool_use_id": "toolu_1", "content": "boom", "is_error": True}
+    ]

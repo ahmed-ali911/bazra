@@ -1,6 +1,35 @@
 from app.modules.model_router import service as model_router_service
+from app.modules.model_router.schemas import TextBlock, ToolResultBlock, ToolUseBlock
 from app.modules.orchestrator.identity import BAZRA_IDENTITY_INSTRUCTIONS
 from app.modules.orchestrator.schemas import HistoryTurn, OrchestratorResult, ToolCallRequest
+
+# Checkpoint 3.8: the terminal tool-result continuation's own system
+# prompt — deliberately NOT _build_system_prompt's full Task/Calendar/
+# Memory Context Assembly, and deliberately NOT including current
+# date/time (the normalized tool_result already carries its own
+# period_start/period_end/timezone, which is sufficient temporal
+# grounding for every currently-approved reasoning example — see the
+# 3.8 architecture review's "no context without a current consumer").
+# BAZRA_IDENTITY_INSTRUCTIONS is reused verbatim, not copied or
+# paraphrased, so tone/language-mirroring/truthfulness rules are
+# identical to every other call — this is not a second Personality
+# Engine.
+_TOOL_RESULT_SYSTEM_INSTRUCTIONS = (
+    "## Reasoning from a tool result\n"
+    "You already called a tool for the user's own message above, and its real, "
+    "current result is provided below as the tool result. Treat it as the ONLY "
+    "authoritative source of live information for this answer — never invent a "
+    "missing field, never substitute your own general knowledge for it, and "
+    "never claim it contains something it does not. If the result doesn't fully "
+    "answer the question, say plainly what you don't know rather than guessing. "
+    "Clearly distinguish the observed/forecast facts from any judgment or "
+    "recommendation you offer on top of them. Answer naturally, in the same "
+    "language as the user's original message.\n"
+)
+
+
+def _build_tool_result_system_prompt() -> str:
+    return f"{BAZRA_IDENTITY_INSTRUCTIONS}\n{_TOOL_RESULT_SYSTEM_INSTRUCTIONS}"
 
 # Prompt-level instructions only — NOT code-enforced. The code-level
 # guarantee that no DOMAIN MUTATION can actually happen regardless of
@@ -84,9 +113,12 @@ _SYSTEM_INSTRUCTIONS = (
     "about a further-out period (e.g. next week), say plainly that isn't "
     "available yet rather than guessing or calling the tool with an unsupported "
     "value.\n"
-    "- get_weather returns facts only. State them as given — never add your own "
-    "advice or recommendation on top (e.g. whether to bring a jacket or "
-    "umbrella, or whether it's good weather for an activity).\n"
+    "- Set response_mode to 'factual' when the user just wants to be told the "
+    "weather — you will get a ready-made reply back. Set it to 'reason' when "
+    "the user is asking for judgment or a recommendation based on the weather "
+    "(Checkpoint 3.8) — e.g. what to wear, whether to go out, whether it's good "
+    "for an activity; you will then be given the real weather facts and asked "
+    "to answer the original question yourself, grounded in them.\n"
 )
 
 
@@ -154,6 +186,59 @@ def generate_reply(
     tool_call = None
     if response.tool_uses:
         first = response.tool_uses[0]
-        tool_call = ToolCallRequest(tool_name=first.name, arguments=first.input)
+        tool_call = ToolCallRequest(tool_use_id=first.id, tool_name=first.name, arguments=first.input)
 
-    return OrchestratorResult(text=response.text, tool_call=tool_call)
+    return OrchestratorResult(text=response.text, tool_call=tool_call, correlation_id=response.correlation_id)
+
+
+def generate_tool_result_reply(
+    user_message: str,
+    tool_use_id: str,
+    tool_name: str,
+    tool_arguments: dict,
+    assistant_text: str | None,
+    tool_result_content: str,
+    correlation_id: str,
+) -> str | None:
+    """Checkpoint 3.8 — the terminal continuation call for a read tool's
+    "reason" response_mode. tools=None, UNCONDITIONALLY: this is what
+    structurally forecloses another tool_use (there is nothing declared
+    for the model to call), rather than relying on a prompt instruction
+    that could be ignored — no agent loop, no recursive tool execution,
+    ever possible from this call.
+
+    correlation_id is REQUIRED (never generated here) — the caller
+    passes its own initiating chat_completion call's
+    OrchestratorResult.correlation_id, so both AiTrace rows for this one
+    logical reasoning turn share the same value.
+
+    The reconstructed assistant turn (assistant_text + a ToolUseBlock
+    echoing tool_use_id/tool_name/tool_arguments exactly as the model
+    itself produced them) must immediately precede the tool_result
+    message, with nothing in between — the provider's own required
+    ordering (see Anthropic's tool-use docs) — which is exactly what
+    this minimal 3-message list is.
+    """
+    assistant_content: list = []
+    if assistant_text:
+        assistant_content.append(TextBlock(text=assistant_text))
+    assistant_content.append(ToolUseBlock(id=tool_use_id, name=tool_name, input=tool_arguments))
+
+    messages = [
+        {"role": "user", "content": user_message},
+        {"role": "assistant", "content": assistant_content},
+        {"role": "user", "content": [ToolResultBlock(tool_use_id=tool_use_id, content=tool_result_content)]},
+    ]
+
+    try:
+        response = model_router_service.complete(
+            purpose="tool_result_reasoning",
+            messages=messages,
+            system=_build_tool_result_system_prompt(),
+            tools=None,
+            correlation_id=correlation_id,
+        )
+    except model_router_service.ModelRouterError as exc:
+        raise OrchestratorError(str(exc)) from exc
+
+    return response.text

@@ -7,15 +7,17 @@ _ANCHOR = "2030-06-15T14:30:00 (Africa/Cairo)"
 
 
 class _FakeToolUse:
-    def __init__(self, name, input):
+    def __init__(self, name, input, id="toolu_test"):
+        self.id = id
         self.name = name
         self.input = input
 
 
 class _FakeModelResponse:
-    def __init__(self, text=None, tool_uses=None):
+    def __init__(self, text=None, tool_uses=None, correlation_id="corr_test"):
         self.text = text
         self.tool_uses = tool_uses or []
+        self.correlation_id = correlation_id
 
 
 def test_generate_reply_builds_correct_message_list_and_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -248,10 +250,91 @@ def test_system_prompt_lists_exactly_the_supported_weather_horizons() -> None:
     assert "'now', 'today', 'tonight', and 'tomorrow' are supported" in prompt
 
 
-def test_system_prompt_instructs_weather_facts_only_no_advice() -> None:
+def test_system_prompt_instructs_response_mode_factual_vs_reason() -> None:
+    """Checkpoint 3.8: the model expresses factual-vs-interpretive intent
+    as a response_mode argument on the SAME get_weather call, not via a
+    second tool or a separate classifier call."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
-    assert "get_weather returns facts only" in prompt
-    assert "never add your own advice or recommendation" in prompt
+    assert "Set response_mode to 'factual'" in prompt
+    assert "Set it to 'reason' when the user is asking for judgment or a recommendation" in prompt
+
+
+# ---- Checkpoint 3.8: terminal tool-result continuation ----------------------
+
+
+def test_tool_result_system_prompt_excludes_current_date_time() -> None:
+    """Correction 2: the continuation's system prompt must NOT include
+    current date/time unless a concrete consumer proves it necessary —
+    WeatherResult's own period_start/period_end/timezone are sufficient
+    temporal grounding for every currently-approved example."""
+    prompt = orchestrator_service._build_tool_result_system_prompt()
+    assert "Current date/time" not in prompt
+    assert _ANCHOR not in prompt
+
+
+def test_tool_result_system_prompt_includes_identity_and_grounding_rules() -> None:
+    prompt = orchestrator_service._build_tool_result_system_prompt()
+    assert "You are BAZRA" in prompt
+    assert "the ONLY authoritative source of live information" in prompt
+    assert "never invent a missing field" in prompt
+
+
+def test_generate_tool_result_reply_sends_no_tools_and_reuses_correlation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def _fake_complete(*, purpose, messages, system=None, tools=None, correlation_id=None):
+        captured["purpose"] = purpose
+        captured["messages"] = messages
+        captured["tools"] = tools
+        captured["correlation_id"] = correlation_id
+        return _FakeModelResponse(text="It's warm tonight, no jacket needed.", correlation_id=correlation_id)
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    result = orchestrator_service.generate_tool_result_reply(
+        user_message="do I need a jacket tonight in Cairo?",
+        tool_use_id="toolu_123",
+        tool_name="get_weather",
+        tool_arguments={"location": "Cairo", "horizon": "tonight", "response_mode": "reason"},
+        assistant_text="Let me check the weather.",
+        tool_result_content='{"condition": "clear", "temperature_low_c": 22}',
+        correlation_id="corr_shared_value",
+    )
+
+    assert result == "It's warm tonight, no jacket needed."
+    assert captured["purpose"] == "tool_result_reasoning"
+    assert captured["tools"] is None  # terminal — structurally forecloses another tool call
+    assert captured["correlation_id"] == "corr_shared_value"
+
+    # Exact 3-message shape, tool_result immediately following tool_use,
+    # nothing in between — the provider's own required ordering.
+    assert captured["messages"][0] == {"role": "user", "content": "do I need a jacket tonight in Cairo?"}
+    assistant_content = captured["messages"][1]["content"]
+    assert assistant_content[-1].id == "toolu_123"
+    assert assistant_content[-1].name == "get_weather"
+    tool_result_content = captured["messages"][2]["content"]
+    assert tool_result_content[0].tool_use_id == "toolu_123"
+    assert tool_result_content[0].content == '{"condition": "clear", "temperature_low_c": 22}'
+
+
+def test_generate_tool_result_reply_wraps_model_router_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(**kwargs):
+        raise orchestrator_service.model_router_service.ModelRouterError("provider_error")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
+
+    with pytest.raises(orchestrator_service.OrchestratorError):
+        orchestrator_service.generate_tool_result_reply(
+            user_message="do I need a jacket?",
+            tool_use_id="toolu_1",
+            tool_name="get_weather",
+            tool_arguments={"location": "Cairo", "horizon": "now", "response_mode": "reason"},
+            assistant_text=None,
+            tool_result_content="{}",
+            correlation_id="corr_x",
+        )
 
 
 def test_orchestrator_never_imports_a_write_capable_service_function() -> None:

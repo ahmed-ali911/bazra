@@ -1,4 +1,5 @@
 import logging
+import secrets
 import time
 from decimal import Decimal
 
@@ -10,7 +11,14 @@ from sqlalchemy.orm import sessionmaker
 from app.config import settings
 from app.database import SessionLocal
 from app.modules.model_router.models import AiTrace
-from app.modules.model_router.schemas import ModelCallPurpose, ModelResponse, ToolUseBlock, VALID_PURPOSES
+from app.modules.model_router.schemas import (
+    VALID_PURPOSES,
+    ModelCallPurpose,
+    ModelResponse,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +56,42 @@ def _get_client() -> Anthropic:
     return Anthropic(api_key=settings.anthropic_api_key)
 
 
+def _serialize_block(block: TextBlock | ToolUseBlock | ToolResultBlock) -> dict:
+    """The ONLY place in the codebase that knows Anthropic's literal
+    wire-format content-block keys (Checkpoint 3.8) — callers outside
+    this module construct/receive TextBlock/ToolUseBlock/ToolResultBlock
+    only, never a raw dict with a "type" key."""
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, ToolUseBlock):
+        return {"type": "tool_use", "id": block.id, "name": block.name, "input": block.input}
+    if isinstance(block, ToolResultBlock):
+        result: dict = {"type": "tool_result", "tool_use_id": block.tool_use_id, "content": block.content}
+        if block.is_error:
+            result["is_error"] = True
+        return result
+    raise TypeError(f"Unknown content block type: {type(block)!r}")
+
+
+def _serialize_messages(messages: list[dict]) -> list[dict]:
+    """A message's content is either a plain string (unchanged since
+    3.2 — passed through untouched) or, as of 3.8, a list of content-
+    block dataclasses (used to replay an assistant tool_use turn and to
+    supply a tool_result) — converted to Anthropic's own dict shape
+    only here, immediately before the SDK call."""
+    serialized = []
+    for message in messages:
+        content = message["content"]
+        if isinstance(content, str):
+            serialized.append(message)
+        else:
+            serialized.append({"role": message["role"], "content": [_serialize_block(block) for block in content]})
+    return serialized
+
+
 def _call_anthropic(
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict],
     system: str | None = None,
     tools: list[dict] | None = None,
 ) -> Message:
@@ -61,7 +102,7 @@ def _call_anthropic(
     has no "system" message role. tools is additive (Checkpoint 3.3) —
     omitted entirely when not passed, so existing callers see no change
     in the request shape at all."""
-    kwargs = {"model": model, "max_tokens": _MAX_TOKENS, "messages": messages}
+    kwargs = {"model": model, "max_tokens": _MAX_TOKENS, "messages": _serialize_messages(messages)}
     if system is not None:
         kwargs["system"] = system
     if tools is not None:
@@ -81,7 +122,7 @@ def _extract_response_parts(message: Message) -> tuple[str | None, list[ToolUseB
     """
     text_parts = [block.text for block in message.content if getattr(block, "type", None) == "text"]
     tool_uses = [
-        ToolUseBlock(name=block.name, input=block.input)
+        ToolUseBlock(id=block.id, name=block.name, input=block.input)
         for block in message.content
         if getattr(block, "type", None) == "tool_use"
     ]
@@ -173,9 +214,10 @@ def _safe_record_trace(**fields) -> bool:
 
 def complete(
     purpose: ModelCallPurpose,
-    messages: list[dict[str, str]],
+    messages: list[dict],
     system: str | None = None,
     tools: list[dict] | None = None,
+    correlation_id: str | None = None,
 ) -> ModelResponse:
     """The only function other modules call to reach a model provider.
 
@@ -189,6 +231,19 @@ def complete(
     omitted, behavior is byte-for-byte identical to before this
     checkpoint. ModelResponse.text may be None only when tools were
     offered and the model chose to call one with no accompanying text.
+
+    correlation_id (Checkpoint 3.8) is an opaque grouping identifier for
+    AiTrace rows that belong to the same logical model workflow — no
+    user/prompt/tool content, no timestamp/semantic encoding, generated
+    server-side via secrets.token_hex, the same primitive already used
+    for session tokens (auth/service.py). When omitted (every ordinary,
+    single-call turn), one is generated fresh here. A caller reusing an
+    earlier call's OWN ModelResponse.correlation_id (the only real
+    consumer today: a tool_result_reasoning continuation reusing its
+    initiating chat_completion's id) is what links two AiTrace rows as
+    one workflow — this is an explicit input, never hidden/thread-local
+    state, and is the ONLY thing "correlation" means here: no span
+    trees, no parent/child relationships, no distributed tracing.
 
     Guarantees, stated explicitly rather than assumed:
     - The provider call failing (auth, network, rate limit, missing key)
@@ -213,6 +268,7 @@ def complete(
         raise ValueError(f"Unknown purpose: {purpose!r}")
 
     model = _DEFAULT_MODEL
+    resolved_correlation_id = correlation_id or secrets.token_hex(16)
     start = time.monotonic()
 
     # Boundary 1: the provider call itself. A failure here means no
@@ -234,6 +290,7 @@ def complete(
             completion_tokens=None,
             estimated_cost_usd=None,
             error_summary=_summarize_error(exc),
+            correlation_id=resolved_correlation_id,
         )
         raise ModelRouterError(_summarize_error(exc)) from exc
 
@@ -269,6 +326,7 @@ def complete(
             completion_tokens=completion_tokens,
             estimated_cost_usd=estimated_cost_usd,
             error_summary=_summarize_error(exc),
+            correlation_id=resolved_correlation_id,
         )
         raise ModelRouterError(_summarize_error(exc)) from exc
 
@@ -286,6 +344,7 @@ def complete(
         completion_tokens=completion_tokens,
         estimated_cost_usd=estimated_cost_usd,
         error_summary=None,
+        correlation_id=resolved_correlation_id,
     ):
         logger.error("model_router: trace persistence failed for a successful call (purpose=%s)", purpose)
 
@@ -295,4 +354,5 @@ def complete(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         tool_uses=tool_uses,
+        correlation_id=resolved_correlation_id,
     )

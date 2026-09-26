@@ -25,6 +25,17 @@ class AiTrace(BaseModel):
 
     Never stores prompt/response text or provider secrets — see
     service.py's _record_trace and this module's explicit absence tests.
+
+    correlation_id (Checkpoint 3.8): an opaque, server-generated grouping
+    identifier — no user/prompt/tool/result content, no timestamp or
+    semantic encoding. Nullable: every pre-3.8 row has none, and remains
+    valid. Its one real consumer today is linking a tool_result_reasoning
+    continuation's row back to the chat_completion row that triggered
+    it (both rows are given the SAME value); an ordinary single-call
+    turn also receives one (Model Router generates it unconditionally),
+    but nothing currently groups on it beyond the two-row case. This is
+    deliberately just one flat, opaque grouping key — no span/parent
+    hierarchy, no trace tree, no separate correlation table.
     """
 
     __tablename__ = "ai_traces"
@@ -38,3 +49,4 @@ class AiTrace(BaseModel):
     completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     estimated_cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(10, 6), nullable=True)
     error_summary: Mapped[str | None] = mapped_column(String, nullable=True)
+    correlation_id: Mapped[str | None] = mapped_column(String, nullable=True, index=True)

@@ -279,6 +279,57 @@ All three passed on the first attempt.
   weather-specific API key/config entry (not needed for Open-Meteo's
   free tier); geocoding disambiguation UI.
 
+### Checkpoint 3.8
+
+Grounded tool-result reasoning — the general architecture 3.7 deferred
+for questions requiring interpretation of a live tool result (e.g.
+"do I need a jacket tonight?"), proven with weather as its first real
+consumer. `get_weather` gains a required `response_mode: factual |
+reason` argument, decided by the SAME initial model call (no second
+classifier, no keyword routing) — the same pattern already proven by
+`save_memory.type`. `factual` is byte-for-byte the 3.7 path. `reason`
+adds exactly one more, **terminal** model call
+(`orchestrator_service.generate_tool_result_reply`, `tools=None`
+unconditionally) that reasons only from the fetch's own normalized
+`WeatherResult` — never the raw Open-Meteo payload, never Tasks/
+Calendar/Memory/earlier history, and deliberately no current date/time
+(the result's own `period_start`/`period_end`/`timezone` are sufficient
+temporal grounding). `tools=None` is a structural guarantee, not a
+prompt convention: with no tool declared, the provider cannot emit a
+`tool_use` block, which forecloses any further tool call, write
+attempt, or loop by construction. A failed continuation degrades to the
+existing factual renderer's output — honest, since the facts were
+really fetched — with no retry and no third call. Attribution remains
+code-appended either way.
+
+Required a small Model Router evolution: `ToolUseBlock` gains `id`
+(previously discarded); a message's `content` may now be a list of
+`TextBlock`/`ToolUseBlock`/`ToolResultBlock` alongside the existing
+plain-string shape, serialized to Anthropic's literal wire format only
+inside `model_router/service.py` — nothing outside that module ever
+constructs a raw provider-shaped dict. Also added `AiTrace.correlation_id`
+(nullable String, one additive migration) — an opaque, server-generated
+grouping id (`secrets.token_hex`, the same primitive `auth/service.py`
+already uses for session tokens), assigned to every call and explicitly
+reused across a `reason` turn's two calls so both rows are provably
+linked, without any span/parent hierarchy or separate correlation table.
+
+Live-verified with 3 gates, all passing on the first attempt: factual
+weather (still exactly 1 call), interpretive weather ("do I need a
+jacket tonight in Cairo?" — exactly 2 calls sharing one
+`correlation_id`, a grounded real recommendation, zero `ProposedAction`
+rows), and an existing write proposal (still exactly 1 call, a
+`ProposedAction` created, no continuation attempted) — proving 3.3's
+semantics are untouched.
+
+- Deferred (no current consumer or no demonstrated need): `response_mode`
+  on any capability beyond weather; combining tool-result reasoning with
+  Tasks/Calendar/Memory context in the same continuation; multiple/
+  parallel tool calls; resending `tools` on a continuation (deliberately
+  never done); an agent loop or recursive tool execution; a second
+  fact-checking model call; a distributed-tracing span/parent hierarchy
+  or correlation table.
+
 ## Run locally (without Docker)
 
 ```bash

@@ -51,9 +51,15 @@ def _message_count(db_session: Session) -> int:
     return db_session.execute(select(func.count()).select_from(ChatMessage)).scalar_one()
 
 
-def _mock_reply(text: str | None, tool_name: str | None = None, arguments: dict | None = None):
-    tool_call = ToolCallRequest(tool_name, arguments or {}) if tool_name else None
-    return lambda **kwargs: OrchestratorResult(text=text, tool_call=tool_call)
+def _mock_reply(
+    text: str | None, tool_name: str | None = None, arguments: dict | None = None,
+    tool_use_id: str = "toolu_test", correlation_id: str = "corr_test",
+):
+    tool_call = (
+        ToolCallRequest(tool_use_id=tool_use_id, tool_name=tool_name, arguments=arguments or {})
+        if tool_name else None
+    )
+    return lambda **kwargs: OrchestratorResult(text=text, tool_call=tool_call, correlation_id=correlation_id)
 
 
 def _get_space_and_user(db_session: Session):
@@ -114,7 +120,7 @@ def test_chat_answers_grounded_in_real_seeded_data(
     def _fake_generate_reply(**kwargs):
         captured["context"] = kwargs["context"]
         captured["user_message"] = kwargs["user_message"]
-        return OrchestratorResult(text="Your task list shows File Q3 taxes is overdue.", tool_call=None)
+        return OrchestratorResult(text="Your task list shows File Q3 taxes is overdue.", tool_call=None, correlation_id="corr_test")
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -138,7 +144,7 @@ def test_clear_write_request_gets_unavailability_message_without_calling_model(
     def _track(**kwargs):
         nonlocal call_count
         call_count += 1
-        return OrchestratorResult(text="should never be called", tool_call=None)
+        return OrchestratorResult(text="should never be called", tool_call=None, correlation_id="corr_test")
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _track)
 
@@ -554,7 +560,7 @@ def test_history_capped_at_max_message_count(
 
     def _fake_generate_reply(**kwargs):
         captured["history"] = kwargs["history"]
-        return OrchestratorResult(text="ok", tool_call=None)
+        return OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -632,7 +638,7 @@ def test_incoming_and_history_budgets_are_independent(
 
     def _fake_generate_reply(**kwargs):
         captured["history_len"] = len(kwargs["history"])
-        return OrchestratorResult(text="ok", tool_call=None)
+        return OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -957,7 +963,7 @@ def test_relevant_memory_appears_in_a_later_conversations_context(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None)),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")),
     )
     _send(authenticated_client, "اشرحلي الـ Model Router")
 
@@ -983,7 +989,7 @@ def test_forgotten_memory_does_not_appear_in_context(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None)),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")),
     )
     _send(authenticated_client, "what's up?")
 
@@ -1007,7 +1013,7 @@ def test_inference_type_memory_is_labeled_tentative_in_context(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None)),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")),
     )
     _send(authenticated_client, "what's up?")
 
@@ -1044,7 +1050,7 @@ def test_memory_context_discloses_truncation_when_active_count_exceeds_the_cap(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="...", tool_call=None)),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="...", tool_call=None, correlation_id="corr_test")),
     )
     _send(authenticated_client, "إيه اللي فاكره عني؟")
 
@@ -1173,7 +1179,10 @@ def test_identity_and_personality_instructions_reach_a_real_chat_turns_system_pr
 
     def _fake_complete(*, purpose, messages, system=None, tools=None):
         captured["system"] = system
-        return ModelResponse(text="ok", model="claude-sonnet-5", prompt_tokens=1, completion_tokens=1, tool_uses=[])
+        return ModelResponse(
+            text="ok", model="claude-sonnet-5", prompt_tokens=1, completion_tokens=1, tool_uses=[],
+            correlation_id="corr_test",
+        )
 
     monkeypatch.setattr(model_router_service, "complete", _fake_complete)
 
@@ -1215,8 +1224,9 @@ def _proposed_action_count(db_session: Session) -> int:
 def test_get_weather_tool_offered_with_required_location_and_horizon() -> None:
     tool = next(t for t in chat_service._TOOLS_OFFERED if t["name"] == "get_weather")
     schema = tool["input_schema"]
-    assert schema["required"] == ["location", "horizon"]
+    assert schema["required"] == ["location", "horizon", "response_mode"]
     assert schema["properties"]["horizon"]["enum"] == ["now", "today", "tonight", "tomorrow"]
+    assert schema["properties"]["response_mode"]["enum"] == ["factual", "reason"]
 
 
 def test_missing_location_asks_and_makes_no_weather_http_call(
@@ -1229,7 +1239,10 @@ def test_missing_location_asks_and_makes_no_weather_http_call(
     monkeypatch.setattr(weather_service, "fetch_weather", _fail_if_called)
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        _mock_reply("Which city do you mean?", tool_name="get_weather", arguments={"horizon": "now"}),
+        _mock_reply(
+            "Which city do you mean?", tool_name="get_weather",
+            arguments={"horizon": "now", "response_mode": "factual"},
+        ),
     )
 
     response = _send(authenticated_client, "what's the weather like?")
@@ -1245,7 +1258,8 @@ def test_successful_weather_read_creates_no_proposed_action_and_exactly_one_mode
     def _counted_reply(**kwargs):
         call_count["n"] += 1
         return _mock_reply(
-            "Let me check.", tool_name="get_weather", arguments={"location": "Cairo", "horizon": "now"},
+            "Let me check.", tool_name="get_weather",
+            arguments={"location": "Cairo", "horizon": "now", "response_mode": "factual"},
         )(**kwargs)
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
@@ -1268,7 +1282,10 @@ def test_weather_reply_renders_english_facts_deterministically(
 ) -> None:
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        _mock_reply("checking", tool_name="get_weather", arguments={"location": "Cairo", "horizon": "now"}),
+        _mock_reply(
+            "checking", tool_name="get_weather",
+            arguments={"location": "Cairo", "horizon": "now", "response_mode": "factual"},
+        ),
     )
     monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
         display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
@@ -1289,7 +1306,10 @@ def test_weather_reply_renders_arabic_facts_deterministically(
 ) -> None:
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        _mock_reply("checking", tool_name="get_weather", arguments={"location": "القاهرة", "horizon": "now"}),
+        _mock_reply(
+            "checking", tool_name="get_weather",
+            arguments={"location": "القاهرة", "horizon": "now", "response_mode": "factual"},
+        ),
     )
     monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
         display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
@@ -1308,7 +1328,10 @@ def test_no_attribution_when_location_missing(
 ) -> None:
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        _mock_reply("Which city?", tool_name="get_weather", arguments={"horizon": "now"}),
+        _mock_reply(
+            "Which city?", tool_name="get_weather",
+            arguments={"horizon": "now", "response_mode": "factual"},
+        ),
     )
     response = _send(authenticated_client, "what's the weather like?")
     assert "Open-Meteo" not in response.json()["assistant_message"]["content"]
@@ -1319,7 +1342,10 @@ def test_location_not_found_reply_is_honest_and_unattributed(
 ) -> None:
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        _mock_reply("checking", tool_name="get_weather", arguments={"location": "Nowhereville", "horizon": "now"}),
+        _mock_reply(
+            "checking", tool_name="get_weather",
+            arguments={"location": "Nowhereville", "horizon": "now", "response_mode": "factual"},
+        ),
     )
     monkeypatch.setattr(weather_service, "geocode_location", lambda location: None)
 
@@ -1334,7 +1360,10 @@ def test_provider_failure_produces_one_truthful_reply_never_fabricated(
 ) -> None:
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        _mock_reply("checking", tool_name="get_weather", arguments={"location": "Cairo", "horizon": "now"}),
+        _mock_reply(
+            "checking", tool_name="get_weather",
+            arguments={"location": "Cairo", "horizon": "now", "response_mode": "factual"},
+        ),
     )
 
     def _raise(location):
@@ -1365,8 +1394,9 @@ def test_ai_traces_contain_no_weather_location_or_payload_for_a_weather_turn(
 
     class _FakeToolUseBlock:
         type = "tool_use"
+        id = "toolu_trace_test"
         name = "get_weather"
-        input = {"location": "Cairo", "horizon": "now"}
+        input = {"location": "Cairo", "horizon": "now", "response_mode": "factual"}
 
     class _FakeMessage:
         content = [_FakeToolUseBlock()]
@@ -1391,3 +1421,202 @@ def test_ai_traces_contain_no_weather_location_or_payload_for_a_weather_turn(
             assert "30.06" not in text_value
             assert "31.25" not in text_value
             assert "weather-trace-marker-test" not in text_value
+
+
+# ---- Checkpoint 3.8: grounded tool-result reasoning (response_mode="reason") -----
+
+
+def _max_ai_trace_id(db_session: Session) -> int:
+    return db_session.execute(text("SELECT COALESCE(max(id), 0) FROM ai_traces")).scalar_one()
+
+
+def test_interpretive_weather_uses_exactly_two_model_calls_with_shared_correlation_id(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real end-to-end proof: mocks _call_anthropic (below
+    orchestrator_service.generate_reply AND generate_tool_result_reply,
+    neither of which is itself mocked), so both real model_router.complete()
+    calls happen, writing two real AiTrace rows that must share the SAME
+    correlation_id."""
+    from app.modules.model_router import service as model_router_service
+
+    class _FakeUsage:
+        def __init__(self, input_tokens=10, output_tokens=10):
+            self.input_tokens = input_tokens
+            self.output_tokens = output_tokens
+
+    class _FakeTextBlock:
+        type = "text"
+
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeToolUseBlock:
+        type = "tool_use"
+        id = "toolu_reason_test"
+        name = "get_weather"
+        input = {"location": "Cairo", "horizon": "tonight", "response_mode": "reason"}
+
+    class _FakeToolCallMessage:
+        content = [_FakeToolUseBlock()]
+        usage = _FakeUsage()
+
+    class _FakeReasoningMessage:
+        content = [_FakeTextBlock("It's a mild evening, you probably won't need a jacket.")]
+        usage = _FakeUsage()
+
+    call_log = []
+
+    def _fake_call_anthropic(model, messages, **kwargs):
+        call_log.append(kwargs.get("tools"))
+        if len(call_log) == 1:
+            return _FakeToolCallMessage()
+        return _FakeReasoningMessage()
+
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _fake_call_anthropic)
+    monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
+        display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
+    ))
+    monkeypatch.setattr(weather_service, "fetch_weather", lambda resolved, horizon: WeatherResult(
+        resolved_location="Cairo, Egypt", horizon="tonight",
+        period_start=datetime(2026, 9, 25, 21, 0, tzinfo=timezone.utc),
+        period_end=datetime(2026, 9, 25, 23, 59, 59, tzinfo=timezone.utc),
+        timezone="Africa/Cairo", temperature=None, temperature_low=20.0, temperature_high=23.0,
+        feels_like=None, condition="clear", precipitation_probability=5.0, units="C",
+    ))
+
+    before_trace_id = _max_ai_trace_id(db_session)
+    before_actions = _proposed_action_count(db_session)
+
+    response = _send(authenticated_client, "do I need a jacket tonight in Cairo?")
+    assert response.status_code == 200
+
+    after_actions = _proposed_action_count(db_session)
+    assert after_actions == before_actions  # still zero ProposedAction rows
+
+    assert len(call_log) == 2  # exactly two model calls, never a third
+    assert call_log[1] is None  # continuation received NO tools — terminal
+
+    rows = db_session.execute(
+        text("SELECT purpose, correlation_id FROM ai_traces WHERE id > :bid ORDER BY id"),
+        {"bid": before_trace_id},
+    ).all()
+    assert len(rows) == 2
+    assert rows[0].purpose == "chat_completion"
+    assert rows[1].purpose == "tool_result_reasoning"
+    assert rows[0].correlation_id is not None
+    assert rows[0].correlation_id == rows[1].correlation_id
+
+    content = response.json()["assistant_message"]["content"]
+    assert "It's a mild evening, you probably won't need a jacket." in content
+    assert "Weather data by Open-Meteo.com (https://open-meteo.com/)" in content
+
+
+def test_interpretive_weather_continuation_failure_degrades_to_factual_reply(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No retry, no third call, no generic error — the facts were really
+    fetched, so an honest factual reply is used instead when only the
+    reasoning step fails."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "checking", tool_name="get_weather",
+            arguments={"location": "Cairo", "horizon": "tonight", "response_mode": "reason"},
+        ),
+    )
+    monkeypatch.setattr(weather_service, "geocode_location", lambda location: ResolvedLocation(
+        display_name="Cairo, Egypt", latitude=30.06, longitude=31.25, timezone="Africa/Cairo",
+    ))
+    tonight_result = WeatherResult(
+        resolved_location="Cairo, Egypt", horizon="tonight",
+        period_start=datetime(2026, 9, 25, 21, 0, tzinfo=timezone.utc),
+        period_end=datetime(2026, 9, 25, 23, 59, 59, tzinfo=timezone.utc),
+        timezone="Africa/Cairo", temperature=None, temperature_low=20.0, temperature_high=23.0,
+        feels_like=None, condition="clear", precipitation_probability=5.0, units="C",
+    )
+    monkeypatch.setattr(weather_service, "fetch_weather", lambda resolved, horizon: tonight_result)
+
+    def _raise(**kwargs):
+        raise orchestrator_service.OrchestratorError("provider_error")
+
+    monkeypatch.setattr(orchestrator_service, "generate_tool_result_reply", _raise)
+
+    response = _send(authenticated_client, "do I need a jacket tonight in Cairo?")
+    assert response.status_code == 200
+    content = response.json()["assistant_message"]["content"]
+    assert content == chat_service._render_weather_reply(tonight_result, "do I need a jacket tonight in Cairo?")
+    assert "Weather data by Open-Meteo.com (https://open-meteo.com/)" in content
+
+
+def test_separate_turns_receive_different_correlation_ids(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.model_router import service as model_router_service
+
+    class _FakeUsage:
+        input_tokens = 5
+        output_tokens = 5
+
+    class _FakeTextBlock:
+        type = "text"
+
+        def __init__(self, text):
+            self.text = text
+
+    class _FakeMessage:
+        def __init__(self, text):
+            self.content = [_FakeTextBlock(text)]
+            self.usage = _FakeUsage()
+
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("ok"))
+
+    before = _max_ai_trace_id(db_session)
+    _send(authenticated_client, "separate-turn-marker-1 hello")
+    _send(authenticated_client, "separate-turn-marker-2 hello again")
+
+    rows = db_session.execute(
+        text("SELECT correlation_id FROM ai_traces WHERE id > :bid ORDER BY id"), {"bid": before},
+    ).all()
+    assert len(rows) == 2
+    assert rows[0].correlation_id != rows[1].correlation_id
+
+
+def test_write_proposal_still_one_model_call_no_continuation_and_confirmation_semantics_unchanged(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression proof: write tools are completely untouched by 3.8 —
+    still exactly one model call, still ProposedAction -> confirm ->
+    execute, never a tool-result continuation."""
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply(
+            "I'll create a task to call Hussein — confirm?",
+            tool_name="propose_create_task", arguments={"title": "Call Hussein - corr38test"},
+        )(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+
+    response = _send(authenticated_client, "add a task to call Hussein")
+    assert response.status_code == 200
+    assert call_count["n"] == 1
+
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.action_type == "create_task"
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "Call Hussein - corr38test" for t in tasks)

@@ -31,6 +31,9 @@ CONDITION_PRIORITY: tuple[WeatherCondition, ...] = (
 )
 
 
+WeatherResponseMode = Literal["factual", "reason"]
+
+
 class GetWeatherArguments(BaseModel):
     """The model's own tool-call arguments, validated by THIS module —
     deliberately never added to actions_service._ACTION_ARGUMENT_SCHEMAS
@@ -40,10 +43,18 @@ class GetWeatherArguments(BaseModel):
     here when the user's own message named a place explicitly; see
     chat/service.py's _handle_get_weather and the system prompt's
     "never guess a location" instruction.
+
+    response_mode (Checkpoint 3.8) is the model's own semantic judgment
+    of what the user's question needs — "factual" (state the weather)
+    or "reason" (interpret/recommend based on it) — REQUIRED, no
+    default, the same precedent as MemoryCreate.type: forcing an
+    explicit choice every time rather than silently defaulting toward
+    the cheaper path.
     """
 
     location: str = Field(min_length=1, max_length=100)
     horizon: WeatherHorizon
+    response_mode: WeatherResponseMode
 
 
 @dataclass
