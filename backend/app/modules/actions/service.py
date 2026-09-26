@@ -10,7 +10,7 @@ from app.modules.actions.schemas import ConfirmResult
 from app.modules.memory import service as memory_service
 from app.modules.memory.schemas import MemoryCreate, MemoryForget, MemoryResponse
 from app.modules.tasks import service as tasks_service
-from app.modules.tasks.schemas import TaskCreate, TaskResponse
+from app.modules.tasks.schemas import ProposedTaskUpdate, TaskCreate, TaskResponse, TaskUpdate
 
 _DEFAULT_TTL_MINUTES = 10
 
@@ -21,6 +21,7 @@ _ACTION_ARGUMENT_SCHEMAS: dict[str, type[PydanticBaseModel]] = {
     "create_task": TaskCreate,
     "save_memory": MemoryCreate,
     "forget_memory": MemoryForget,
+    "update_task": ProposedTaskUpdate,
 }
 
 
@@ -54,6 +55,19 @@ def validate_arguments(action_type: str, arguments: dict) -> dict:
     active, is it owned by this space/user) requires a database lookup
     and lives in chat_service, right after this shape check succeeds —
     see chat/service.py's _require_active_memory.
+
+    Checkpoint 3.10 note: exclude_unset=True on the dump below is
+    load-bearing, not cosmetic — for create_task/save_memory it is a
+    no-op (an omitted optional field and an explicit null already mean
+    the same thing for a brand-new row), but for update_task it is what
+    keeps a PARTIAL update partial through the JSONB round-trip:
+    without it, every optional field the model didn't mention would be
+    dumped as an explicit null and, reconstructed at confirm time,
+    would be indistinguishable from "the model explicitly asked to
+    clear this field" — silently wiping title/description/due_at/
+    life_area_id on every update_task confirmation that didn't repeat
+    them all. See tasks/schemas.py's ProposedTaskUpdate and this
+    module's confirm_and_execute update_task branch.
     """
     schema = _ACTION_ARGUMENT_SCHEMAS.get(action_type)
     if schema is None:
@@ -62,7 +76,7 @@ def validate_arguments(action_type: str, arguments: dict) -> dict:
         validated = schema(**arguments)
     except ValidationError as exc:
         raise InvalidActionArgumentsError(action_type, str(exc)) from exc
-    return validated.model_dump(mode="json")
+    return validated.model_dump(mode="json", exclude_unset=True)
 
 
 def _supersede_existing_pending(db: Session, space_id: int, user_id: int) -> None:
@@ -209,7 +223,27 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             proposal.status = "executed"
             proposal.executed_task_id = task.id
             db.commit()
-            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task))
+            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="created")
+
+        if proposal.action_type == "update_task":
+            # ProposedTaskUpdate(**proposal.arguments) reconstructs
+            # model_fields_set correctly from the sparse (exclude_unset)
+            # stored dict — only fields the model actually named are
+            # "set", so re-dumping with exclude_unset below and handing
+            # THAT to TaskUpdate produces a genuinely partial update,
+            # never a silent wipe of untouched fields. completed_at is
+            # never in this data at all (ProposedTaskUpdate has no such
+            # field) — tasks_service.update_task derives it itself, the
+            # exact same server-side-only rule the direct REST path uses.
+            update_data = ProposedTaskUpdate(**proposal.arguments)
+            task_update = TaskUpdate(**update_data.model_dump(exclude={"task_id"}, exclude_unset=True))
+            task = tasks_service.update_task(db, space_id, update_data.task_id, task_update)
+            if task is None:
+                raise RuntimeError(f"task_id {update_data.task_id} no longer exists")
+            proposal.status = "executed"
+            proposal.executed_task_id = task.id
+            db.commit()
+            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="updated")
 
         if proposal.action_type == "save_memory":
             memory_data = MemoryCreate(**proposal.arguments)

@@ -13,14 +13,23 @@ import re
 #
 # Checkpoint 3.3: task CREATION deliberately no longer matches here (the
 # CREATE patterns' noun list dropped "task"/"مهمة") — that phrasing now
-# reaches the Orchestrator, which may offer propose_create_task. Delete/
-# edit/mark-done phrasings for tasks are unaffected and still decline
-# here, since only proposing a CREATE is implemented this checkpoint.
+# reaches the Orchestrator, which may offer propose_create_task.
+#
+# Checkpoint 3.10: task UPDATE (mark done/reopen, reschedule, rename,
+# edit description, reassign life area) similarly no longer matches —
+# "task" and "due date" were dropped from the edit/update noun list, and
+# the standalone mark-done pattern was removed entirely (nothing else in
+# this app has a "done" concept to mark), so that phrasing now reaches
+# the Orchestrator, which may offer propose_update_task. Task DELETION
+# remains unimplemented and still declines here, deliberately — a
+# different risk profile (irreversible) than an editable field, and
+# explicitly out of this checkpoint's scope. Calendar/Inbox/Life-Area
+# edits and deletes are also unaffected and still decline here, since
+# only Task writes are implemented so far.
 _WRITE_INTENT_PATTERNS_EN = [
     re.compile(r"\b(create|add|schedule|make)\b.{0,40}\b(event|meeting|reminder)\b", re.IGNORECASE),
     re.compile(r"\b(delete|remove|cancel)\b.{0,40}\b(task|event|meeting|reminder|life area)\b", re.IGNORECASE),
-    re.compile(r"\b(update|edit|change|reschedule|rename|move)\b.{0,40}\b(task|event|due date|life area)\b", re.IGNORECASE),
-    re.compile(r"\bmark\b.{0,40}\b(done|complete|finished)\b", re.IGNORECASE),
+    re.compile(r"\b(update|edit|change|reschedule|rename|move)\b.{0,40}\b(life area)\b", re.IGNORECASE),
 ]
 
 # A good-faith attempt at common, unambiguous Arabic write phrasings —
@@ -32,7 +41,7 @@ _WRITE_INTENT_PATTERNS_EN = [
 _WRITE_INTENT_PATTERNS_AR = [
     re.compile(r"(ضيف|أضف|اضافة|سجل)\s+.{0,20}(حدث|موعد|تذكير)"),
     re.compile(r"(احذف|امسح|الغاء|إلغاء)\s+.{0,20}(مهمة|حدث|موعد|تذكير)"),
-    re.compile(r"(عدل|غير|غيّر)\s+.{0,20}(مهمة|حدث|موعد|تاريخ)"),
+    re.compile(r"(عدل|غير|غيّر)\s+.{0,20}(حدث|موعد)"),
 ]
 
 WRITE_UNAVAILABLE_MESSAGE = (

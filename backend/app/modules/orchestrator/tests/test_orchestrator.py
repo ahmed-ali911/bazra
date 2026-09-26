@@ -125,6 +125,25 @@ def test_system_prompt_describes_propose_create_task_as_a_proposal_not_an_execut
     assert "must explicitly confirm before anything is created" in prompt
 
 
+def test_system_prompt_describes_propose_update_task_referencing_task_id() -> None:
+    """Checkpoint 3.10: the model must be told to use the real task_id
+    shown in Current Data, never guess one, and that this tool is a
+    proposal (does NOT change anything) just like propose_create_task."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "propose_update_task" in prompt
+    assert "task_id" in prompt
+
+
+def test_system_prompt_no_longer_claims_tasks_cannot_be_edited_or_marked_complete() -> None:
+    """Checkpoint 3.10 narrows the old blanket 'no ability to edit,
+    delete, mark complete... in this conversation' claim — that remains
+    true for Calendar/Inbox/Life Areas, but is no longer true for an
+    existing Task's own fields."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "you still cannot delete a task" in prompt
+    assert "propose_update_task" in prompt
+
+
 def test_system_prompt_includes_current_datetime_anchor() -> None:
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
     assert _ANCHOR in prompt

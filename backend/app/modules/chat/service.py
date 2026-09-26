@@ -17,6 +17,7 @@ from app.modules.memory import service as memory_service
 from app.modules.memory.models import Memory
 from app.modules.orchestrator import service as orchestrator_service
 from app.modules.orchestrator.schemas import HistoryTurn
+from app.modules.tasks import service as tasks_service
 from app.modules.weather import service as weather_service
 from app.modules.weather.schemas import GetWeatherArguments, WeatherProviderError, WeatherResult
 
@@ -63,6 +64,42 @@ _PROPOSE_CREATE_TASK_TOOL = {
             },
         },
         "required": ["title"],
+    },
+}
+
+_PROPOSE_UPDATE_TASK_TOOL = {
+    "name": "propose_update_task",
+    "description": (
+        "Propose changing an EXISTING task — marking it done or reopening it, "
+        "rescheduling its due date, renaming it, editing its description, or "
+        "reassigning its life area. This does NOT change it — it only records a "
+        "proposal that the user must explicitly confirm before anything is "
+        "actually changed. Only use a task_id that actually appears in Current "
+        "Data below (shown as task_id=N next to each task) — never guess one. "
+        "Only include the fields that are actually changing; never repeat fields "
+        "that aren't changing."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "integer",
+                "description": "The task_id of the existing task to change, exactly as shown in Current Data.",
+            },
+            "title": {"type": "string", "description": "New title, only if it's changing."},
+            "description": {"type": "string", "description": "New description, only if it's changing."},
+            "status": {
+                "type": "string",
+                "enum": ["open", "done"],
+                "description": "Set to 'done' to mark complete, or 'open' to reopen — only if this is changing.",
+            },
+            "due_at": {"type": "string", "description": "New ISO 8601 due date/time, only if it's changing."},
+            "life_area_id": {
+                "type": "integer",
+                "description": "New life area id, only if it's changing — must appear in Current Data below.",
+            },
+        },
+        "required": ["task_id"],
     },
 }
 
@@ -159,12 +196,16 @@ _GET_WEATHER_TOOL = {
     },
 }
 
-_TOOLS_OFFERED = [_PROPOSE_CREATE_TASK_TOOL, _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL]
+_TOOLS_OFFERED = [
+    _PROPOSE_CREATE_TASK_TOOL, _PROPOSE_UPDATE_TASK_TOOL, _PROPOSE_SAVE_MEMORY_TOOL,
+    _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
+]
 
 # Used by _describe_pending_proposal to tell the model which tool to call
 # again for a revision, regardless of which action_type is pending.
 _ACTION_TYPE_TOOL_NAMES = {
     "create_task": "propose_create_task",
+    "update_task": "propose_update_task",
     "save_memory": "propose_save_memory",
     "forget_memory": "propose_forget_memory",
 }
@@ -464,6 +505,52 @@ def _render_create_task_confirmation(arguments: dict, timezone_name: str, user_m
     return f'I\'ll add the task "{title}". Shall I go ahead?'
 
 
+def _render_update_task_confirmation(task_title: str, changes: dict, timezone_name: str, user_message: str) -> str:
+    """Checkpoint 3.10 — same discipline as _render_create_task_confirmation:
+    built ONLY from the already-validated `changes` (proposal.arguments
+    minus task_id) and the task's own CURRENT title (re-fetched from the
+    database, never restated by the model) — never from the model's own
+    free-form reply text. `changes` only ever contains fields the model
+    actually named (see actions_service.validate_arguments's
+    exclude_unset note), so this never describes a change that isn't
+    really being proposed.
+    """
+    arabic = _is_arabic(user_message)
+    fragments_en: list[str] = []
+    fragments_ar: list[str] = []
+
+    if "status" in changes:
+        if changes["status"] == "done":
+            fragments_en.append("mark it as done")
+            fragments_ar.append("أعلّمها إنها خلصت")
+        else:
+            fragments_en.append("reopen it")
+            fragments_ar.append("أرجعها مفتوحة")
+    if "due_at" in changes:
+        if changes["due_at"] is None:
+            fragments_en.append("clear its due date")
+            fragments_ar.append("أشيل تاريخها")
+        else:
+            when = _format_due_at_local(changes["due_at"], timezone_name)
+            fragments_en.append(f"reschedule it to {when}")
+            fragments_ar.append(f"أغير ميعادها لـ {when}")
+    if "title" in changes:
+        fragments_en.append(f'rename it to "{changes["title"]}"')
+        fragments_ar.append(f'أغير اسمها لـ "{changes["title"]}"')
+    if "description" in changes:
+        fragments_en.append("update its description")
+        fragments_ar.append("أعدل وصفها")
+    if "life_area_id" in changes:
+        fragments_en.append("move it to a different life area")
+        fragments_ar.append("أنقلها لمجال حياة تاني")
+
+    if arabic:
+        joined = " و".join(fragments_ar)
+        return f'هـ{joined} — "{task_title}". أأكدها؟'
+    joined = " and ".join(fragments_en)
+    return f'I\'ll {joined} — "{task_title}". Shall I go ahead?'
+
+
 def _render_save_memory_confirmation(arguments: dict, user_message: str) -> str:
     """Same discipline as _render_create_task_confirmation: built ONLY
     from the validated arguments that will be stored/executed, never
@@ -608,6 +695,8 @@ def _format_memory_context(memories: list[Memory], total_active_count: int) -> s
 def _reply_for_confirm_result(result: ConfirmResult) -> str:
     if result.outcome == "executed":
         if result.task is not None:
+            if result.task_action == "updated":
+                return f'Done — I\'ve updated the task "{result.task.title}".'
             return f'Done — I\'ve created the task "{result.task.title}".'
         if result.memory is not None:
             if result.memory.status == "forgotten":
@@ -643,6 +732,22 @@ def _require_active_memory(db: Session, space_id: int, user_id: int, action_type
     return memory
 
 
+def _require_existing_task(db: Session, space_id: int, action_type: str, task_id: int):
+    """Checkpoint 3.10 — the same DB-lookup discipline as
+    _require_active_memory: validate_arguments only checks that
+    task_id is shaped like an int; this resolves whether it's a REAL
+    task in this space, called right after that pure shape check
+    succeeds. A None result (wrong id, wrong space) becomes the SAME
+    InvalidActionArgumentsError, before any proposal is created.
+    """
+    task = tasks_service.get_task(db, space_id, task_id)
+    if task is None:
+        raise actions_service.InvalidActionArgumentsError(
+            action_type, f"task_id {task_id} is not a task you own"
+        )
+    return task
+
+
 def _handle_create_task_proposal(
     db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
     timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
@@ -660,6 +765,27 @@ def _handle_create_task_proposal(
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
     actions_service.create_pending_action(
         db, space_id, user_id, assistant_message.id, "create_task", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
+def _handle_update_task_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("update_task", arguments)
+        task = _require_existing_task(db, space_id, "update_task", validated["task_id"])
+    except actions_service.InvalidActionArgumentsError:
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    changes = {k: v for k, v in validated.items() if k != "task_id"}
+    reply_text = _render_update_task_confirmation(task.title, changes, timezone_name, user_message_content)
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "update_task", validated, commit=False,
     )
     db.commit()
     db.refresh(assistant_message)
@@ -779,6 +905,7 @@ def _handle_get_weather(
 
 _TOOL_HANDLERS = {
     "propose_create_task": _handle_create_task_proposal,
+    "propose_update_task": _handle_update_task_proposal,
     "propose_save_memory": _handle_save_memory_proposal,
     "propose_forget_memory": _handle_forget_memory_proposal,
     "get_weather": _handle_get_weather,

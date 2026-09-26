@@ -17,8 +17,13 @@ _MAX_CONTEXT_CHARS = 8000
 
 
 def _format_task_line(task) -> str:
+    """task_id (Checkpoint 3.10) mirrors _format_memory_line's own
+    mem_id convention (chat/service.py) — the same "expose the real id
+    so a later propose_* tool can reference it" need, this time for
+    propose_update_task. Never previously needed since nothing before
+    3.10 referenced an existing task by id."""
     due = f", due {task.due_at.isoformat()}" if task.due_at else ""
-    return f"- {task.title}{due}"
+    return f"- {task.title}{due} (task_id={task.id})"
 
 
 def _format_agenda_line(item) -> str:

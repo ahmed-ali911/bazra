@@ -377,6 +377,65 @@ line.
   deterministic, but recognizing that the sentence means that query is
   not.
 
+### Checkpoint 3.10
+
+Task write-capability breadth: `propose_update_task` — mark an existing
+task done/reopen it, reschedule its due date, rename it, edit its
+description, or reassign its life area, referenced by the `task_id`
+now shown alongside each task in Context Assembly (mirroring Memory's
+own `mem_id` precedent). Reuses the exact `create_task`/`save_memory`/
+`forget_memory` pattern end to end: `ProposedTaskUpdate` (a thin
+`TaskUpdate` subclass adding `task_id`) is one more entry in
+`actions_service._ACTION_ARGUMENT_SCHEMAS`, `confirm_and_execute`
+dispatches a new `update_task` branch calling the *existing*, already-
+tested `tasks_service.update_task`, and the existing zero-LLM confirm/
+reject route (3.9) generalizes to it with no changes of its own. No
+migration — `action_type` remains a plain, code-validated string.
+
+Two correctness findings surfaced during implementation, both fixed as
+part of this checkpoint:
+- `validate_arguments`'s JSONB round-trip previously dumped every
+  optional field (even ones the model never mentioned) as an explicit
+  `null`. Harmless for `create_task`/`save_memory` (an omitted field
+  and an explicit null already mean the same thing for a brand-new
+  row), but would have silently wiped an update-task's untouched
+  fields on every confirmation. Fixed by adding `exclude_unset=True`
+  to that one shared dump call — verified to change nothing for the
+  three pre-existing action types, and directly proven for update_task
+  by a dedicated partial-update test.
+- `write_intent.py`'s existing deterministic decline patterns for
+  "mark done" and "edit/reschedule ... task/due date" would have
+  intercepted the exact phrasings `propose_update_task` needs to
+  reach the model for, before this checkpoint ever ran. Narrowed the
+  same way task **creation** was narrowed in 3.3 — task deletion and
+  all Calendar/Inbox/Life-Area edits remain deterministically declined,
+  unaffected.
+
+`completed_at` (Correction 4) remains owned exclusively by
+`tasks_service.update_task`'s own existing open→done/done→open logic —
+`ProposedTaskUpdate` has no such field at all (it subclasses
+`TaskUpdate`, which has none), and a model-supplied one is proven to be
+silently ignored, never reaching storage or execution. A real
+Postgres two-thread concurrency test (Correction 5) proves the
+row-locked replay guard generalizes to `update_task`, including that
+its `InboxItem` "Completed: …" side effect fires exactly once, not
+twice, under concurrent confirmation attempts.
+
+Live-verified: a real chat-created task, updated to `done` via a real
+`propose_update_task` proposal and a bare "yes" — exactly 1 `AiTrace`
+row for the propose call, zero for the confirm call, the existing 3.9
+deterministic-route log firing correctly for the new action type, and
+`completed_at` set via the unchanged existing behavior. An ordinary
+`create_task` propose→confirm flow was re-verified live alongside it,
+unaffected.
+
+- Deferred (no current consumer or no demonstrated need): `delete_task`
+  (a different, irreversible risk profile — deliberately out of this
+  checkpoint); Calendar/Inbox write capability (the same pattern, one
+  domain later); exposing `task_id` in the merged "Coming Up" agenda
+  line (only Focus Today/Anytime widened — the sections most naturally
+  used to reference a task for a status change).
+
 ## Run locally (without Docker)
 
 ```bash

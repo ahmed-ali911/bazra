@@ -8,6 +8,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.modules.chat import context as context_module
 from app.modules.chat import service as chat_service
 from app.modules.chat.models import ChatMessage
 from app.modules.orchestrator import service as orchestrator_service
@@ -1802,3 +1803,167 @@ def test_arabic_bare_confirm_and_reject_against_pending_proposal_remain_zero_mod
     assert reject_response.status_code == 200
     tasks_after = authenticated_client.get("/api/v1/tasks").json()
     assert not any(t["title"] == "اختبار عربي - 39d" for t in tasks_after)
+
+
+# ---- Checkpoint 3.10: propose / confirm an update to an EXISTING task ------------
+
+
+def _create_real_task(authenticated_client: TestClient, title: str, **extra) -> dict:
+    payload = {"title": title, **extra}
+    response = authenticated_client.post("/api/v1/tasks", json=payload)
+    assert response.status_code == 201
+    return response.json()
+
+
+def test_context_exposes_task_id_for_referencing_existing_tasks(
+    authenticated_client: TestClient, db_session: Session,
+) -> None:
+    """The Checkpoint 3.10 prerequisite: a task must be referenceable by
+    id before propose_update_task can name one at all — mirrors Memory's
+    own mem_id precedent."""
+    task = _create_real_task(authenticated_client, "Context task_id test - 310a")
+
+    user, space = _get_space_and_user(db_session)
+    context = context_module.gather_context(db_session, space.id, TOMORROW_START, WINDOW_END)
+    assert f"(task_id={task['id']})" in context
+
+
+def test_propose_then_confirm_updates_the_real_task(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _create_real_task(authenticated_client, "Mark me done - 310b")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll mark it done — confirm?", tool_name="propose_update_task",
+            arguments={"task_id": task["id"], "status": "done"},
+        ),
+    )
+    propose_response = _send(authenticated_client, "mark 'Mark me done - 310b' as done")
+    assert propose_response.status_code == 200
+    assert "Mark me done - 310b" in propose_response.json()["assistant_message"]["content"]
+
+    tasks_before = authenticated_client.get("/api/v1/tasks").json()
+    before = next(t for t in tasks_before if t["id"] == task["id"])
+    assert before["status"] == "open"
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    assert "updated" in confirm_response.json()["assistant_message"]["content"].lower()
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    after = next(t for t in tasks_after if t["id"] == task["id"])
+    assert after["status"] == "done"
+    assert after["completed_at"] is not None
+
+
+def test_propose_update_task_reject_leaves_the_task_unchanged(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _create_real_task(authenticated_client, "Do not touch me - 310c", description="original")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll rename it — confirm?", tool_name="propose_update_task",
+            arguments={"task_id": task["id"], "title": "Renamed - 310c"},
+        ),
+    )
+    _send(authenticated_client, "rename that task")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    reject_response = _send(authenticated_client, "no")
+    assert reject_response.status_code == 200
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    after = next(t for t in tasks_after if t["id"] == task["id"])
+    assert after["title"] == "Do not touch me - 310c"
+    assert after["description"] == "original"
+
+
+def test_propose_update_task_with_missing_task_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure, updating that", tool_name="propose_update_task", arguments={"status": "done"}),
+    )
+    response = _send(authenticated_client, "mark it done, no id given")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_update_task_with_nonexistent_task_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure, updating that", tool_name="propose_update_task",
+            arguments={"task_id": 999999, "status": "done"},
+        ),
+    )
+    response = _send(authenticated_client, "mark task 999999 as done")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_update_task_confirmation_language_matches_arabic_or_english_of_the_triggering_message(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task_en = _create_real_task(authenticated_client, "Bilingual update test EN - 310d")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("ok", tool_name="propose_update_task", arguments={"task_id": task_en["id"], "status": "done"}),
+    )
+    response_en = _send(authenticated_client, "mark it done please")
+    content_en = response_en.json()["assistant_message"]["content"]
+    assert "Bilingual update test EN - 310d" in content_en
+    assert "Shall I go ahead?" in content_en
+
+    task_ar = _create_real_task(authenticated_client, "اختبار تحديث ثنائي اللغة - 310e")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("تمام", tool_name="propose_update_task", arguments={"task_id": task_ar["id"], "status": "done"}),
+    )
+    response_ar = _send(authenticated_client, "خلصها لو سمحت")
+    content_ar = response_ar.json()["assistant_message"]["content"]
+    assert "اختبار تحديث ثنائي اللغة - 310e" in content_ar
+    assert "أأكدها؟" in content_ar
+
+
+def test_model_prose_with_wrong_details_does_not_appear_in_update_task_confirmation(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same discipline as the 3.3 create_task fix: the confirmation is
+    rendered ONLY from validated arguments, never the model's own
+    free-form text — even when that text describes something else."""
+    task = _create_real_task(authenticated_client, "Real task title - 310f")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll rename it to something totally different!", tool_name="propose_update_task",
+            arguments={"task_id": task["id"], "status": "done"},
+        ),
+    )
+    response = _send(authenticated_client, "mark it done")
+    content = response.json()["assistant_message"]["content"]
+    assert "totally different" not in content
+    assert "Real task title - 310f" in content
+    assert "mark it as done" in content

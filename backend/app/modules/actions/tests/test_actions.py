@@ -374,3 +374,155 @@ def test_validate_arguments_save_memory_requires_type_and_content(db_session: Se
 def test_validate_arguments_forget_memory_requires_memory_id(db_session: Session) -> None:
     with pytest.raises(actions_service.InvalidActionArgumentsError):
         actions_service.validate_arguments("forget_memory", {})
+
+
+# ---- Checkpoint 3.10: update_task ---------------------------------------------------
+
+
+def test_validate_arguments_update_task_requires_task_id(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("update_task", {"status": "done"})
+
+
+def test_validate_arguments_update_task_rejects_a_no_op_with_no_changes(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("update_task", {"task_id": 1})
+
+
+def test_validate_arguments_update_task_only_returns_explicitly_set_fields(db_session: Session) -> None:
+    """The load-bearing exclude_unset proof: an update naming only
+    `status` must not silently reintroduce title/description/due_at/
+    life_area_id as explicit nulls — that would wipe them at execution
+    time. See actions_service.validate_arguments's own docstring note.
+    """
+    validated = actions_service.validate_arguments("update_task", {"task_id": 1, "status": "done"})
+    assert validated == {"task_id": 1, "status": "done"}
+    assert "title" not in validated
+    assert "description" not in validated
+    assert "due_at" not in validated
+    assert "life_area_id" not in validated
+
+
+def test_validate_arguments_update_task_silently_ignores_a_model_supplied_completed_at(
+    db_session: Session,
+) -> None:
+    """Correction 4: there is no parallel completion-timestamp path.
+    ProposedTaskUpdate has no completed_at field at all (it subclasses
+    TaskUpdate, which has none) — Pydantic's default extra="ignore"
+    behavior means a model that somehow included one gets it silently
+    dropped, never reaching storage or execution, never entering
+    model_fields_set."""
+    validated = actions_service.validate_arguments(
+        "update_task",
+        {"task_id": 1, "status": "done", "completed_at": "2020-01-01T00:00:00+00:00"},
+    )
+    assert "completed_at" not in validated
+
+
+def test_confirm_and_execute_dispatches_update_task_applies_only_the_changed_field(
+    db_session: Session, owner
+) -> None:
+    """The end-to-end proof that a partial update stays partial through
+    the full propose -> store -> confirm round trip: only `status` was
+    named, so title/description/due_at/life_area_id must all survive
+    untouched."""
+    from app.modules.life_areas import service as life_areas_service
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    life_area = life_areas_service.create_life_area(db_session, "Home - actions39")
+    task = tasks_service.create_task(
+        db_session, space.id,
+        TaskCreate(
+            title="Untouched title - actions310", description="Original description",
+            due_at=datetime(2030, 6, 20, 9, 0, tzinfo=timezone.utc), life_area_id=life_area.id,
+        ),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "done"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.task_action == "updated"
+    assert result.task.id == task.id
+    assert result.task.status == "done"
+
+    db_session.refresh(task)
+    assert task.status == "done"
+    assert task.title == "Untouched title - actions310"  # untouched
+    assert task.description == "Original description"  # untouched
+    assert task.due_at == datetime(2030, 6, 20, 9, 0, tzinfo=timezone.utc)  # untouched
+    assert task.life_area_id == life_area.id  # untouched
+
+
+def test_confirm_and_execute_update_task_nonexistent_task_rolls_back_to_pending(
+    db_session: Session, owner
+) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": 999999, "status": "done"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"  # reverted, safely re-confirmable
+
+
+# ---- Checkpoint 3.10 / Correction 4: completed_at ownership -------------------------
+
+
+def test_update_task_open_to_done_sets_completed_at_via_existing_task_behavior(
+    db_session: Session, owner
+) -> None:
+    """The direct-REST completion behavior (tasks_service.update_task's
+    own open->done edge) is exercised UNCHANGED through the new chat
+    write path — never a model-supplied timestamp."""
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="Complete me - actions39b"))
+    assert task.completed_at is None
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "done"},
+    )
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.task.completed_at is not None
+
+
+def test_update_task_done_to_open_clears_completed_at_preserving_existing_behavior(
+    db_session: Session, owner
+) -> None:
+    """The existing done->open edge (tasks_service.update_task already
+    nulls completed_at on this transition) is preserved exactly through
+    the new chat write path."""
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate, TaskUpdate
+
+    user, space = owner
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="Reopen me - actions39c"))
+    tasks_service.update_task(db_session, space.id, task.id, TaskUpdate(status="done"))
+    db_session.refresh(task)
+    assert task.completed_at is not None
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "open"},
+    )
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.task.status == "open"
+    assert result.task.completed_at is None
