@@ -1,3 +1,4 @@
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -1217,6 +1218,17 @@ _WEATHER_NOW_RESULT = WeatherResult(
 )
 
 
+def _enable_chat_service_logger() -> None:
+    """Alembic's migrations/env.py (run once per test session to build
+    bazra_test) calls logging.config.fileConfig(), whose default
+    disable_existing_loggers=True silently disables any logger already
+    created by that point, including chat/service.py's own — a
+    pre-existing test-infrastructure quirk, unrelated to this
+    checkpoint's change, worked around locally here rather than editing
+    migrations/env.py."""
+    logging.getLogger("app.modules.chat.service").disabled = False
+
+
 def _proposed_action_count(db_session: Session) -> int:
     return db_session.execute(text("SELECT count(*) FROM proposed_actions")).scalar_one()
 
@@ -1620,3 +1632,173 @@ def test_write_proposal_still_one_model_call_no_continuation_and_confirmation_se
     assert confirm_response.status_code == 200
     tasks = authenticated_client.get("/api/v1/tasks").json()
     assert any(t["title"] == "Call Hussein - corr38test" for t in tasks)
+
+
+# ---- Checkpoint 3.9: deterministic-routing observability & regression guard -----
+
+
+def test_write_intent_decline_makes_zero_model_calls_zero_traces_and_logs_route(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("should never be called")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+
+    before_trace_id = _max_ai_trace_id(db_session)
+    _enable_chat_service_logger()
+    with caplog.at_level(logging.INFO, logger="app.modules.chat.service"):
+        response = _send(authenticated_client, "delete my meeting with Bob")
+    assert response.status_code == 200
+
+    assert call_count["n"] == 0
+    assert _max_ai_trace_id(db_session) == before_trace_id  # zero new AiTrace rows
+
+    user_message_id = response.json()["user_message"]["id"]
+    assert "deterministic_route=write_intent_decline" in caplog.text
+    assert f"chat_message_id={user_message_id}" in caplog.text
+
+
+def test_proposal_confirm_makes_zero_model_calls_zero_traces_and_logs_route(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll add the task — confirm?", tool_name="propose_create_task",
+            arguments={"title": "Deterministic route test - 39a"},
+        ),
+    )
+    _send(authenticated_client, "add a task, deterministic route test 39a")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("should never be called")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+
+    before_trace_id = _max_ai_trace_id(db_session)
+    _enable_chat_service_logger()
+    with caplog.at_level(logging.INFO, logger="app.modules.chat.service"):
+        response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+
+    assert call_count["n"] == 0
+    assert _max_ai_trace_id(db_session) == before_trace_id
+
+    user_message_id = response.json()["user_message"]["id"]
+    assert "deterministic_route=proposal_confirm" in caplog.text
+    assert f"chat_message_id={user_message_id}" in caplog.text
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "Deterministic route test - 39a" for t in tasks)
+
+
+def test_proposal_reject_makes_zero_model_calls_zero_traces_and_logs_route(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll add the task — confirm?", tool_name="propose_create_task",
+            arguments={"title": "Deterministic route test - 39b"},
+        ),
+    )
+    _send(authenticated_client, "add a task, deterministic route test 39b")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("should never be called")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+
+    before_trace_id = _max_ai_trace_id(db_session)
+    _enable_chat_service_logger()
+    with caplog.at_level(logging.INFO, logger="app.modules.chat.service"):
+        response = _send(authenticated_client, "no")
+    assert response.status_code == 200
+
+    assert call_count["n"] == 0
+    assert _max_ai_trace_id(db_session) == before_trace_id
+
+    user_message_id = response.json()["user_message"]["id"]
+    assert "deterministic_route=proposal_reject" in caplog.text
+    assert f"chat_message_id={user_message_id}" in caplog.text
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "Deterministic route test - 39b" for t in tasks)
+
+
+def test_bare_yes_no_with_no_pending_proposal_reaches_the_model_path(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.9 regression guard: proves the rejected candidate
+    from the architecture review (widening confirm/reject to a bare
+    yes/no with NO pending proposal) was never silently adopted — a
+    bare "yes" with nothing pending still reaches the Orchestrator,
+    exactly like any other ordinary message, since without a pending
+    row the phrase has no structural referent to be safe against."""
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    actions_service.reject(db_session, space.id, user.id)  # guarantee no pending, regardless of prior tests
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("I don't have anything pending — did you mean something else?")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+
+    response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+    assert call_count["n"] == 1  # reached the model — NOT deterministically handled
+
+
+def test_arabic_bare_confirm_and_reject_against_pending_proposal_remain_zero_model_calls(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.9: explicit Arabic coverage for the existing
+    deterministic confirm/reject routes — no prior test in this file
+    exercised an Arabic bare confirm/decline phrase against a real
+    pending proposal specifically."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("هضيف المهمة دي — أأكدها؟", tool_name="propose_create_task",
+                    arguments={"title": "اختبار عربي - 39c"}),
+    )
+    _send(authenticated_client, "ضيف مهمة، اختبار عربي")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for Arabic 'نعم'")),
+    )
+    confirm_response = _send(authenticated_client, "نعم")
+    assert confirm_response.status_code == 200
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "اختبار عربي - 39c" for t in tasks)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("هضيف المهمة دي — أأكدها؟", tool_name="propose_create_task",
+                    arguments={"title": "اختبار عربي - 39d"}),
+    )
+    _send(authenticated_client, "ضيف مهمة تانية، اختبار عربي")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for Arabic 'لا'")),
+    )
+    reject_response = _send(authenticated_client, "لا")
+    assert reject_response.status_code == 200
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "اختبار عربي - 39d" for t in tasks_after)

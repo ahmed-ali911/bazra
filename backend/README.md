@@ -330,6 +330,53 @@ semantics are untouched.
   fact-checking model call; a distributed-tracing span/parent hierarchy
   or correlation table.
 
+### Checkpoint 3.9
+
+Deterministic/zero-LLM routing foundation & observability — see
+`docs/architecture/bazra-deterministic-routing.md`. Repository
+inspection found the routing foundation itself already existed,
+incrementally, since Checkpoints 3.3–3.4: `chat/service.py::send_message`
+already short-circuits before ever reaching the Orchestrator for three
+cases — a clear write-intent decline, a bare confirm ("yes") against a
+pending `ProposedAction`, and a bare reject ("no") against one — none
+of which ever call `model_router_service.complete()`, so none can
+produce an `AiTrace` row or a `correlation_id`. No new deterministic
+route was added this checkpoint (a candidate — treating a bare yes/no
+as deterministic even with **no** pending proposal — was evaluated and
+explicitly rejected: without a pending row to give it a concrete
+referent, the same phrase is genuinely conversational again, not safe
+structural evidence).
+
+What shipped: the architecture doc distinguishing zero-LLM *execution*
+from strong structural evidence (preferred) from zero-LLM
+natural-language *understanding* via fragile pattern-matching
+(deliberately avoided); a small, honest observability addition — one
+`logger.info` call at each of the three existing branches, using the
+real, already-persisted `ChatMessage.id` as the turn identifier, never
+a fabricated `AiTrace` row or `correlation_id` (there is no model call
+to correlate on these paths); and tests that explicitly assert the "0
+calls" guarantee by count (mirroring the existing 1-call/2-call
+assertion style), plus a regression guard proving a bare yes/no with no
+pending proposal still reaches the model, and new explicit Arabic
+coverage for the confirm/reject routes (no prior test exercised an
+Arabic bare phrase against a real pending proposal).
+
+Live-verified: a real chat-created `ProposedAction` (1 real model call)
+confirmed via a bare "yes" produced the correct executed `Task`, zero
+new `AiTrace` rows for the confirmation turn, and the expected
+`deterministic_route=proposal_confirm chat_message_id=<real id>` log
+line.
+
+- Deferred (no current consumer or no demonstrated need): a
+  turn/workflow-level correlation concept spanning both model and
+  non-model operations (explicitly left open for a future checkpoint,
+  not decided either way here); UI-originated structured commands (no
+  such request shape exists today — would need frontend work); any
+  natural-language recognition of read intent ("show me what matters
+  today") as a deterministic route — the underlying query is
+  deterministic, but recognizing that the sentence means that query is
+  not.
+
 ## Run locally (without Docker)
 
 ```bash

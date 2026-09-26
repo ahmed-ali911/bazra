@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,6 +19,8 @@ from app.modules.orchestrator import service as orchestrator_service
 from app.modules.orchestrator.schemas import HistoryTurn
 from app.modules.weather import service as weather_service
 from app.modules.weather.schemas import GetWeatherArguments, WeatherProviderError, WeatherResult
+
+logger = logging.getLogger(__name__)
 
 # Four independent bounds, per the explicit review requirement — none of
 # these were defined before, and the conversation would otherwise grow
@@ -269,6 +272,19 @@ class InvalidTimezoneError(Exception):
     def __init__(self, timezone_name: str):
         self.timezone_name = timezone_name
         super().__init__(f"Invalid timezone: {timezone_name}")
+
+
+# Checkpoint 3.9: an ordinary structured log line for each of the three
+# EXISTING zero-LLM branches in send_message (write-intent decline,
+# pending-proposal confirm, pending-proposal reject) — see
+# docs/architecture/bazra-deterministic-routing.md. Deliberately just a
+# log, never a new AiTrace row or a generated correlation_id: there is
+# no model call here to correlate, and inventing one would misrepresent
+# what happened. chat_message_id (the real, already-persisted user
+# ChatMessage.id) is the natural, zero-new-generation identifier for
+# "which turn was this" — not a fabricated correlation value.
+def _log_deterministic_route(route: str, chat_message_id: int) -> None:
+    logger.info("chat: deterministic_route=%s chat_message_id=%s", route, chat_message_id)
 
 
 def record_user_message(db: Session, space_id: int, user_id: int, content: str) -> ChatMessage:
@@ -814,6 +830,7 @@ def send_message(
         # Deterministic path — no model call, no cost, no ai_traces row,
         # since nothing was attempted.
         assistant_message = record_assistant_message(db, space_id, user_id, WRITE_UNAVAILABLE_MESSAGE)
+        _log_deterministic_route("write_intent_decline", user_message.id)
         return user_message, assistant_message
 
     pending = actions_service.get_latest_pending(db, space_id, user_id)
@@ -822,11 +839,13 @@ def send_message(
     if narrow_answer == "yes":
         result = actions_service.confirm_and_execute(db, space_id, user_id)
         assistant_message = record_assistant_message(db, space_id, user_id, _reply_for_confirm_result(result))
+        _log_deterministic_route("proposal_confirm", user_message.id)
         return user_message, assistant_message
 
     if narrow_answer == "no":
         actions_service.reject(db, space_id, user_id)
         assistant_message = record_assistant_message(db, space_id, user_id, _REJECTED_MESSAGE)
+        _log_deterministic_route("proposal_reject", user_message.id)
         return user_message, assistant_message
 
     context = context_module.gather_context(db, space_id, tomorrow_start, window_end)
