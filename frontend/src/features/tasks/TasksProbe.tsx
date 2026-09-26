@@ -12,6 +12,27 @@ import { useDeleteTask } from "./useDeleteTask";
 import { useTasks } from "./useTasks";
 import { useUpdateTask } from "./useUpdateTask";
 
+// Checkpoint 3.12a: converts a timezone-aware API instant (e.g.
+// "2026-09-26T07:00:00Z") into the local wall-clock digits a
+// <input type="datetime-local"> element expects ("YYYY-MM-DDTHH:mm").
+// Uses the LOCAL getters (getFullYear/getMonth/getDate/getHours/
+// getMinutes), never the UTC ones and never a raw string slice —
+// exactly the browser's own IANA timezone database resolves the
+// conversion, DST included, the same discipline localDayBoundaries.ts
+// already uses elsewhere. isoString.slice(0, 16) looked plausible but
+// is wrong: toISOString()/the API's own ISO string are always UTC, so
+// slicing it merely relabels the UTC digits as if they were local.
+export function toLocalDateTimeInputValue(isoString: string): string {
+  const date = new Date(isoString);
+  const pad = (value: number) => String(value).padStart(2, "0");
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+}
+
 // Minimum probe UI proving real CRUD against the real API — not a designed
 // Tasks screen. Final composition waits for a written screen spec. due_at
 // is editable here (not just at creation) because Calendar's agenda
@@ -119,7 +140,7 @@ export function TasksProbe() {
                   <input
                     type="datetime-local"
                     aria-label={`Due date for "${task.title}"`}
-                    defaultValue={task.due_at ? task.due_at.slice(0, 16) : ""}
+                    defaultValue={task.due_at ? toLocalDateTimeInputValue(task.due_at) : ""}
                     onBlur={(event) =>
                       updateTask.mutate({
                         id: task.id,
