@@ -526,3 +526,107 @@ def test_update_task_done_to_open_clears_completed_at_preserving_existing_behavi
     assert result.outcome == "executed"
     assert result.task.status == "open"
     assert result.task.completed_at is None
+
+
+# ---- Checkpoint 3.13: delete_task ---------------------------------------------------
+
+
+def test_validate_arguments_delete_task_requires_task_id(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("delete_task", {})
+
+
+def test_confirm_and_execute_dispatches_delete_task_archives_exactly_that_task(
+    db_session: Session, owner
+) -> None:
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="Archive me - actions313a"))
+    other_task = tasks_service.create_task(db_session, space.id, TaskCreate(title="Leave me alone - actions313a"))
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_task", {"task_id": task.id},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.task_action == "deleted"
+    assert result.task.id == task.id
+    assert result.task.title == "Archive me - actions313a"
+
+    assert tasks_service.get_task(db_session, space.id, task.id) is None  # archived -> filtered out
+
+    db_session.refresh(other_task)
+    assert other_task.archived_at is None  # exactly the intended task, nothing else
+
+
+def test_confirm_and_execute_delete_task_nonexistent_task_rolls_back_to_pending(
+    db_session: Session, owner
+) -> None:
+    """Covers execution-time race A/D from the 3.13 design report: the
+    task was archived, removed, or never existed by the time
+    confirmation runs — the proposal reverts to genuinely 'pending'
+    (no terminal 'failed' state), exactly like every other action type's
+    own execution-failure handling."""
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_task", {"task_id": 999999},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"  # reverted, safely re-confirmable
+
+
+def test_confirm_and_execute_delete_task_already_archived_between_proposal_and_confirmation_rolls_back(
+    db_session: Session, owner
+) -> None:
+    """Race A from the 3.13 design report: the task is archived (e.g. by
+    a direct REST delete) after the ProposedAction was created but
+    before it's confirmed. Execution must fail safely, not archive an
+    already-archived row a second time or silently report success."""
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="Raced away - actions313b"))
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_task", {"task_id": task.id},
+    )
+
+    tasks_service.delete_task(db_session, space.id, task.id)  # the race: archived out from under the proposal
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"
+
+
+def test_reject_delete_task_proposal_leaves_task_active(db_session: Session, owner) -> None:
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="Rejected removal - actions313c"))
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_task", {"task_id": task.id},
+    )
+
+    rejected = actions_service.reject(db_session, space.id, user.id)
+    assert rejected is True
+
+    db_session.refresh(task)
+    assert task.archived_at is None
+    assert tasks_service.get_task(db_session, space.id, task.id) is not None

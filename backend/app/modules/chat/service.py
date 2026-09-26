@@ -103,6 +103,27 @@ _PROPOSE_UPDATE_TASK_TOOL = {
     },
 }
 
+_PROPOSE_DELETE_TASK_TOOL = {
+    "name": "propose_delete_task",
+    "description": (
+        "Propose removing an existing task from the user's tasks. This does NOT "
+        "remove it — it only records a proposal that the user must explicitly "
+        "confirm before anything is actually removed. Only use a task_id that "
+        "actually appears in Current Data below (shown as task_id=N next to each "
+        "task) — never guess one."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "integer",
+                "description": "The task_id of the existing task to remove, exactly as shown in Current Data.",
+            },
+        },
+        "required": ["task_id"],
+    },
+}
+
 _PROPOSE_SAVE_MEMORY_TOOL = {
     "name": "propose_save_memory",
     "description": (
@@ -197,8 +218,8 @@ _GET_WEATHER_TOOL = {
 }
 
 _TOOLS_OFFERED = [
-    _PROPOSE_CREATE_TASK_TOOL, _PROPOSE_UPDATE_TASK_TOOL, _PROPOSE_SAVE_MEMORY_TOOL,
-    _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
+    _PROPOSE_CREATE_TASK_TOOL, _PROPOSE_UPDATE_TASK_TOOL, _PROPOSE_DELETE_TASK_TOOL,
+    _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
 ]
 
 # Used by _describe_pending_proposal to tell the model which tool to call
@@ -206,6 +227,7 @@ _TOOLS_OFFERED = [
 _ACTION_TYPE_TOOL_NAMES = {
     "create_task": "propose_create_task",
     "update_task": "propose_update_task",
+    "delete_task": "propose_delete_task",
     "save_memory": "propose_save_memory",
     "forget_memory": "propose_forget_memory",
 }
@@ -573,6 +595,26 @@ def _render_update_task_confirmation(task_title: str, changes: dict, timezone_na
     return f'I\'ll {joined} — "{task_title}". Shall I go ahead?'
 
 
+def _render_delete_task_confirmation(task_title: str, user_message: str) -> str:
+    """Checkpoint 3.13 — same discipline as _render_update_task_confirmation:
+    built ONLY from the task's own CURRENT title (re-fetched from the
+    database via _require_existing_task, never restated by the model).
+
+    Deliberately consequence-aware (Option B from the 3.13 design
+    report, approved as product decision 4): BAZRA has no restore/
+    unarchive surface anywhere in the app today (verified directly
+    across backend, REST, frontend, and Chat before this checkpoint), so
+    saying nothing about recoverability — or saying something that
+    implies it exists — would be misleading. "Remove" is used
+    throughout, never "delete" (overstates permanence the DB doesn't
+    have) or "archive"/"restorable" (implies a recovery surface that
+    doesn't exist) — see this checkpoint's design report, Parts E/F.
+    """
+    if _is_arabic(user_message):
+        return f'هشيل "{task_title}" من مهامك — مفيش طريقة أرجعها دلوقتي في بذرة. أنفذ؟'
+    return f'I can remove "{task_title}" from your tasks — there\'s no way to bring it back in BAZRA right now. Shall I go ahead?'
+
+
 def _render_save_memory_confirmation(arguments: dict, user_message: str) -> str:
     """Same discipline as _render_create_task_confirmation: built ONLY
     from the validated arguments that will be stored/executed, never
@@ -719,6 +761,8 @@ def _reply_for_confirm_result(result: ConfirmResult) -> str:
         if result.task is not None:
             if result.task_action == "updated":
                 return f'Done — I\'ve updated the task "{result.task.title}".'
+            if result.task_action == "deleted":
+                return f'Done — I\'ve removed the task "{result.task.title}".'
             return f'Done — I\'ve created the task "{result.task.title}".'
         if result.memory is not None:
             if result.memory.status == "forgotten":
@@ -808,6 +852,26 @@ def _handle_update_task_proposal(
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
     actions_service.create_pending_action(
         db, space_id, user_id, assistant_message.id, "update_task", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
+def _handle_delete_task_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("delete_task", arguments)
+        task = _require_existing_task(db, space_id, "delete_task", validated["task_id"])
+    except actions_service.InvalidActionArgumentsError:
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    reply_text = _render_delete_task_confirmation(task.title, user_message_content)
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "delete_task", validated, commit=False,
     )
     db.commit()
     db.refresh(assistant_message)
@@ -928,6 +992,7 @@ def _handle_get_weather(
 _TOOL_HANDLERS = {
     "propose_create_task": _handle_create_task_proposal,
     "propose_update_task": _handle_update_task_proposal,
+    "propose_delete_task": _handle_delete_task_proposal,
     "propose_save_memory": _handle_save_memory_proposal,
     "propose_forget_memory": _handle_forget_memory_proposal,
     "get_weather": _handle_get_weather,

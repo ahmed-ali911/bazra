@@ -475,6 +475,68 @@ remained exactly 1 model call to propose, 0 to confirm, unaffected.
   that. What it does guarantee is that whenever nothing is genuinely
   pending, the model is explicitly, deterministically told so.
 
+### Checkpoint 3.13
+
+Task write-capability breadth, completed: `propose_delete_task` —
+removes an existing task, referenced by the same `task_id` already
+exposed for `propose_update_task`. Reuses the exact existing pattern end
+to end: a minimal `ProposedTaskDelete` (`task_id: int` only — no title,
+no fuzzy reference) is one more entry in
+`actions_service._ACTION_ARGUMENT_SCHEMAS`, `confirm_and_execute`
+dispatches a new `delete_task` branch calling the *existing*, already-
+tested `tasks_service.delete_task` (soft delete via `archived_at` — the
+row is never physically removed), and the existing zero-LLM confirm/
+reject route (3.9) generalizes to it with no changes of its own. No
+migration.
+
+`write_intent.py`'s existing deterministic decline pattern for
+"delete/remove/cancel ... task" would have intercepted the exact
+phrasings `propose_delete_task` needs to reach the model for, before
+this checkpoint ever ran. Narrowed the same way task creation (3.3) and
+update (3.10) were narrowed — only "task"/"مهمة" dropped from the
+delete/remove/cancel noun list; Calendar/meeting/reminder/Life-Area
+deletion, in both English and Arabic, remain deterministically declined,
+unaffected.
+
+**Consequence-aware confirmation wording, deliberately not "delete" or
+"archive":** BAZRA has no restore/unarchive surface anywhere today —
+verified directly (no such function in `tasks_service`, no REST
+endpoint, no frontend UI, no Chat capability) before writing this
+checkpoint's confirmation text. Saying "delete" would overstate
+permanence the DB doesn't have (the row survives, `archived_at` is
+just set); saying "archive" or anything implying restorability would
+misstate the *absence* of any recovery path. The confirmation and
+success reply both say **"remove"** and state the current no-restore
+consequence explicitly (EN: *"there's no way to bring it back in BAZRA
+right now"*; AR: *"مفيش طريقة أرجعها دلوقتي في بذرة"*) — this is a
+product decision about what's currently true, not a permanent claim;
+if a restore path is ever added, this wording must be revisited.
+
+`InboxItem` rows referencing a since-removed task (e.g. its own
+"Completed: …" snapshot) are unaffected by design: `task_id` is a
+nullable FK with no cascade, and the title is a frozen snapshot never
+re-derived from the live Task — removing a task cannot break, hide, or
+alter an existing `InboxItem` in any way; no cascade behavior was added.
+
+A real Postgres two-thread concurrency test proves the row-locked
+replay guard generalizes to `delete_task` exactly as it already did for
+`update_task` in 3.10 — exactly one confirmation attempt archives the
+task, the other observes nothing left pending, and a follow-up
+confirmation attempt against the same (now-executed) proposal cannot
+re-execute it.
+
+Live-verified: a real chat-created task, removed via a real
+`propose_delete_task` proposal and a bare "yes" — exactly 1 `AiTrace`
+row for the propose call, zero for the confirm call, the task archived
+and absent from the normal task-list read immediately afterward. A
+read-only control request was verified not to spuriously trigger the
+new tool.
+
+- Deferred (no current consumer or no demonstrated need): `restore_task`
+  /an unarchive endpoint, a Trash view, an undo framework, bulk
+  deletion, physical row deletion, Calendar/Inbox/Life-Area deletion —
+  the same deferral reasoning as 3.10's own list, one domain later.
+
 ## Run locally (without Docker)
 
 ```bash

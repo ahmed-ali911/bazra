@@ -10,7 +10,7 @@ from app.modules.actions.schemas import ConfirmResult
 from app.modules.memory import service as memory_service
 from app.modules.memory.schemas import MemoryCreate, MemoryForget, MemoryResponse
 from app.modules.tasks import service as tasks_service
-from app.modules.tasks.schemas import ProposedTaskUpdate, TaskCreate, TaskResponse, TaskUpdate
+from app.modules.tasks.schemas import ProposedTaskDelete, ProposedTaskUpdate, TaskCreate, TaskResponse, TaskUpdate
 
 _DEFAULT_TTL_MINUTES = 10
 
@@ -22,6 +22,7 @@ _ACTION_ARGUMENT_SCHEMAS: dict[str, type[PydanticBaseModel]] = {
     "save_memory": MemoryCreate,
     "forget_memory": MemoryForget,
     "update_task": ProposedTaskUpdate,
+    "delete_task": ProposedTaskDelete,
 }
 
 
@@ -244,6 +245,26 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             proposal.executed_task_id = task.id
             db.commit()
             return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="updated")
+
+        if proposal.action_type == "delete_task":
+            # Fetched BEFORE delete_task runs, deliberately: delete_task
+            # sets archived_at and its own internal get_task lookup
+            # filters archived_at IS NULL, so a task_id fetched AFTER
+            # deletion would no longer resolve. This fetch doubles as
+            # the execution-time revalidation — task
+            # archived/removed/reassigned to another space between
+            # proposal and confirmation all collapse into the same
+            # "no longer exists" None here, exactly like update_task's
+            # own None check above.
+            delete_data = ProposedTaskDelete(**proposal.arguments)
+            task = tasks_service.get_task(db, space_id, delete_data.task_id)
+            if task is None:
+                raise RuntimeError(f"task_id {delete_data.task_id} no longer exists")
+            tasks_service.delete_task(db, space_id, delete_data.task_id)
+            proposal.status = "executed"
+            proposal.executed_task_id = task.id
+            db.commit()
+            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="deleted")
 
         if proposal.action_type == "save_memory":
             memory_data = MemoryCreate(**proposal.arguments)

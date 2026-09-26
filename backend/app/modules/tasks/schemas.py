@@ -54,6 +54,18 @@ class ProposedTaskUpdate(TaskUpdate):
         return self
 
 
+class ProposedTaskDelete(BaseModel):
+    """Checkpoint 3.13 — the model-facing argument shape for
+    propose_delete_task: a stable, explicit task_id only. Deliberately
+    minimal — no title, no fuzzy reference, no additional delete
+    metadata; task_id is the ONLY thing this proposal ever needs, and
+    the only thing tasks_service.delete_task itself takes beyond
+    space_id.
+    """
+
+    task_id: int
+
+
 class TaskResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

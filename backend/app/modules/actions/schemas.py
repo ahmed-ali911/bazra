@@ -6,10 +6,13 @@ from app.modules.tasks.schemas import TaskResponse
 
 # Closed, code-level sets — plain strings at rest (matching Task.status/
 # AiTrace.purpose's own convention), not native DB enums. Extended in
-# Checkpoint 3.4 (save_memory, forget_memory) and Checkpoint 3.10
-# (update_task) rather than accepting an arbitrary string.
-ActionType = Literal["create_task", "save_memory", "forget_memory", "update_task"]
-VALID_ACTION_TYPES: frozenset[str] = frozenset({"create_task", "save_memory", "forget_memory", "update_task"})
+# Checkpoint 3.4 (save_memory, forget_memory), Checkpoint 3.10
+# (update_task), and Checkpoint 3.13 (delete_task) rather than accepting
+# an arbitrary string.
+ActionType = Literal["create_task", "save_memory", "forget_memory", "update_task", "delete_task"]
+VALID_ACTION_TYPES: frozenset[str] = frozenset(
+    {"create_task", "save_memory", "forget_memory", "update_task", "delete_task"}
+)
 
 # Deliberately no "failed" — see actions/service.py's
 # confirm_and_execute docstring for why an execution failure rolls back
@@ -29,16 +32,17 @@ class ConfirmResult:
     memory's own status is what distinguishes the two, rather than
     adding a redundant action_type field here.
 
-    task_action (Checkpoint 3.10) exists because Task has no equivalent
-    natural per-object signal: an updated task's own state doesn't
-    distinguish "just created" from "just updated" the way a memory's
-    status already does. Set only alongside task, only when
-    outcome=="executed"; left None (its default) for every action_type
-    that predates 3.10, so create_task's own existing "I've created..."
-    reply is unaffected by construction, not by a special case.
+    task_action (Checkpoint 3.10, extended 3.13) exists because Task has
+    no equivalent natural per-object signal: an updated (or removed)
+    task's own state doesn't distinguish "just created" from "just
+    updated" from "just removed" the way a memory's status already
+    does. Set only alongside task, only when outcome=="executed"; left
+    None (its default) for every action_type that predates 3.10, so
+    create_task's own existing "I've created..." reply is unaffected by
+    construction, not by a special case.
     """
 
     outcome: Literal["executed", "rejected", "nothing_pending", "execution_failed"]
     task: TaskResponse | None = None
     memory: MemoryResponse | None = None
-    task_action: Literal["created", "updated"] | None = None
+    task_action: Literal["created", "updated", "deleted"] | None = None

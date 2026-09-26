@@ -2233,3 +2233,390 @@ def test_no_active_proposal_branch_adds_no_extra_ai_trace(
     after = _max_ai_trace_id(db_session)
 
     assert after - before == 1
+
+
+# ---- Checkpoint 3.13: propose / confirm a removal of an EXISTING task -----------
+
+
+def test_propose_delete_task_requires_explicit_task_id(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same shape-validation discipline as propose_update_task's own
+    missing-task_id test: task_id is required by the tool's own schema,
+    and a call without it never reaches the point of creating a
+    ProposedAction row."""
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure, removing it", tool_name="propose_delete_task", arguments={}),
+    )
+    response = _send(authenticated_client, "remove that task, no id given")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_then_confirm_removes_the_real_task(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The main end-to-end flow: a valid task_id produces exactly one
+    pending delete_task ProposedAction and exactly one model call; the
+    task remains fully active until confirmation; a bare 'yes' costs
+    zero model calls and archives exactly that task, which then
+    disappears from the normal task-list read."""
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Remove me - 313a")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply(
+            "I can remove it — confirm?", tool_name="propose_delete_task",
+            arguments={"task_id": task["id"]},
+        )(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    propose_response = _send(authenticated_client, "remove the 'Remove me - 313a' task")
+    assert propose_response.status_code == 200
+    assert call_count["n"] == 1
+    assert "Remove me - 313a" in propose_response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.action_type == "delete_task"
+
+    tasks_before_confirm = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["id"] == task["id"] for t in tasks_before_confirm)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    assert "removed" in confirm_response.json()["assistant_message"]["content"].lower()
+    assert "Remove me - 313a" in confirm_response.json()["assistant_message"]["content"]
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["id"] == task["id"] for t in tasks_after)
+
+    direct_get = authenticated_client.get(f"/api/v1/tasks/{task['id']}")
+    assert direct_get.status_code == 404
+
+
+def test_propose_delete_task_reject_leaves_task_active(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _create_real_task(authenticated_client, "Do not remove me - 313b")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I can remove it — confirm?", tool_name="propose_delete_task",
+            arguments={"task_id": task["id"]},
+        ),
+    )
+    _send(authenticated_client, "remove that task")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    reject_response = _send(authenticated_client, "no")
+    assert reject_response.status_code == 200
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    after = next(t for t in tasks_after if t["id"] == task["id"])
+    assert after["title"] == "Do not remove me - 313b"
+
+
+def test_propose_delete_task_with_nonexistent_task_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure, removing it", tool_name="propose_delete_task",
+            arguments={"task_id": 999999},
+        ),
+    )
+    response = _send(authenticated_client, "remove task 999999")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_delete_task_with_other_space_task_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real task_id that genuinely exists, but in a DIFFERENT space —
+    the same space-scoped get_task lookup that makes a nonexistent id
+    safe must also make a real-but-foreign id indistinguishable from
+    nonexistent, never a leak."""
+    from app.modules.actions import service as actions_service
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces.models import Space
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    owner = auth_service.get_the_user(db_session)
+    other_space = Space(name="Other Space - 313c", is_default=False, user_id=owner.id)
+    db_session.add(other_space)
+    db_session.commit()
+    db_session.refresh(other_space)
+    foreign_task = tasks_service.create_task(db_session, other_space.id, TaskCreate(title="Foreign task - 313c"))
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure, removing it", tool_name="propose_delete_task",
+            arguments={"task_id": foreign_task.id},
+        ),
+    )
+    response = _send(authenticated_client, "remove that other task")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    # The foreign task itself must remain completely untouched.
+    still_there = tasks_service.get_task(db_session, other_space.id, foreign_task.id)
+    assert still_there is not None
+    assert still_there.archived_at is None
+
+
+def test_propose_delete_task_on_already_archived_task_creates_no_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers both 'already-archived task cannot create a valid
+    proposal' and 'archived task cannot subsequently be proposed for
+    deletion again' — the same _require_existing_task/get_task lookup
+    that filters archived_at IS NULL for every other proposal type
+    applies identically here."""
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Remove me twice - 313d")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, "remove that task")
+    _send(authenticated_client, "yes")  # now archived
+
+    tasks_after_first_delete = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["id"] == task["id"] for t in tasks_after_first_delete)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    response = _send(authenticated_client, "remove that task again")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_archived_task_cannot_subsequently_be_updated(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Removed then targeted - 313e")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, "remove that task")
+    _send(authenticated_client, "yes")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure, marking it done", tool_name="propose_update_task",
+            arguments={"task_id": task["id"], "status": "done"},
+        ),
+    )
+    response = _send(authenticated_client, "mark that removed task as done")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_delete_task_confirmation_names_task_and_states_no_restore_consequence(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Product decisions 4/5: the confirmation must name the real task,
+    state the no-restore consequence explicitly, use 'remove' language,
+    and never say anything implying permanence-as-erasure or
+    restorability that doesn't exist."""
+    task = _create_real_task(authenticated_client, "Consequence check - 313f")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure!", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    response = _send(authenticated_client, "remove the 'Consequence check - 313f' task")
+    content = response.json()["assistant_message"]["content"]
+
+    assert "Consequence check - 313f" in content
+    assert "remove" in content.lower()
+    assert "no way to bring it back" in content.lower() or "there's no way to bring it back" in content.lower()
+    assert "permanently deleted" not in content.lower()
+    assert "restorable" not in content.lower()
+    assert "restore" not in content.lower()  # says "no way to bring it back", never the word "restore" itself
+
+
+def test_delete_task_confirmation_language_matches_arabic_or_english_of_the_triggering_message(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_en = _create_real_task(authenticated_client, "Bilingual delete test EN - 313g")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("ok", tool_name="propose_delete_task", arguments={"task_id": task_en["id"]}),
+    )
+    response_en = _send(authenticated_client, "remove it please")
+    content_en = response_en.json()["assistant_message"]["content"]
+    assert "Bilingual delete test EN - 313g" in content_en
+    assert "Shall I go ahead?" in content_en
+
+    task_ar = _create_real_task(authenticated_client, "اختبار حذف ثنائي اللغة - 313h")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("تمام", tool_name="propose_delete_task", arguments={"task_id": task_ar["id"]}),
+    )
+    response_ar = _send(authenticated_client, "شيلها لو سمحت")
+    content_ar = response_ar.json()["assistant_message"]["content"]
+    assert "اختبار حذف ثنائي اللغة - 313h" in content_ar
+    assert "أنفذ؟" in content_ar
+    assert "مفيش طريقة أرجعها" in content_ar
+
+
+def test_model_prose_with_wrong_details_does_not_appear_in_delete_task_confirmation(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _create_real_task(authenticated_client, "Real task title - 313i")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I've removed a totally different task for you!", tool_name="propose_delete_task",
+            arguments={"task_id": task["id"]},
+        ),
+    )
+    response = _send(authenticated_client, "remove it")
+    content = response.json()["assistant_message"]["content"]
+    assert "totally different" not in content
+    assert "Real task title - 313i" in content
+
+
+def test_completed_task_can_be_removed_and_existing_inbox_item_remains_valid(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed task already has a 'Completed: <title>' InboxItem
+    (created by tasks_service.update_task's own open->done side effect).
+    Removing that task afterward must not delete, hide, or otherwise
+    alter that InboxItem — no cascade behavior of any kind, per the
+    3.13 design report's InboxItem/FK finding."""
+    from app.modules.inbox import service as inbox_service
+
+    task = _create_real_task(authenticated_client, "Complete then remove - 313j")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_update_task", arguments={"task_id": task["id"], "status": "done"}),
+    )
+    _send(authenticated_client, "mark it done")
+    _send(authenticated_client, "yes")
+
+    user, space = _get_space_and_user(db_session)
+    inbox_before = [i for i in inbox_service.list_items(db_session, space.id) if i.task_id == task["id"]]
+    assert len(inbox_before) == 1
+    assert inbox_before[0].title == "Completed: Complete then remove - 313j"
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, "remove that task")
+    _send(authenticated_client, "yes")
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["id"] == task["id"] for t in tasks_after)
+
+    inbox_after = [i for i in inbox_service.list_items(db_session, space.id) if i.task_id == task["id"]]
+    assert len(inbox_after) == 1
+    assert inbox_after[0].id == inbox_before[0].id
+    assert inbox_after[0].title == "Completed: Complete then remove - 313j"
+    assert inbox_after[0].archived_at is None
+
+
+def test_delete_task_model_prose_without_tool_call_removes_nothing(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.13's own version of the file's general adversarial
+    proof: a model that merely TALKS about removing a task, with no
+    propose_delete_task tool call attached, must leave the real task
+    completely untouched — no ProposedAction, no archived_at, ever, from
+    text alone."""
+    task = _create_real_task(authenticated_client, "Never actually removed - 313k")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Sure, I've removed that task for you."),
+    )
+    response = _send(authenticated_client, "remove the 'Never actually removed - 313k' task")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "Sure, I've removed that task for you."
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["id"] == task["id"] for t in tasks_after)
+
+
+def test_delete_task_proposal_and_confirm_use_zero_extra_ai_traces_and_log_deterministic_routes(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mirrors the 3.9 deterministic-route regression guards for
+    create_task, applied to delete_task: the proposal turn is one real
+    model call (one new AiTrace); the bare 'yes' that follows is zero
+    model calls, zero new AiTrace rows, and logs the same
+    proposal_confirm route as every other action type."""
+    task = _create_real_task(authenticated_client, "Deterministic route test - 313l")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, "remove that task, deterministic route test 313l")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("should never be called")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+
+    before_trace_id = _max_ai_trace_id(db_session)
+    _enable_chat_service_logger()
+    with caplog.at_level(logging.INFO, logger="app.modules.chat.service"):
+        response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+
+    assert call_count["n"] == 0
+    assert _max_ai_trace_id(db_session) == before_trace_id
+
+    user_message_id = response.json()["user_message"]["id"]
+    assert "deterministic_route=proposal_confirm" in caplog.text
+    assert f"chat_message_id={user_message_id}" in caplog.text
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["id"] == task["id"] for t in tasks)

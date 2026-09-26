@@ -139,26 +139,44 @@ def test_system_prompt_requires_the_tool_call_for_supported_task_writes() -> Non
     the tool for a supported create/update request — a reliability fix
     for the observed failure mode where the model sometimes replies with
     proposal-like text without ever calling propose_create_task/
-    propose_update_task."""
+    propose_update_task. Checkpoint 3.13 extends the same MUST-call
+    requirement to propose_delete_task."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
     assert "you MUST call the propose_create_task tool" in prompt
     assert "you MUST call the propose_update_task tool" in prompt
+    assert "you MUST call the propose_delete_task tool" in prompt
 
 
 def test_system_prompt_states_plain_text_is_not_a_substitute_for_the_tool_call() -> None:
     """Checkpoint 3.12b: plain-text promises/offers/descriptions must be
-    explicitly ruled out as satisfying the requirement above."""
+    explicitly ruled out as satisfying the requirement above.
+    Checkpoint 3.13: same for a plain-text promise/description of
+    removing a task."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
     assert "is NOT a substitute for actually calling it" in prompt
     assert "is NOT a substitute for calling it" in prompt
+    assert "a plain-text promise or description of removing it is NOT a substitute" in prompt
+
+
+def test_system_prompt_describes_propose_delete_task_as_a_proposal_not_an_execution() -> None:
+    """Checkpoint 3.13: the model must be told the tool call itself only
+    proposes removal (still requires explicit confirmation), and must
+    reference the task's own task_id exactly like propose_update_task
+    does — no title, no fuzzy reference."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "propose_delete_task" in prompt
+    assert "This does NOT remove it — it only proposes it" in prompt
+    assert "the task's own task_id shown in Current Data below" in prompt
 
 
 def test_system_prompt_excludes_read_only_and_hypothetical_requests_from_the_tool_requirement() -> None:
     """Checkpoint 3.12b: the MUST-call requirement only applies when the
-    user is actually asking for that creation/change right now — not for
-    a read-only question, hypothetical discussion, or explanation."""
+    user is actually asking for that creation/change/removal right now —
+    not for a read-only question, hypothetical discussion, or
+    explanation. Checkpoint 3.13 extends the same exclusion sentence to
+    cover propose_delete_task alongside the original two tools."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
-    assert "actually asking for that specific creation or change right now" in prompt
+    assert "actually asking for that specific creation, change, or removal right now" in prompt
     assert "never" in prompt
     assert "read-only question, hypothetical discussion, an explanation" in prompt
 
@@ -178,10 +196,20 @@ def test_system_prompt_no_longer_claims_tasks_cannot_be_edited_or_marked_complet
     """Checkpoint 3.10 narrows the old blanket 'no ability to edit,
     delete, mark complete... in this conversation' claim — that remains
     true for Calendar/Inbox/Life Areas, but is no longer true for an
-    existing Task's own fields."""
+    existing Task's own fields. Checkpoint 3.13 narrows it further:
+    Task deletion is no longer claimed to be unsupported either."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
-    assert "you still cannot delete a task" in prompt
     assert "propose_update_task" in prompt
+    assert "propose_delete_task" in prompt
+    assert "you still cannot delete a task" not in prompt
+
+
+def test_system_prompt_still_declines_calendar_inbox_life_area_writes() -> None:
+    """The blanket 'not available yet' decline remains true for
+    Calendar/Inbox/Life Areas — only Task's own write capabilities
+    (create/update/delete) have ever been carved out of it."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "for Calendar, Inbox, or Life Areas, say plainly that this isn't available yet" in prompt
 
 
 def test_system_prompt_includes_current_datetime_anchor() -> None:

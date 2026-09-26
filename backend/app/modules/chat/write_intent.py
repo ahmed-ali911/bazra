@@ -20,15 +20,21 @@ import re
 # "task" and "due date" were dropped from the edit/update noun list, and
 # the standalone mark-done pattern was removed entirely (nothing else in
 # this app has a "done" concept to mark), so that phrasing now reaches
-# the Orchestrator, which may offer propose_update_task. Task DELETION
-# remains unimplemented and still declines here, deliberately — a
-# different risk profile (irreversible) than an editable field, and
-# explicitly out of this checkpoint's scope. Calendar/Inbox/Life-Area
-# edits and deletes are also unaffected and still decline here, since
-# only Task writes are implemented so far.
+# the Orchestrator, which may offer propose_update_task. Calendar/Inbox/
+# Life-Area edits and deletes are unaffected and still decline here,
+# since only Task writes are implemented so far.
+#
+# Checkpoint 3.13: task DELETION similarly narrowed — "task" (and its
+# Arabic equivalent "مهمة") dropped from the delete/remove/cancel noun
+# list, the same precedent as the two narrowings above, so that phrasing
+# now reaches the Orchestrator, which may offer propose_delete_task.
+# Event/meeting/reminder/life-area deletion are deliberately left in
+# this list and still decline exactly as before — this checkpoint only
+# narrows what already-implemented capability (Task) is exempted, it
+# does not touch the unimplemented ones.
 _WRITE_INTENT_PATTERNS_EN = [
     re.compile(r"\b(create|add|schedule|make)\b.{0,40}\b(event|meeting|reminder)\b", re.IGNORECASE),
-    re.compile(r"\b(delete|remove|cancel)\b.{0,40}\b(task|event|meeting|reminder|life area)\b", re.IGNORECASE),
+    re.compile(r"\b(delete|remove|cancel)\b.{0,40}\b(event|meeting|reminder|life area)\b", re.IGNORECASE),
     re.compile(r"\b(update|edit|change|reschedule|rename|move)\b.{0,40}\b(life area)\b", re.IGNORECASE),
 ]
 
@@ -40,7 +46,7 @@ _WRITE_INTENT_PATTERNS_EN = [
 # Flagged for native-speaker review before this ships to real usage.
 _WRITE_INTENT_PATTERNS_AR = [
     re.compile(r"(ضيف|أضف|اضافة|سجل)\s+.{0,20}(حدث|موعد|تذكير)"),
-    re.compile(r"(احذف|امسح|الغاء|إلغاء)\s+.{0,20}(مهمة|حدث|موعد|تذكير)"),
+    re.compile(r"(احذف|امسح|الغاء|إلغاء)\s+.{0,20}(حدث|موعد|تذكير)"),
     re.compile(r"(عدل|غير|غيّر)\s+.{0,20}(حدث|موعد)"),
 ]
 
