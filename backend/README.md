@@ -620,6 +620,75 @@ and no `ProposedAction`. Both real event-creation trials: exactly 1
 `AiTrace` on the propose turn, 0 on confirm, zero `CalendarEvent` rows
 before confirmation, exactly one afterward, at the correct UTC instant.
 
+### Checkpoint 3.17
+
+Closes a real, live-proven safety gap the 3.16 inspection surfaced: a
+bare "yes"/"no" only ever checked whether SOME `ProposedAction` was
+still `pending` and unexpired — never whether that proposal was still
+what the conversation was actually about. An unrelated question asked
+in between (e.g. "what's the weather tomorrow?") left the old proposal
+fully intact, and a later bare "yes" — even one meant for something
+else entirely — would deterministically execute it, 0 LLM calls, no
+chance for the model to catch the mismatch. Reproduced live for
+`create_event` and `delete_task` (the latter with no restore path,
+the most consequential case) before this fix; both close with it.
+
+**The adjacency guard** (`actions_service.is_still_conversationally_adjacent`)
+answers one question deterministically: has anything been said in this
+conversation since the pending proposal's own confirmation prompt? No
+new column — `ProposedAction.source_chat_message_id` already *is* the
+id of that exact confirmation `ChatMessage` (every `_handle_*_proposal`
+call site has passed the assistant's own message there since 3.3), so
+"adjacent" is just "no `ChatMessage` row exists strictly between that
+id and the current incoming one." A bare yes/no only dispatches
+deterministically when adjacent; otherwise the proposal stays
+`pending` — untouched, not expired/rejected/deleted — and the turn
+falls through to ordinary model reasoning instead.
+
+**A plain id-range query alone is provably unsafe under real
+concurrency**, verified with a forced two-thread Postgres experiment
+before writing any production code: Postgres allocates a sequence id
+at INSERT time, not at COMMIT time, so a concurrently-inserted row
+with a LOWER id can stay invisible to a reader for as long as its own
+transaction stays open — letting the reader wrongly conclude "nothing
+intervened." Closed with a transaction-scoped Postgres advisory lock
+(`pg_advisory_xact_lock`, keyed on `space_id:user_id`, auto-released at
+the next commit) held from the moment a message is appended through
+the adjacency decision — no migration, no new table, the standard
+primitive for serializing otherwise-unrelated transactions against one
+logical key. `record_user_message` gained the same `commit=False`
+escape hatch `record_assistant_message` already had, so this lock, the
+message insert, and (when adjacent) the deterministic confirm/reject
+all land in one atomic commit; a non-adjacent or ordinary turn commits
+right away, releasing the lock before the potentially slow Orchestrator
+call, which needs no lock at all. A real two-thread test forces the
+exact adversarial interleaving and proves the concurrent thread cannot
+even allocate an id for its row until the first thread's entire
+critical section has committed.
+
+Current Action State (3.11) now describes a pending proposal two ways
+from the SAME `pending` status — never a new status value: adjacent
+text is unchanged; non-adjacent text explicitly says the proposal is
+still stored, is NOT expired/rejected/removed, that the model must
+never claim it was acted on, and that calling the same `propose_*`
+tool again creates a fresh, confirmable proposal. This directly
+targets a real failure observed live during 3.17's own inspection: an
+explicit contextual return ("Yes, add that task.") once produced a
+model reply falsely claiming completion with no backing write. In this
+checkpoint's own live gate, the same phrasing after an interruption
+correctly produced a fresh `propose_create_task` call instead.
+
+Live-verified (real provider calls, 8 fixed scenarios, no mocking):
+immediate yes/no, create_task/create_event/delete_task each interrupted
+by an unrelated weather question then a bare "yes" (none executed),
+interrupted bare "no" (not incorrectly rejected), an explicit
+contextual return after interruption (correctly re-proposed rather than
+falsely claiming completion), and the full re-propose → confirm chain
+(exactly one task actually created). Two of the eight opening proposal
+turns hit the same pre-existing, stochastic text-only tool-call miss
+already documented since 3.12b — unrelated to this fix, honestly
+reported rather than retried.
+
 ## Run locally (without Docker)
 
 ```bash

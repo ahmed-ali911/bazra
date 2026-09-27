@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import ValidationError
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
@@ -406,11 +407,56 @@ def _log_deterministic_route(route: str, chat_message_id: int) -> None:
     logger.info("chat: deterministic_route=%s chat_message_id=%s", route, chat_message_id)
 
 
-def record_user_message(db: Session, space_id: int, user_id: int, content: str) -> ChatMessage:
+def _acquire_conversation_lock(db: Session, space_id: int, user_id: int) -> None:
+    """Checkpoint 3.17 — a transaction-scoped Postgres advisory lock
+    (pg_advisory_xact_lock), automatically released at this session's
+    NEXT commit or rollback, no manual unlock call needed or possible
+    to forget. No migration, no new table, no new column — this is the
+    standard Postgres primitive for serializing otherwise-unrelated
+    transactions against one logical key with zero schema footprint.
+
+    Why this exists: the 3.17 inspection's own forced-interleaving
+    experiment proved that a plain `ChatMessage.id BETWEEN` adjacency
+    query is UNSAFE under real concurrent access to the same (space_id,
+    user_id) — Postgres allocates a sequence-generated id at INSERT
+    time, not at COMMIT time, so a concurrently-inserted row with a
+    LOWER id can remain completely invisible to a reader for as long as
+    its own transaction stays open, letting that reader wrongly
+    conclude "nothing intervened" for a message that, once it lands,
+    would have counted as an intervening turn. Acquiring this lock
+    before appending ANY message for a given (space_id, user_id), and
+    holding it through the adjacency decision that follows, forces two
+    concurrent requests for the SAME conversation (two tabs, a
+    double-submit) to be fully serialized exactly where it matters: the
+    second can't even get an id until the first's entire critical
+    section — lock, insert, adjacency check, commit — has completed.
+
+    Acquired UNCONDITIONALLY for every message, not just ones that
+    might be answering a pending proposal — a message whose own routing
+    doesn't care about any proposal at all might still be the exact
+    "intervening turn" a CONCURRENT request's own adjacency check
+    depends on seeing correctly.
+    """
+    lock_key = f"{space_id}:{user_id}"
+    db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"), {"lock_key": lock_key})
+
+
+def record_user_message(
+    db: Session, space_id: int, user_id: int, content: str, commit: bool = True
+) -> ChatMessage:
+    """commit=False (Checkpoint 3.17) lets this message be flushed (its
+    id populated) without ending the transaction — needed so the
+    conversation advisory lock acquired just before this call (see
+    _acquire_conversation_lock) stays held through the adjacency
+    decision that follows, in the SAME transaction, rather than being
+    released the instant this one insert commits."""
     message = ChatMessage(space_id=space_id, user_id=user_id, role="user", content=content)
     db.add(message)
-    db.commit()
-    db.refresh(message)
+    if commit:
+        db.commit()
+        db.refresh(message)
+    else:
+        db.flush()
     return message
 
 
@@ -557,15 +603,33 @@ def _classify_narrow_yes_no(content: str) -> str | None:
     return None
 
 
-def _describe_pending_proposal(pending) -> str:
+def _describe_pending_proposal(pending, adjacent: bool) -> str:
+    """Checkpoint 3.17: `adjacent` (see is_still_conversationally_adjacent)
+    picks between two truthful descriptions of the SAME underlying
+    'pending' database status — never a new ProposedAction status, just
+    different model-facing text for the same stored fact. When
+    non-adjacent, the model must not claim the proposal was acted on
+    (nothing happened to it — it is not expired, rejected, or deleted)
+    and must be told the correct next step: propose it again, fresh.
+    """
     tool_name = _ACTION_TYPE_TOOL_NAMES.get(pending.action_type, pending.action_type)
+    if adjacent:
+        return (
+            f"A '{pending.action_type}' proposal is awaiting the user's yes/no "
+            f"confirmation (proposed just now, expires {pending.expires_at.isoformat()}). "
+            f"Proposed arguments: {pending.arguments}. If the user's message is a "
+            f"revision request rather than a plain yes/no, call {tool_name} "
+            f"again with the corrected arguments — this replaces the pending proposal "
+            f"above rather than creating an additional one."
+        )
     return (
-        f"A '{pending.action_type}' proposal is awaiting the user's yes/no "
-        f"confirmation (proposed just now, expires {pending.expires_at.isoformat()}). "
-        f"Proposed arguments: {pending.arguments}. If the user's message is a "
-        f"revision request rather than a plain yes/no, call {tool_name} "
-        f"again with the corrected arguments — this replaces the pending proposal "
-        f"above rather than creating an additional one."
+        f"A '{pending.action_type}' proposal (arguments: {pending.arguments}) is still "
+        f"stored, but other conversation has happened since it was proposed, so a bare "
+        f"\"yes\"/\"no\" can no longer confirm or reject it automatically — it is NOT "
+        f"expired, rejected, or removed; nothing has happened to it either way, and you "
+        f"must never claim it was created, changed, or removed. If the user now clearly "
+        f"wants to proceed with it, call {tool_name} again with the intended arguments — "
+        f"this creates a fresh proposal the user can then confirm normally."
     )
 
 
@@ -1230,9 +1294,16 @@ def send_message(
     2. A clear write-intent phrase (delete/edit/mark-done/etc, or a
        create-something-other-than-a-task) -> deterministic decline,
        exactly as before 3.3. Unaffected by any pending proposal.
-    3. A pending proposal exists AND the message is a narrow bare
-       yes/no -> deterministic confirm/reject, zero model calls,
-       regardless of the pending proposal's action_type.
+    3. A pending proposal exists, is still conversationally adjacent
+       (Checkpoint 3.17 — see is_still_conversationally_adjacent), AND
+       the message is a narrow bare yes/no -> deterministic
+       confirm/reject, zero model calls, regardless of the pending
+       proposal's action_type. A pending proposal that is NOT adjacent
+       (something else was said since its own confirmation prompt) is
+       never deterministically confirmed or rejected — it falls through
+       to step 4 like any other message, still fully intact and still
+       'pending' in the database, describable but not bare-yes/no-
+       actionable.
     4. Everything else -> the Orchestrator, with propose_create_task/
        propose_save_memory/propose_forget_memory all offered and any
        pending proposal (of whichever type) folded into context, plus
@@ -1240,6 +1311,17 @@ def send_message(
        creates/revises a pending proposal (atomically with the
        assistant message describing it); no tool call is an ordinary
        answer that leaves any pending proposal untouched.
+
+    Checkpoint 3.17: a transaction-scoped conversation advisory lock
+    (_acquire_conversation_lock) is held from just before the incoming
+    message is flushed through the adjacency decision above — released
+    by whichever commit happens first (the write-intent-decline path,
+    the deterministic confirm/reject path, or the explicit db.commit()
+    below when falling through) — so no concurrent request for the
+    SAME (space_id, user_id) can insert a message whose existence would
+    change that decision while it's being made. See the lock helper's
+    own docstring for why a plain id-range query alone was proven
+    unsafe.
     """
     if len(content) > _MAX_INCOMING_MESSAGE_CHARS:
         raise MessageTooLongError(_MAX_INCOMING_MESSAGE_CHARS)
@@ -1248,35 +1330,51 @@ def send_message(
     # never leave a lone user message with no reply.
     current_datetime_local = _compute_current_datetime_local(timezone_name)
 
-    user_message = record_user_message(db, space_id, user_id, content)
+    _acquire_conversation_lock(db, space_id, user_id)
+    user_message = record_user_message(db, space_id, user_id, content, commit=False)
 
     if detect_clear_write_intent(content):
         # Deterministic path — no model call, no cost, no ai_traces row,
-        # since nothing was attempted.
-        assistant_message = record_assistant_message(db, space_id, user_id, WRITE_UNAVAILABLE_MESSAGE)
+        # since nothing was attempted. Commits (and so releases the
+        # conversation lock) together with the user message above.
+        assistant_message = record_assistant_message(db, space_id, user_id, WRITE_UNAVAILABLE_MESSAGE, commit=False)
+        db.commit()
         _log_deterministic_route("write_intent_decline", user_message.id)
         return user_message, assistant_message
 
     pending = actions_service.get_latest_pending(db, space_id, user_id)
+    adjacent = (
+        actions_service.is_still_conversationally_adjacent(db, space_id, user_id, pending, user_message.id)
+        if pending is not None else False
+    )
     narrow_answer = _classify_narrow_yes_no(content) if pending is not None else None
 
-    if narrow_answer == "yes":
+    if narrow_answer == "yes" and adjacent:
         result = actions_service.confirm_and_execute(db, space_id, user_id)
         assistant_message = record_assistant_message(db, space_id, user_id, _reply_for_confirm_result(result))
         _log_deterministic_route("proposal_confirm", user_message.id)
         return user_message, assistant_message
 
-    if narrow_answer == "no":
+    if narrow_answer == "no" and adjacent:
         actions_service.reject(db, space_id, user_id)
         assistant_message = record_assistant_message(db, space_id, user_id, _REJECTED_MESSAGE)
         _log_deterministic_route("proposal_reject", user_message.id)
         return user_message, assistant_message
 
+    # Falling through: either an ordinary message, or a bare yes/no
+    # that no longer applies (nothing really pending, or a real pending
+    # proposal that is no longer conversationally adjacent). The
+    # adjacency conclusion above is already final — commit now (this
+    # also persists the user message and releases the conversation
+    # lock) before the potentially slow Orchestrator call below, which
+    # needs no lock at all.
+    db.commit()
+
     context = context_module.gather_context(db, space_id, tomorrow_start, window_end)
     memories, total_active_memories = memory_service.get_relevant_memories(db, space_id, user_id, limit=_MAX_MEMORIES)
     context = f"{context}\n\n{_format_memory_context(memories, total_active_memories)}"
     if pending is not None:
-        context = f"{context}\n\n## Pending proposal awaiting confirmation\n{_describe_pending_proposal(pending)}"
+        context = f"{context}\n\n## Pending proposal awaiting confirmation\n{_describe_pending_proposal(pending, adjacent)}"
     else:
         context = f"{context}\n\n## Current action state\n{_NO_ACTIVE_PROPOSAL_NOTE}"
     history_rows = list_recent_messages(db, space_id, user_id)

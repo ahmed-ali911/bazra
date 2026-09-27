@@ -312,3 +312,98 @@ def test_two_concurrent_create_event_confirmations_result_in_exactly_one_calenda
         assert second_attempt.outcome == "nothing_pending"  # no duplicate execution possible after the fact
     finally:
         verify_session.close()
+
+
+def test_conversation_lock_prevents_the_adjacency_race_under_forced_interleaving(db_session: Session) -> None:
+    """Checkpoint 3.17's own mandatory concurrency proof.
+
+    The inspection's own forced-interleaving experiment demonstrated
+    that a PLAIN ChatMessage id-range query is unsafe under real
+    concurrency: Postgres allocates a sequence id at INSERT time, not
+    at COMMIT time, so a concurrently-inserted, lower-id row can stay
+    completely invisible to a reader for as long as its own
+    transaction remains open — letting that reader wrongly conclude
+    "nothing intervened" for a message that, moments later, would
+    correctly count as an intervening turn.
+
+    This test forces the EXACT SAME adversarial interleaving through
+    the REAL, shipped `_acquire_conversation_lock` +
+    `is_still_conversationally_adjacent` combination (not a
+    reimplementation) and proves it closes the window: the concurrent
+    "interruption" thread cannot even get an id for its row until the
+    "current turn" thread's entire critical section — lock acquire,
+    insert, adjacency check, commit (which releases the lock) — has
+    fully finished.
+    """
+    import time
+
+    from app.modules.chat import service as chat_service
+
+    SessionLocal = sessionmaker(bind=db_session.get_bind())
+
+    user = auth_service.get_the_user(db_session)
+    if user is None:
+        user = User(password_hash=auth_service.hash_password("owner-fixture-password"))
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    space = spaces_service.get_or_create_default_space_for_user(db_session, user.id)
+    space_id, user_id = space.id, user.id
+
+    confirmation = chat_service.record_assistant_message(db_session, space_id, user_id, "confirm? - 317lock")
+    pending = actions_service.create_pending_action(
+        db_session, space_id, user_id, confirmation.id, "create_task", {"title": "Lock race test - 317lock"},
+    )
+
+    t1_result: dict = {}
+    t1_started_insert = threading.Event()
+    t1_finished = threading.Event()
+
+    def _t1_concurrent_interruption() -> None:
+        session: Session = SessionLocal()
+        try:
+            t1_started_insert.set()
+            chat_service._acquire_conversation_lock(session, space_id, user_id)  # blocks while T2 holds it
+            msg = chat_service.record_user_message(session, space_id, user_id, "interruption - 317lock", commit=False)
+            t1_result["id"] = msg.id
+            session.commit()
+        finally:
+            session.close()
+        t1_finished.set()
+
+    main_session: Session = SessionLocal()
+    chat_service._acquire_conversation_lock(main_session, space_id, user_id)
+
+    t1 = threading.Thread(target=_t1_concurrent_interruption)
+    t1.start()
+    t1_started_insert.wait(timeout=5)
+    time.sleep(0.3)  # give T1 every chance to race ahead if the lock did not actually serialize it
+    assert "id" not in t1_result, "T1 must be blocked on the conversation lock, not free to insert"
+
+    current_message = chat_service.record_user_message(
+        main_session, space_id, user_id, "yes - 317lock", commit=False
+    )
+    current_message_id = current_message.id
+    adjacent = actions_service.is_still_conversationally_adjacent(
+        main_session, space_id, user_id, pending, current_message_id
+    )
+    assert adjacent is True  # correct: while the lock is held, T1 genuinely has not inserted yet
+    main_session.commit()  # releases the conversation lock
+    main_session.close()
+
+    t1_finished.wait(timeout=5)
+    t1.join(timeout=5)
+    assert "id" in t1_result, "T1 should have proceeded once the lock was released"
+    assert t1_result["id"] > current_message_id  # only allocated its id AFTER T2's entire critical section
+
+    verify_session: Session = SessionLocal()
+    try:
+        later_message = chat_service.record_user_message(
+            verify_session, space_id, user_id, "yes again - 317lock"
+        )
+        adjacent_now = actions_service.is_still_conversationally_adjacent(
+            verify_session, space_id, user_id, pending, later_message.id
+        )
+        assert adjacent_now is False  # T1's real interruption is correctly seen as intervening now
+    finally:
+        verify_session.close()

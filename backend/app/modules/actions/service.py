@@ -9,6 +9,7 @@ from app.modules.actions.models import ProposedAction
 from app.modules.actions.schemas import ConfirmResult
 from app.modules.calendar import service as calendar_service
 from app.modules.calendar.schemas import CalendarEventResponse, ProposedCalendarEventCreate
+from app.modules.chat.models import ChatMessage
 from app.modules.life_areas import service as life_areas_service
 from app.modules.memory import service as memory_service
 from app.modules.memory.schemas import MemoryCreate, MemoryForget, MemoryResponse
@@ -151,6 +152,46 @@ def get_latest_pending(db: Session, space_id: int, user_id: int) -> ProposedActi
         )
         .order_by(ProposedAction.id.desc())
     ).scalars().first()
+
+
+def is_still_conversationally_adjacent(
+    db: Session, space_id: int, user_id: int, pending: ProposedAction, current_user_message_id: int,
+) -> bool:
+    """Checkpoint 3.17 — the deterministic eligibility guard for bare
+    yes/no dispatch: a pending proposal may only be confirmed/rejected
+    without a model call when NOTHING has been said in this
+    conversation since its own confirmation prompt.
+
+    Uses `pending.source_chat_message_id` exactly as it already is —
+    every _handle_*_proposal call site (create_task, update_task,
+    delete_task, create_event, save_memory, forget_memory) has always
+    passed the ASSISTANT's own confirmation-prompt ChatMessage id there,
+    never the user's triggering message. No new column: this linkage
+    already existed under this name.
+
+    Adjacent means: no ChatMessage row (of any role, on any topic)
+    exists strictly between that confirmation prompt and the CURRENT
+    incoming message. A plain range query answering this is safe here
+    ONLY because the caller (chat/service.py's send_message) holds this
+    (space_id, user_id)'s conversation advisory lock for the caller's
+    entire critical section — see _acquire_conversation_lock's own
+    docstring for the forced-interleaving experiment that proved this
+    same query UNSAFE without that lock: a concurrently-inserted, lower-
+    id row can stay invisible to a reader for as long as its own
+    transaction remains open, producing a false "adjacent" conclusion
+    for a message that, moments later, would correctly count as
+    intervening. This function does not (and structurally cannot)
+    acquire that lock itself — it trusts the caller already holds it.
+    """
+    intervening_count = db.execute(
+        select(func.count()).select_from(ChatMessage).where(
+            ChatMessage.space_id == space_id,
+            ChatMessage.user_id == user_id,
+            ChatMessage.id > pending.source_chat_message_id,
+            ChatMessage.id < current_user_message_id,
+        )
+    ).scalar_one()
+    return intervening_count == 0
 
 
 def reject(db: Session, space_id: int, user_id: int) -> bool:

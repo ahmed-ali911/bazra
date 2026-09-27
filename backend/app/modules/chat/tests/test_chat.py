@@ -73,6 +73,40 @@ def _get_space_and_user(db_session: Session):
     return user, space
 
 
+def _propose_interrupt_then_bare_answer(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+    propose_message: str, tool_name: str, arguments: dict, bare_answer: str,
+) -> dict:
+    """Checkpoint 3.17 shared shape: propose a real pending action, send
+    an unrelated interruption (answered as ordinary weather text, no
+    tool call), then send a bare yes/no. Returns the call-count for the
+    bare-answer turn (0 = deterministic dispatch, 1 = reached the model)
+    plus the final assistant reply, so callers only need to add their
+    own action-specific "was anything actually written?" check.
+    """
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name=tool_name, arguments=arguments),
+    )
+    _send(authenticated_client, propose_message)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Tomorrow in Cairo: sunny, 30°C."),
+    )
+    _send(authenticated_client, "What's the weather tomorrow in Cairo?")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("Just to confirm, what would you like me to do?")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    response = _send(authenticated_client, bare_answer)
+    return {"call_count": call_count["n"], "content": response.json()["assistant_message"]["content"]}
+
+
 # ---- persistence and model-failure behavior ------------------------------------
 
 
@@ -288,12 +322,28 @@ def test_revision_before_confirming_supersedes_the_earlier_proposal(
     assert not any(t["title"] == "Draft A" for t in tasks)
 
 
-def test_unrelated_message_after_a_proposal_leaves_it_pending_and_still_confirmable(
-    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+def test_unrelated_message_after_a_proposal_breaks_adjacency_and_bare_yes_no_longer_executes_it(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Checkpoint 3.17: this is the exact scenario the checkpoint exists
+    to fix — an unrelated conversational turn between a proposal's
+    confirmation prompt and a later bare 'yes' breaks conversational
+    adjacency (is_still_conversationally_adjacent). The proposal
+    remains stored/pending (never expired, rejected, or deleted by
+    this) but is no longer eligible for deterministic bare yes/no
+    dispatch — the bare 'yes' now reaches the model (1 LLM call)
+    instead of silently executing the old proposal. Superseded a
+    pre-3.17 test of the same name that asserted the OLD, now-fixed
+    unsafe behavior (a later bare 'yes' still deterministically
+    executed the stale proposal)."""
+    from app.modules.actions import service as actions_service
+
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        _mock_reply("Create a task to call Hussein about the invoice — confirm?", tool_name="propose_create_task", arguments={"title": "Call Hussein about the invoice"}),
+        _mock_reply(
+            "Create a task to call Hussein about the invoice — confirm?",
+            tool_name="propose_create_task", arguments={"title": "Call Hussein about the invoice"},
+        ),
     )
     _send(authenticated_client, "make a task to call Hussein about the invoice")
 
@@ -305,12 +355,30 @@ def test_unrelated_message_after_a_proposal_leaves_it_pending_and_still_confirma
     assert unrelated_response.json()["assistant_message"]["content"] == "Your task list currently has 3 open items."
 
     tasks_after_unrelated = authenticated_client.get("/api/v1/tasks").json()
-    assert not any(t["title"] == "Call Hussein about the invoice" for t in tasks_after_unrelated)  # still just pending
+    assert not any(t["title"] == "Call Hussein about the invoice" for t in tasks_after_unrelated)
 
-    confirm_response = _send(authenticated_client, "yes")
-    assert "Call Hussein about the invoice" in confirm_response.json()["assistant_message"]["content"]
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"  # still stored, not expired/rejected/deleted by the interruption
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("Just to confirm — are you saying yes to creating that task?")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    _send(authenticated_client, "yes")
+    assert call_count["n"] == 1  # reached the model — NOT deterministic execution
+
     tasks_final = authenticated_client.get("/api/v1/tasks").json()
-    assert any(t["title"] == "Call Hussein about the invoice" for t in tasks_final)
+    assert not any(t["title"] == "Call Hussein about the invoice" for t in tasks_final)  # not executed
+
+    pending_after = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending_after is not None
+    assert pending_after.id == pending.id
+    assert pending_after.status == "pending"  # unchanged — not rejected either
 
 
 def test_confirming_after_expiry_creates_no_task(
@@ -3063,3 +3131,317 @@ def test_expired_create_event_proposal_cannot_execute(
         "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
     ).json()
     assert not any(i["title"] == "Expired event - 315k" for i in agenda)
+
+
+# ---- Checkpoint 3.17: conversational adjacency guard against a stale pending proposal ----
+
+
+def test_update_task_interruption_then_yes_does_not_execute(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _create_real_task(authenticated_client, "Interruption target - 317a")
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="mark 'Interruption target - 317a' as done",
+        tool_name="propose_update_task", arguments={"task_id": task["id"], "status": "done"},
+        bare_answer="yes",
+    )
+    assert result["call_count"] == 1  # reached the model, not deterministic
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    after = next(t for t in tasks_after if t["id"] == task["id"])
+    assert after["status"] == "open"  # NOT updated
+
+
+def test_delete_task_interruption_then_yes_does_not_archive(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    task = _create_real_task(authenticated_client, "Interruption target - 317b")
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="remove the 'Interruption target - 317b' task",
+        tool_name="propose_delete_task", arguments={"task_id": task["id"]},
+        bare_answer="yes",
+    )
+    assert result["call_count"] == 1
+
+    tasks_after = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["id"] == task["id"] for t in tasks_after)  # NOT archived
+
+
+def test_create_event_interruption_then_yes_does_not_create_event(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="add a meeting with Hussein tomorrow at 11 for one hour",
+        tool_name="propose_create_event",
+        arguments={
+            "title": "Interruption event - 317c",
+            "starts_at": "2026-09-28T11:00:00+03:00",
+            "ends_at": "2026-09-28T12:00:00+03:00",
+        },
+        bare_answer="yes",
+    )
+    assert result["call_count"] == 1
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert not any(i["title"] == "Interruption event - 317c" for i in agenda)  # NOT created
+
+
+def test_save_memory_interruption_then_yes_does_not_save(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="remember that I prefer concise answers - 317d",
+        tool_name="propose_save_memory",
+        arguments={"type": "PREFERENCE", "content": "Prefers concise answers - 317d"},
+        bare_answer="yes",
+    )
+    assert result["call_count"] == 1
+
+    user, space = _get_space_and_user(db_session)
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    assert not any(m.content == "Prefers concise answers - 317d" for m in memories)  # NOT saved
+
+
+def test_forget_memory_interruption_then_yes_does_not_forget(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+    memory = memory_service.create_memory(
+        db_session, space.id, user.id, source_id, MemoryCreate(type="GOAL", content="Learn Rust - 317e")
+    )
+    db_session.commit()
+
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="forget that I wanted to learn Rust - 317e",
+        tool_name="propose_forget_memory", arguments={"memory_id": memory.id},
+        bare_answer="yes",
+    )
+    assert result["call_count"] == 1
+
+    memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
+    assert any(m.id == memory.id and m.status == "active" for m in memories)  # NOT forgotten
+
+
+def test_interruption_then_no_does_not_reject_old_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The symmetric rejection-side finding from the 3.17 inspection:
+    a bare 'no' is exactly as adjacency-blind as a bare 'yes' without
+    this guard — proves it is now guarded identically."""
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Do not touch me - 317f")
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="rename 'Do not touch me - 317f' to something else",
+        tool_name="propose_update_task", arguments={"task_id": task["id"], "title": "Renamed - 317f"},
+        bare_answer="no",
+    )
+    assert result["call_count"] == 1  # reached the model, not deterministically rejected
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"  # NOT rejected by the stale "no"
+
+
+def test_explicit_contextual_return_after_interruption_is_model_routed(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.17 Part F/G: an explicit contextual confirmation
+    ('Yes, add that task.') is never added to the narrow bare-phrase
+    set — it must reach the model exactly like any other non-adjacent
+    turn, never bypass it."""
+    from app.modules.actions import service as actions_service
+
+    task_title = "Contextual return target - 317g"
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_create_task", arguments={"title": task_title}),
+    )
+    _send(authenticated_client, f"add a task: {task_title}")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Tomorrow in Cairo: sunny, 30°C."),
+    )
+    _send(authenticated_client, "What's the weather tomorrow in Cairo?")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("Sure — I've added it.")(**kwargs)  # deliberately no tool call
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    response = _send(authenticated_client, "Yes, add that task.")
+    assert call_count["n"] == 1  # model-routed, not deterministic
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == task_title for t in tasks)  # the model's false claim caused no real write
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"  # original proposal untouched either way
+
+
+def test_explicit_contextual_return_can_re_propose_then_fresh_yes_executes(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.17 Part G: the CORRECT behavior for an explicit
+    contextual return — the model calls propose_create_task again,
+    superseding the stale proposal with a fresh, now-adjacent one; a
+    following immediate 'yes' then executes exactly once."""
+    task_title = "Re-proposed task - 317h"
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_create_task", arguments={"title": task_title}),
+    )
+    _send(authenticated_client, f"add a task: {task_title}")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Tomorrow in Cairo: sunny, 30°C."),
+    )
+    _send(authenticated_client, "What's the weather tomorrow in Cairo?")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Sure, re-confirming — add it?", tool_name="propose_create_task", arguments={"title": task_title}),
+    )
+    reprompt_response = _send(authenticated_client, "Yes, add that task.")
+    assert task_title in reprompt_response.json()["assistant_message"]["content"]
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == task_title for t in tasks)  # exactly the fresh proposal executed
+
+
+def test_adjacent_current_action_state_wording_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The adjacent-case description must remain byte-for-byte the same
+    pre-3.11-style text — 3.17 only adds a NEW branch, never changes
+    the existing one."""
+    pending = type(
+        "FakePending", (), {
+            "action_type": "create_task", "arguments": {"title": "X"},
+            "expires_at": type("T", (), {"isoformat": lambda self: "2030-01-01T00:00:00+00:00"})(),
+        },
+    )()
+    text = chat_service._describe_pending_proposal(pending, adjacent=True)
+    assert "is awaiting the user's yes/no confirmation" in text
+    assert "revision request" in text
+    assert "no longer eligible" not in text
+
+
+def test_non_adjacent_current_action_state_wording_is_truthful(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 3.17 Part H: must say the proposal still exists,
+    that it is NOT expired/rejected/removed, that the model must never
+    claim it was acted on, and that a fresh propose_* call is the
+    correct next step — never implying execution already happened."""
+    pending = type(
+        "FakePending", (), {"action_type": "create_task", "arguments": {"title": "X"}},
+    )()
+    text = chat_service._describe_pending_proposal(pending, adjacent=False)
+    assert "is still stored" in text
+    assert "NOT expired, rejected, or removed" in text
+    assert "must never claim it was created, changed, or removed" in text
+    assert "call propose_create_task again" in text
+
+
+def test_history_truncation_cannot_bypass_adjacency_protection(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.17 Part L: the adjacency guard uses a direct,
+    uncapped ChatMessage query — never the 20-message/4000-char
+    model-visible history window. Proven by pushing enough intervening
+    messages that the ORIGINAL confirmation prompt itself falls
+    completely outside that trimmed window, and confirming the guard
+    still correctly blocks deterministic execution."""
+    from app.modules.actions import service as actions_service
+
+    task_title = "Buried under history - 317i"
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_create_task", arguments={"title": task_title}),
+    )
+    _send(authenticated_client, f"add a task: {task_title}")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("noted"),
+    )
+    for i in range(15):  # comfortably exceeds _MAX_HISTORY_MESSAGES (20) together with the propose turn
+        _send(authenticated_client, f"unrelated filler message {i}")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("What would you like me to do?")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    _send(authenticated_client, "yes")
+    assert call_count["n"] == 1  # still correctly non-adjacent, not deterministic
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == task_title for t in tasks)
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"
+
+
+def test_adjacency_check_works_from_a_brand_new_session_simulating_a_restart(db_session: Session) -> None:
+    """Checkpoint 3.17 Part F/M-analog: adjacency is purely DB-backed —
+    a fresh SQLAlchemy Session (no in-memory state carried over,
+    simulating an app/process restart) must compute the identical,
+    correct answer."""
+    from sqlalchemy.orm import sessionmaker
+
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    confirmation = chat_service.record_assistant_message(db_session, space.id, user.id, "confirm?")
+    pending = actions_service.create_pending_action(
+        db_session, space.id, user.id, confirmation.id, "create_task", {"title": "Restart test - 317j"},
+    )
+    current_message = chat_service.record_user_message(db_session, space.id, user.id, "yes")
+
+    FreshSession = sessionmaker(bind=db_session.get_bind())
+    fresh_db = FreshSession()
+    try:
+        adjacent = actions_service.is_still_conversationally_adjacent(
+            fresh_db, space.id, user.id, pending, current_message.id
+        )
+        assert adjacent is True  # nothing intervened
+
+        interruption = chat_service.record_user_message(fresh_db, space.id, user.id, "something else")
+        later_message = chat_service.record_user_message(fresh_db, space.id, user.id, "yes")
+        adjacent_after_interruption = actions_service.is_still_conversationally_adjacent(
+            fresh_db, space.id, user.id, pending, later_message.id
+        )
+        assert adjacent_after_interruption is False  # interruption.id correctly counted
+        assert interruption.id  # sanity: the row really was created
+    finally:
+        fresh_db.close()
