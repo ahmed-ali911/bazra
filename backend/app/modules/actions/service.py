@@ -12,6 +12,7 @@ from app.modules.calendar.schemas import (
     CalendarEventResponse,
     CalendarEventUpdate,
     ProposedCalendarEventCreate,
+    ProposedCalendarEventDelete,
     ProposedCalendarEventUpdate,
 )
 from app.modules.chat.models import ChatMessage
@@ -34,6 +35,7 @@ _ACTION_ARGUMENT_SCHEMAS: dict[str, type[PydanticBaseModel]] = {
     "delete_task": ProposedTaskDelete,
     "create_event": ProposedCalendarEventCreate,
     "update_event": ProposedCalendarEventUpdate,
+    "delete_event": ProposedCalendarEventDelete,
 }
 
 
@@ -373,6 +375,31 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             db.commit()
             return ConfirmResult(
                 outcome="executed", event=CalendarEventResponse.model_validate(event), event_action="updated",
+            )
+
+        if proposal.action_type == "delete_event":
+            # Fetched BEFORE delete_calendar_event runs, deliberately —
+            # the exact same "fetch doubles as execution-time
+            # revalidation" pattern as delete_task's own branch above:
+            # delete_calendar_event sets archived_at and its own
+            # internal get_calendar_event lookup filters archived_at IS
+            # NULL, so an event_id fetched AFTER deletion would no
+            # longer resolve. Event drift on OTHER fields (title/time/
+            # life_area, changed by another path since the proposal was
+            # created) is irrelevant here by design (Part 17 of the
+            # approved design report) — deletion only cares about
+            # identity/existence, never field values, so it proceeds
+            # against whatever the event's current state is as long as
+            # it's still active.
+            delete_data = ProposedCalendarEventDelete(**proposal.arguments)
+            event = calendar_service.get_calendar_event(db, space_id, delete_data.event_id)
+            if event is None:
+                raise RuntimeError(f"event_id {delete_data.event_id} no longer exists")
+            calendar_service.delete_calendar_event(db, space_id, delete_data.event_id)
+            proposal.status = "executed"
+            db.commit()
+            return ConfirmResult(
+                outcome="executed", event=CalendarEventResponse.model_validate(event), event_action="deleted",
             )
 
         if proposal.action_type == "save_memory":

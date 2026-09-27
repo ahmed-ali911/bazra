@@ -7,10 +7,11 @@ def test_clear_english_write_request_is_detected() -> None:
     task UPDATE (mark-done, reschedule, edit) similarly no longer
     matches. Checkpoint 3.13: task DELETION similarly no longer
     matches. Checkpoint 3.15: event/meeting CREATION similarly no
-    longer matches — see below for all four. Calendar/meeting/reminder
-    DELETION, reminder CREATION, and Life-Area edits are unaffected by
-    any of these checkpoints and still decline deterministically."""
-    assert detect_clear_write_intent("delete my meeting with Bob") is True
+    longer matches. Checkpoint 3.19: event/meeting DELETION similarly
+    no longer matches — see below for all five. Reminder/Life-Area
+    deletion and Life-Area edits are unaffected by any of these
+    checkpoints and still decline deterministically."""
+    assert detect_clear_write_intent("cancel the reminder") is True
     assert detect_clear_write_intent("change the life area for this task") is True
 
 
@@ -45,14 +46,24 @@ def test_delete_task_phrasing_is_no_longer_detected_as_a_decline() -> None:
     assert detect_clear_write_intent("cancel that task") is False
 
 
+def test_delete_event_phrasing_is_no_longer_detected_as_a_decline() -> None:
+    """Checkpoint 3.19: removing an EXISTING CalendarEvent is no longer
+    a deterministic decline — it's a real capability now, reached
+    through the Orchestrator's propose_delete_event tool. Only "event"/
+    "meeting" were dropped from the delete/remove/cancel noun list —
+    reminder/life-area deletion are unaffected (see
+    test_unsupported_deletion_phrasing_still_declines below)."""
+    assert detect_clear_write_intent("delete my meeting with Bob") is False
+    assert detect_clear_write_intent("remove that event from my calendar") is False
+    assert detect_clear_write_intent("cancel my meeting with Hussein tomorrow") is False
+
+
 def test_unsupported_deletion_phrasing_still_declines() -> None:
-    """Checkpoint 3.13 narrows ONLY the task noun out of the delete/
-    remove/cancel pattern — event/meeting/reminder/life-area deletion,
-    none of which are implemented capabilities, must continue to
-    decline deterministically exactly as before. Unaffected by 3.15,
-    which only touches the CREATE pattern."""
-    assert detect_clear_write_intent("delete my meeting with Bob") is True
-    assert detect_clear_write_intent("remove that event from my calendar") is True
+    """Checkpoint 3.13 narrowed ONLY the task noun, and Checkpoint 3.19
+    narrowed ONLY the event/meeting nouns, out of the delete/remove/
+    cancel pattern — reminder/life-area deletion, neither of which is
+    an implemented capability, must continue to decline deterministically
+    exactly as before."""
     assert detect_clear_write_intent("cancel the reminder") is True
     assert detect_clear_write_intent("delete this life area") is True
 
@@ -77,18 +88,28 @@ def test_create_reminder_phrasing_still_declines() -> None:
 
 def test_clear_arabic_write_request_is_detected() -> None:
     """Delete/edit phrasings in Arabic are unchanged by 3.3/3.10/3.13/
-    3.15 for anything other than tasks/events — only the CREATE
+    3.15/3.19 for anything other than tasks/events — only the CREATE
     pattern's noun list dropped 'مهمة' (task) in 3.3 and 'حدث'/'موعد'
     (event/appointment) in 3.15, and the DELETE pattern's noun list
-    dropped 'مهمة' in 3.13 (see the dedicated tests below)."""
+    dropped 'مهمة' in 3.13 and 'حدث'/'موعد' in 3.19 (see the dedicated
+    tests below)."""
     assert detect_clear_write_intent("الغاء التذكير") is True
 
 
+def test_arabic_delete_event_phrasing_is_no_longer_detected_as_a_decline() -> None:
+    """Checkpoint 3.19: 'احذف حدث اجتماع الفريق' = 'delete the team
+    meeting event' — used to trigger the deterministic decline; now
+    falls through to the Orchestrator, matching the English
+    delete-event behavior change above."""
+    assert detect_clear_write_intent("احذف حدث اجتماع الفريق") is False
+    assert detect_clear_write_intent("امسح الموعد") is False
+
+
 def test_arabic_unsupported_deletion_phrasing_still_declines() -> None:
-    """Checkpoint 3.13 narrows ONLY 'مهمة' (task) out of the Arabic
-    delete pattern — event/meeting/reminder deletion in Arabic must
-    continue to decline deterministically exactly as before."""
-    assert detect_clear_write_intent("احذف حدث اجتماع الفريق") is True
+    """Checkpoint 3.13 narrowed ONLY 'مهمة' (task), and Checkpoint 3.19
+    narrowed ONLY 'حدث'/'موعد' (event/appointment), out of the Arabic
+    delete pattern — reminder deletion in Arabic must continue to
+    decline deterministically exactly as before."""
     assert detect_clear_write_intent("الغاء التذكير") is True
 
 

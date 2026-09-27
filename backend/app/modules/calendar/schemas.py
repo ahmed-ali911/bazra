@@ -111,6 +111,17 @@ class ProposedCalendarEventUpdate(CalendarEventUpdate):
         return self
 
 
+class ProposedCalendarEventDelete(BaseModel):
+    """Checkpoint 3.19 — the model-facing argument shape for
+    propose_delete_event: a stable, explicit event_id only. Deliberately
+    minimal — no title/time snapshot, no additional delete metadata;
+    the database event is authoritative, re-fetched fresh at both
+    proposal and execution time. Mirrors ProposedTaskDelete exactly.
+    """
+
+    event_id: int
+
+
 class CalendarEventResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

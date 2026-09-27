@@ -238,6 +238,38 @@ _PROPOSE_UPDATE_EVENT_TOOL = {
     },
 }
 
+_PROPOSE_DELETE_EVENT_TOOL = {
+    "name": "propose_delete_event",
+    "description": (
+        "Propose removing an existing CalendarEvent from the user's BAZRA "
+        "calendar — this is what 'cancel my meeting', 'delete the event', and "
+        "'remove it from my calendar' all mean today: removing BAZRA's own "
+        "local record of it. This does NOT contact anyone, send any "
+        "invitation update, or change any external calendar — BAZRA has no "
+        "such integration. Never say or imply that another person was "
+        "notified, that a real-world meeting was cancelled with them, or that "
+        "an external calendar (Google, Outlook, etc.) was changed — only that "
+        "the event was removed from BAZRA. Reference the event by the "
+        "event_id shown next to it in Current Data below (shown as "
+        "event_id=N) — never guess an id, and never resolve one by matching a "
+        "title yourself. If more than one event could plausibly match what "
+        "the user described, ask which one they mean instead of picking one; "
+        "never remove more than one event for a single request. This does "
+        "NOT remove it — it only records a proposal that the user must "
+        "explicitly confirm before anything is actually removed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "event_id": {
+                "type": "integer",
+                "description": "The event_id of the existing event to remove, exactly as shown in Current Data.",
+            },
+        },
+        "required": ["event_id"],
+    },
+}
+
 _PROPOSE_SAVE_MEMORY_TOOL = {
     "name": "propose_save_memory",
     "description": (
@@ -333,7 +365,7 @@ _GET_WEATHER_TOOL = {
 
 _TOOLS_OFFERED = [
     _PROPOSE_CREATE_TASK_TOOL, _PROPOSE_UPDATE_TASK_TOOL, _PROPOSE_DELETE_TASK_TOOL,
-    _PROPOSE_CREATE_EVENT_TOOL, _PROPOSE_UPDATE_EVENT_TOOL,
+    _PROPOSE_CREATE_EVENT_TOOL, _PROPOSE_UPDATE_EVENT_TOOL, _PROPOSE_DELETE_EVENT_TOOL,
     _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
 ]
 
@@ -345,6 +377,7 @@ _ACTION_TYPE_TOOL_NAMES = {
     "delete_task": "propose_delete_task",
     "create_event": "propose_create_event",
     "update_event": "propose_update_event",
+    "delete_event": "propose_delete_event",
     "save_memory": "propose_save_memory",
     "forget_memory": "propose_forget_memory",
 }
@@ -367,6 +400,43 @@ _DECLINE_PHRASES = frozenset({
 _YES_NO_STRIP_CHARS = " \t\n.,!?؟"
 
 _REJECTED_MESSAGE = "Okay, I won't create that."
+
+# Checkpoint 3.19 — fixes a pre-existing defect (first flagged in 3.13's
+# own close-out): a rejected update/delete/memory action was replied to
+# with this SAME literal "I won't create that" regardless of what was
+# actually rejected, which reads backwards for e.g. a rejected deletion
+# ("I won't create" when the user just said no to a REMOVAL). Keyed on
+# the pending proposal's own action_type — deterministic, 0 LLM, no new
+# ProposedAction status, no schema change. Reuses _is_arabic, the SAME
+# existing per-message language-selection mechanism every other
+# confirmation renderer in this file already uses, not a new
+# localization framework. _REJECTED_MESSAGE above remains the fallback
+# for any future/unrecognized action_type, and is also
+# _reply_for_confirm_result's own pre-existing (unreachable in
+# practice — no code path ever constructs ConfirmResult(outcome=
+# "rejected", ...); actions_service.reject() is a separate function
+# whose only caller already renders directly from the table below)
+# defensive default, left untouched.
+_REJECTED_MESSAGE_EN_BY_ACTION_TYPE = {
+    "create_task": "Okay, I won't create that.",
+    "update_task": "Okay, I won't make that change.",
+    "delete_task": "Okay, I won't remove that.",
+    "create_event": "Okay, I won't add that.",
+    "update_event": "Okay, I won't make that change.",
+    "delete_event": "Okay, I won't remove that.",
+    "save_memory": "Okay, I won't remember that.",
+    "forget_memory": "Okay, I won't forget that.",
+}
+_REJECTED_MESSAGE_AR_BY_ACTION_TYPE = {
+    "create_task": "تمام، مش هضيفها.",
+    "update_task": "تمام، مش هغيرها.",
+    "delete_task": "تمام، مش هشيلها.",
+    "create_event": "تمام، مش هضيفه.",
+    "update_event": "تمام، مش هغيره.",
+    "delete_event": "تمام، مش هشيله.",
+    "save_memory": "تمام، مش هفتكرها.",
+    "forget_memory": "تمام، مش هنساها.",
+}
 _NOTHING_PENDING_MESSAGE = "I don't have a pending proposal to confirm right now."
 _EXECUTION_FAILED_MESSAGE = "Something went wrong while creating that task — could you say yes again?"
 _INVALID_PROPOSAL_FALLBACK_MESSAGE = (
@@ -965,6 +1035,34 @@ def _render_update_event_confirmation(
     return f'I can {joined} — "{event.title}". Make that change?'
 
 
+def _render_delete_event_confirmation(event, timezone_name: str, user_message: str) -> str:
+    """Checkpoint 3.19 — same discipline as _render_delete_task_confirmation:
+    built ONLY from the event's own CURRENT state (re-fetched via
+    _require_existing_event, never restated by the model). Names the
+    event's local date/time so the user can catch a misidentification
+    before confirming, and is deliberately consequence-aware — no
+    restore/unarchive surface exists for CalendarEvent any more than it
+    does for Task (verified directly, same as 3.13's own finding) —
+    without ever implying this reaches beyond BAZRA's own local
+    calendar (no attendee/external-calendar wording anywhere).
+    """
+    arabic = _is_arabic(user_message)
+    zone = ZoneInfo(timezone_name)
+    starts_local = event.starts_at.astimezone(zone)
+    date_str = _format_event_date_local(starts_local, arabic)
+    time_str = _format_event_time_local(starts_local, arabic)
+
+    if arabic:
+        return (
+            f'أقدر أشيل "{event.title}" من تقويم بذرة — يوم {date_str} الساعة {time_str}، '
+            f'ومفيش طريقة أرجعه دلوقتي. أشيله؟'
+        )
+    return (
+        f'I can remove "{event.title}" from your BAZRA calendar — it\'s {date_str} at {time_str}, '
+        f'and there\'s no way to bring it back right now. Remove it?'
+    )
+
+
 def _render_save_memory_confirmation(arguments: dict, user_message: str) -> str:
     """Same discipline as _render_create_task_confirmation: built ONLY
     from the validated arguments that will be stored/executed, never
@@ -1106,6 +1204,17 @@ def _format_memory_context(memories: list[Memory], total_active_count: int) -> s
     return text
 
 
+def _reply_for_rejected_action(action_type: str, user_message: str) -> str:
+    """Checkpoint 3.19 — see the tables' own docstring above for why
+    this exists. Falls back to the old generic _REJECTED_MESSAGE for
+    any action_type not in the table (structurally unreachable today,
+    since every current action_type is listed, but keeps this safe
+    against a future action_type being added to VALID_ACTION_TYPES
+    without a matching entry here being remembered)."""
+    table = _REJECTED_MESSAGE_AR_BY_ACTION_TYPE if _is_arabic(user_message) else _REJECTED_MESSAGE_EN_BY_ACTION_TYPE
+    return table.get(action_type, _REJECTED_MESSAGE)
+
+
 def _reply_for_confirm_result(result: ConfirmResult) -> str:
     if result.outcome == "executed":
         if result.task is not None:
@@ -1117,6 +1226,8 @@ def _reply_for_confirm_result(result: ConfirmResult) -> str:
         if result.event is not None:
             if result.event_action == "updated":
                 return f'Done — I\'ve updated "{result.event.title}".'
+            if result.event_action == "deleted":
+                return f'Done — I\'ve removed "{result.event.title}" from your BAZRA calendar.'
             return f'Done — I\'ve added "{result.event.title}" to your calendar.'
         if result.memory is not None:
             if result.memory.status == "forgotten":
@@ -1358,6 +1469,26 @@ def _handle_update_event_proposal(
     return assistant_message
 
 
+def _handle_delete_event_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("delete_event", arguments)
+        event = _require_existing_event(db, space_id, "delete_event", validated["event_id"])
+    except actions_service.InvalidActionArgumentsError:
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    reply_text = _render_delete_event_confirmation(event, timezone_name, user_message_content)
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "delete_event", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
 def _handle_save_memory_proposal(
     db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
     timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
@@ -1475,6 +1606,7 @@ _TOOL_HANDLERS = {
     "propose_delete_task": _handle_delete_task_proposal,
     "propose_create_event": _handle_create_event_proposal,
     "propose_update_event": _handle_update_event_proposal,
+    "propose_delete_event": _handle_delete_event_proposal,
     "propose_save_memory": _handle_save_memory_proposal,
     "propose_forget_memory": _handle_forget_memory_proposal,
     "get_weather": _handle_get_weather,
@@ -1564,8 +1696,9 @@ def send_message(
         return user_message, assistant_message
 
     if narrow_answer == "no" and adjacent:
+        rejected_reply = _reply_for_rejected_action(pending.action_type, content)
         actions_service.reject(db, space_id, user_id)
-        assistant_message = record_assistant_message(db, space_id, user_id, _REJECTED_MESSAGE)
+        assistant_message = record_assistant_message(db, space_id, user_id, rejected_reply)
         _log_deterministic_route("proposal_reject", user_message.id)
         return user_message, assistant_message
 

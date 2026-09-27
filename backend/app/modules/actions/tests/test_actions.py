@@ -1055,3 +1055,144 @@ def test_reject_update_event_proposal_leaves_event_unchanged(db_session: Session
 
     db_session.refresh(event)
     assert event.title == "Untouched - actions318g"
+
+
+# ---- Checkpoint 3.19: delete_event ---------------------------------------------------
+
+
+def test_validate_arguments_delete_event_requires_event_id(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("delete_event", {})
+
+
+def test_confirm_and_execute_dispatches_delete_event_archives_exactly_that_event(
+    db_session: Session, owner,
+) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Archive me - actions319a", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    other_event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Leave me alone - actions319a", starts_at=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_event", {"event_id": event.id},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event_action == "deleted"
+    assert result.event.id == event.id
+    assert result.event.title == "Archive me - actions319a"
+
+    assert calendar_service.get_calendar_event(db_session, space.id, event.id) is None  # archived -> filtered out
+
+    db_session.refresh(other_event)
+    assert other_event.archived_at is None  # exactly the intended event, nothing else
+
+
+def test_confirm_and_execute_delete_event_nonexistent_event_rolls_back_to_pending(
+    db_session: Session, owner,
+) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_event", {"event_id": 999999},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"  # reverted, safely re-confirmable
+
+
+def test_confirm_and_execute_delete_event_already_archived_between_proposal_and_confirmation_rolls_back(
+    db_session: Session, owner,
+) -> None:
+    """Race from the 3.19 design report (Part 16/execution): the event
+    is archived (e.g. by a direct REST delete, or another concurrent
+    proposal) after the ProposedAction was created but before it's
+    confirmed. Execution must fail safely, not archive an
+    already-archived row a second time or silently report success."""
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Raced away - actions319b", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_event", {"event_id": event.id},
+    )
+
+    calendar_service.delete_calendar_event(db_session, space.id, event.id)  # the race
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"
+
+
+def test_confirm_and_execute_delete_event_updated_before_confirmation_still_deletes_same_event(
+    db_session: Session, owner,
+) -> None:
+    """Checkpoint 3.19 Part 17 (approved decision): deletion cares only
+    about identity/existence, never stale field values — if the SAME
+    event is updated (title/time/life area) after the delete proposal
+    but before confirmation, deletion still proceeds against whatever
+    the event's current state is, as long as it remains active."""
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate, CalendarEventUpdate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Original - actions319c", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_event", {"event_id": event.id},
+    )
+
+    calendar_service.update_calendar_event(db_session, space.id, event.id, CalendarEventUpdate(title="Renamed - actions319c"))
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event.title == "Renamed - actions319c"  # deleted the same event, reflecting its latest state
+    assert calendar_service.get_calendar_event(db_session, space.id, event.id) is None
+
+
+def test_reject_delete_event_proposal_leaves_event_active(db_session: Session, owner) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Rejected removal - actions319d", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_event", {"event_id": event.id},
+    )
+
+    rejected = actions_service.reject(db_session, space.id, user.id)
+    assert rejected is True
+
+    db_session.refresh(event)
+    assert event.archived_at is None
+    assert calendar_service.get_calendar_event(db_session, space.id, event.id) is not None

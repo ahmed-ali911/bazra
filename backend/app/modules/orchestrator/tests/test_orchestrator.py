@@ -204,16 +204,18 @@ def test_system_prompt_no_longer_claims_tasks_cannot_be_edited_or_marked_complet
     assert "you still cannot delete a task" not in prompt
 
 
-def test_system_prompt_still_declines_calendar_delete_mark_complete_and_inbox_life_area_writes() -> None:
+def test_system_prompt_still_declines_calendar_mark_complete_and_inbox_life_area_writes() -> None:
     """The blanket 'not available yet' decline remains true for
-    Calendar event delete/mark-complete and for Inbox/Life Areas — only
-    Task's own write capabilities (create/update/delete) and
-    CalendarEvent's own create (3.15) and update (3.18) capabilities
-    have ever been carved out of it. 'edit' was deliberately removed
-    from the Calendar decline clause in 3.18, since editing an existing
-    event is now a real capability via propose_update_event."""
+    Calendar event mark-complete and for Inbox/Life Areas — only Task's
+    own write capabilities (create/update/delete) and CalendarEvent's
+    own create (3.15), update (3.18), and delete (3.19) capabilities
+    have ever been carved out of it. 'edit' was removed from the
+    Calendar decline clause in 3.18; 'delete' was removed in 3.19, since
+    removing an existing event is now a real capability via
+    propose_delete_event."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
-    assert "delete or mark complete an existing Calendar event" in prompt
+    assert "mark complete an existing Calendar event" in prompt
+    assert "you still cannot mark complete an existing one" in prompt
     assert "edit, delete, mark complete, or create anything for Inbox or Life Areas" in prompt
     assert "say plainly that this isn't available yet" in prompt
 
@@ -291,6 +293,37 @@ def test_system_prompt_requires_duration_preserving_move_semantics() -> None:
     assert "compute and include BOTH the new starts_at and the new ends_at" in prompt
     assert "For a genuine point event (no ends_at shown), moving it only changes starts_at" in prompt
     assert "compute and send only the resulting final ends_at" in prompt
+
+
+def test_system_prompt_describes_propose_delete_event_as_a_proposal_not_an_execution() -> None:
+    """Checkpoint 3.19: the model must be told plainly that it MUST call
+    propose_delete_event for a supported CalendarEvent removal, that a
+    plain-text claim of completion is NOT a substitute, and that the
+    tool call itself only proposes — following the same MUST-call/
+    NOT-a-substitute pattern as every other propose_* tool."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "propose_delete_event" in prompt
+    assert "You MUST call the propose_delete_event tool" in prompt
+    assert "is NOT a substitute for calling it" in prompt
+    assert "This does NOT remove it — it only proposes it" in prompt
+
+
+def test_system_prompt_forbids_claiming_external_calendar_effects() -> None:
+    """Checkpoint 3.19 Part F/6: BAZRA must never imply an external
+    calendar effect, attendee notification, or real-world cancellation
+    — only that the event was removed from BAZRA's own local calendar."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "NO integration with Google Calendar, Outlook" in prompt
+    assert "never say or imply that another person was notified" in prompt
+    assert "only that the event was removed from BAZRA's own calendar" in prompt
+
+
+def test_system_prompt_requires_disambiguation_for_ambiguous_delete_target() -> None:
+    """Checkpoint 3.19 Part 8: never guess between multiple plausibly-
+    matching events, never remove more than one for a single request."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "ask which one instead of guessing" in prompt
+    assert "never remove more than one event for a single request" in prompt
 
 
 def test_system_prompt_includes_current_datetime_anchor() -> None:

@@ -173,8 +173,10 @@ def test_clear_write_request_gets_unavailability_message_without_calling_model(
     authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Checkpoint 3.3: task CREATION no longer declines deterministically
-    (see the propose/confirm tests below) — delete/edit/mark-done
-    phrasings are unaffected and still decline without a model call."""
+    (see the propose/confirm tests below) — a still-unsupported
+    destructive phrasing (reminder deletion; Calendar event deletion
+    became a real capability in 3.19, see test_write_intent.py) is
+    unaffected and still declines without a model call."""
     call_count = 0
 
     def _track(**kwargs):
@@ -184,7 +186,7 @@ def test_clear_write_request_gets_unavailability_message_without_calling_model(
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _track)
 
-    response = _send(authenticated_client, "delete my meeting with Bob")
+    response = _send(authenticated_client, "cancel the reminder")
     assert response.status_code == 200
     assert call_count == 0
     assert response.json()["assistant_message"]["content"] == chat_service.WRITE_UNAVAILABLE_MESSAGE
@@ -869,7 +871,10 @@ def test_reject_save_memory_proposal_creates_no_memory(
     )
     decline_response = _send(authenticated_client, "no")
     assert decline_response.status_code == 200
-    assert decline_response.json()["assistant_message"]["content"] == chat_service._REJECTED_MESSAGE
+    # Checkpoint 3.19: rejection copy is now action-aware — a rejected
+    # save_memory correctly says "remember," never the old generic
+    # (and here wrong) "I won't create that."
+    assert decline_response.json()["assistant_message"]["content"] == "Okay, I won't remember that."
 
     user, space = _get_space_and_user(db_session)
     memories, _ = memory_service.get_relevant_memories(db_session, space.id, user.id, limit=1000)
@@ -1720,7 +1725,7 @@ def test_write_intent_decline_makes_zero_model_calls_zero_traces_and_logs_route(
     before_trace_id = _max_ai_trace_id(db_session)
     _enable_chat_service_logger()
     with caplog.at_level(logging.INFO, logger="app.modules.chat.service"):
-        response = _send(authenticated_client, "delete my meeting with Bob")
+        response = _send(authenticated_client, "cancel the reminder")
     assert response.status_code == 200
 
     assert call_count["n"] == 0
@@ -3843,3 +3848,538 @@ def test_update_event_interruption_then_yes_does_not_execute(
     ).json()
     unchanged = next(i for i in agenda if i["id"] == event["id"] and i["source"] == "event")
     assert unchanged["title"] == "Interruption target - 318n"  # NOT updated
+
+
+# ---- Checkpoint 3.19: propose / confirm the removal of an EXISTING CalendarEvent ----
+
+
+def test_propose_then_confirm_removes_the_real_event(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The main end-to-end flow: a valid event_id produces exactly one
+    pending delete_event ProposedAction and exactly one model call;
+    the event remains fully active until confirmation; a bare 'yes'
+    costs zero model calls and archives exactly that event, which then
+    disappears from the normal Calendar/Agenda read."""
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(authenticated_client, "Meeting with Hussein - 319a", "2026-09-28T11:00:00+03:00")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]})(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    propose_response = _send(authenticated_client, "cancel my meeting with Hussein tomorrow")
+    assert propose_response.status_code == 200
+    assert call_count["n"] == 1
+    assert "Meeting with Hussein - 319a" in propose_response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.action_type == "delete_event"
+
+    agenda_before = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert any(i["id"] == event["id"] and i["source"] == "event" for i in agenda_before)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    assert "removed" in confirm_response.json()["assistant_message"]["content"].lower()
+    assert "BAZRA calendar" in confirm_response.json()["assistant_message"]["content"]
+
+    agenda_after = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert not any(i["id"] == event["id"] and i["source"] == "event" for i in agenda_after)
+
+    direct_get = authenticated_client.get(f"/api/v1/calendar/events/{event['id']}")
+    assert direct_get.status_code == 404
+
+
+def test_propose_delete_event_reject_leaves_event_active(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "Do not remove me - 319b", "2026-09-28T11:00:00+03:00")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    _send(authenticated_client, "remove that meeting")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    reject_response = _send(authenticated_client, "no")
+    assert reject_response.status_code == 200
+    assert reject_response.json()["assistant_message"]["content"] == "Okay, I won't remove that."
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert any(i["id"] == event["id"] and i["source"] == "event" for i in agenda)
+
+
+def test_propose_delete_event_with_nonexistent_event_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure", tool_name="propose_delete_event", arguments={"event_id": 999999}),
+    )
+    response = _send(authenticated_client, "remove event 999999")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_delete_event_with_other_space_event_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+    from app.modules.auth import service as auth_service
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+    from app.modules.spaces.models import Space
+
+    owner = auth_service.get_the_user(db_session)
+    other_space = Space(name="Other Space - 319c", is_default=False, user_id=owner.id)
+    db_session.add(other_space)
+    db_session.commit()
+    db_session.refresh(other_space)
+    foreign_event = calendar_service.create_calendar_event(
+        db_session, other_space.id,
+        CalendarEventCreate(title="Foreign event - 319c", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure", tool_name="propose_delete_event", arguments={"event_id": foreign_event.id}),
+    )
+    response = _send(authenticated_client, "remove that other event")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    still_there = calendar_service.get_calendar_event(db_session, other_space.id, foreign_event.id)
+    assert still_there is not None
+    assert still_there.archived_at is None
+
+
+def test_propose_delete_event_on_already_archived_event_creates_no_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Covers both 'already-archived event cannot create a valid
+    proposal' and 'archived event cannot subsequently be proposed for
+    deletion again' — the same get_calendar_event lookup that filters
+    archived_at IS NULL for every other proposal type applies
+    identically here."""
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(authenticated_client, "Remove me twice - 319d", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    _send(authenticated_client, "remove that event")
+    _send(authenticated_client, "yes")  # now archived
+
+    agenda_after_first_delete = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert not any(i["id"] == event["id"] and i["source"] == "event" for i in agenda_after_first_delete)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    response = _send(authenticated_client, "remove that event again")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_delete_event_confirmation_names_event_and_states_no_restore_consequence(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "Consequence check - 319e", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure!", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    response = _send(authenticated_client, "cancel the 'Consequence check - 319e' meeting")
+    content = response.json()["assistant_message"]["content"]
+
+    assert "Consequence check - 319e" in content
+    assert "remove" in content.lower()
+    assert "no way to bring it back" in content.lower()
+    assert "permanently deleted" not in content.lower()
+    assert "restorable" not in content.lower()
+    assert "restore" not in content.lower()  # says "no way to bring it back", never the word "restore" itself
+
+
+def test_delete_event_confirmation_and_success_never_imply_external_effects(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.19 Part 6/G: the core product-safety requirement —
+    BAZRA must never claim or imply attendee notification, a
+    real-world/external cancellation, or an external calendar change."""
+    event = _create_real_event(authenticated_client, "Meeting with Hussein - 319f", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    propose_response = _send(authenticated_client, "cancel my meeting with Hussein tomorrow")
+    propose_content = propose_response.json()["assistant_message"]["content"]
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    confirm_content = confirm_response.json()["assistant_message"]["content"]
+
+    for content in (propose_content, confirm_content):
+        lowered = content.lower()
+        assert "cancelled with" not in lowered
+        assert "notified" not in lowered
+        assert "google" not in lowered
+        assert "outlook" not in lowered
+        assert "invit" not in lowered  # invite/invitation
+    assert "BAZRA calendar" in confirm_content
+
+
+def test_delete_event_confirmation_language_matches_arabic_or_english(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "اجتماع مع حسين - 319g", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("تمام", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    response = _send(authenticated_client, "الغي اجتماع حسين بكرة")
+    content = response.json()["assistant_message"]["content"]
+    assert "اجتماع مع حسين - 319g" in content
+    assert "أشيله؟" in content
+    assert "مفيش طريقة أرجعه" in content
+
+
+def test_delete_event_confirmation_across_dst_capable_timezone(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "NY meeting - 319h", "2026-07-15T11:00:00-04:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    response = _send(authenticated_client, "cancel that meeting", timezone_name="America/New_York")
+    content = response.json()["assistant_message"]["content"]
+    assert "11:00 AM" in content
+    assert "July 15" in content
+
+
+def test_model_prose_with_wrong_details_does_not_appear_in_delete_event_confirmation(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "Real event title - 319i", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I've removed a totally different event for you!", tool_name="propose_delete_event",
+            arguments={"event_id": event["id"]},
+        ),
+    )
+    response = _send(authenticated_client, "remove it")
+    content = response.json()["assistant_message"]["content"]
+    assert "totally different" not in content
+    assert "Real event title - 319i" in content
+
+
+def test_delete_event_ambiguity_then_disambiguating_followup_produces_correct_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    actions_service.reject(db_session, space.id, user.id)  # clean slate regardless of prior tests in this run
+
+    event_am = _create_real_event(authenticated_client, "Meeting with Hussein - 319j", "2026-09-28T09:00:00+03:00")
+    event_pm = _create_real_event(authenticated_client, "Meeting with Hussein - 319j", "2026-09-28T14:00:00+03:00")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Do you mean the 9 AM one or the 2 PM one?"),
+    )
+    clarify_response = _send(authenticated_client, "cancel my meeting with Hussein")
+    assert clarify_response.status_code == 200
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event_pm["id"]}),
+    )
+    disambiguated_response = _send(authenticated_client, "the 2 PM one")
+    assert disambiguated_response.status_code == 200
+
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.arguments["event_id"] == event_pm["id"]
+
+
+def test_delete_event_interruption_then_yes_does_not_execute(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.17 inheritance — no delete_event-specific adjacency
+    logic was written; this proves the generic guard already covers
+    it."""
+    event = _create_real_event(authenticated_client, "Interruption target - 319k", "2026-09-28T11:00:00+03:00")
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="cancel the 'Interruption target - 319k' meeting",
+        tool_name="propose_delete_event", arguments={"event_id": event["id"]},
+        bare_answer="yes",
+    )
+    assert result["call_count"] == 1  # reached the model, not deterministic
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert any(i["id"] == event["id"] and i["source"] == "event" for i in agenda)  # NOT archived
+
+
+def test_delete_event_interruption_then_no_does_not_reject(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(authenticated_client, "Do not touch me - 319l", "2026-09-28T11:00:00+03:00")
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="cancel the 'Do not touch me - 319l' meeting",
+        tool_name="propose_delete_event", arguments={"event_id": event["id"]},
+        bare_answer="no",
+    )
+    assert result["call_count"] == 1  # reached the model, not deterministically rejected
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"  # NOT rejected by the stale "no"
+
+
+def test_update_event_pending_then_delete_event_proposal_supersedes(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.19 Part 18: generic cross-type supersession, no
+    action-specific architecture."""
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(authenticated_client, "Cross-type test - 319m", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_update_event", arguments={"event_id": event["id"], "title": "New title"}),
+    )
+    _send(authenticated_client, "rename that event")
+
+    user, space = _get_space_and_user(db_session)
+    first_pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert first_pending is not None
+    assert first_pending.action_type == "update_event"
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    _send(authenticated_client, "actually just remove it")
+
+    second_pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert second_pending is not None
+    assert second_pending.action_type == "delete_event"
+    assert second_pending.id != first_pending.id
+
+    db_session.refresh(first_pending)
+    assert first_pending.status == "superseded"
+
+
+def test_delete_event_pending_then_update_event_proposal_supersedes(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(authenticated_client, "Cross-type test - 319n", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    _send(authenticated_client, "remove that event")
+
+    user, space = _get_space_and_user(db_session)
+    first_pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert first_pending is not None
+    assert first_pending.action_type == "delete_event"
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_update_event", arguments={"event_id": event["id"], "title": "New title"}),
+    )
+    _send(authenticated_client, "actually just rename it instead")
+
+    second_pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert second_pending is not None
+    assert second_pending.action_type == "update_event"
+    assert second_pending.id != first_pending.id
+
+    db_session.refresh(first_pending)
+    assert first_pending.status == "superseded"
+
+
+# ---- Checkpoint 3.19: generic rejection-copy fix, all action types -------------
+
+
+def test_create_task_rejection_copy(authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_create_task", arguments={"title": "Rejection copy test - 319o"}),
+    )
+    _send(authenticated_client, "add a task")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't create that."
+
+
+def test_update_task_rejection_copy(authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _create_real_task(authenticated_client, "Rejection copy test - 319p")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_update_task", arguments={"task_id": task["id"], "status": "done"}),
+    )
+    _send(authenticated_client, "mark it done")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't make that change."
+
+
+def test_delete_task_rejection_copy(authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _create_real_task(authenticated_client, "Rejection copy test - 319q")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, "remove that task")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't remove that."
+
+
+def test_create_event_rejection_copy(authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={"title": "Rejection copy test - 319r", "starts_at": "2026-09-28T11:00:00+03:00"},
+        ),
+    )
+    _send(authenticated_client, "add a meeting")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't add that."
+
+
+def test_update_event_rejection_copy(authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    event = _create_real_event(authenticated_client, "Rejection copy test - 319s", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_update_event", arguments={"event_id": event["id"], "title": "New"}),
+    )
+    _send(authenticated_client, "rename that event")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't make that change."
+
+
+def test_delete_event_rejection_copy(authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    event = _create_real_event(authenticated_client, "Rejection copy test - 319t", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    _send(authenticated_client, "remove that event")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't remove that."
+
+
+def test_save_memory_rejection_copy(authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "noted", tool_name="propose_save_memory",
+            arguments={"type": "FACT", "content": "Rejection copy test - 319u"},
+        ),
+    )
+    _send(authenticated_client, "remember that - 319u")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't remember that."
+
+
+def test_forget_memory_rejection_copy(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.memory import service as memory_service
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = _get_space_and_user(db_session)
+    source_id = chat_service.record_assistant_message(db_session, space.id, user.id, "seed").id
+    memory = memory_service.create_memory(
+        db_session, space.id, user.id, source_id, MemoryCreate(type="GOAL", content="Rejection copy test - 319v")
+    )
+    db_session.commit()
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure", tool_name="propose_forget_memory", arguments={"memory_id": memory.id}),
+    )
+    _send(authenticated_client, "forget that - 319v")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    response = _send(authenticated_client, "no")
+    assert response.json()["assistant_message"]["content"] == "Okay, I won't forget that."

@@ -781,6 +781,78 @@ handling), and no false completion claim occurred anywhere in the run.
   search/read tool or expanded horizon would address this; deliberately
   out of scope here (see the 3.18 design report's own Part T finding).
 
+### Checkpoint 3.19
+
+Conversational CalendarEvent removal: `propose_delete_event` — a
+direct combination of three already-proven patterns rather than new
+architecture: `delete_task`'s (3.13) soft-delete/confirmation shape,
+`update_event`'s (3.18) event-identity exposure, and 3.17's adjacency
+guard, inherited automatically with only a registration entry.
+`ProposedCalendarEventDelete(event_id: int)` mirrors `ProposedTaskDelete`
+exactly — no title/time snapshot; the database event is authoritative,
+re-fetched fresh at both proposal and execution time.
+
+**"Cancel," "delete," and "remove" are natural synonyms today, with
+zero extra code**: the write-intent verb group already included
+"cancel" alongside "delete"/"remove"; narrowing only the noun group
+(dropping "event"/"meeting" and "حدث"/"موعد" — the same noun group
+already narrowed once for "task"/"مهمة" in 3.13, now narrowed a third
+time) made all three verbs reachable for CalendarEvent simultaneously.
+"reminder"/"life area"/"تذكير" deliberately stay declined.
+
+**The external-effect boundary is the one genuinely new piece of
+reasoning** — verified with a repo-wide search that no external
+calendar integration exists anywhere (no Google/Outlook, no attendees,
+no invites, no sync/webhooks) before writing any wording. The tool
+description, system instructions, deterministic confirmation, and
+success reply all explicitly state the action only affects BAZRA's own
+local calendar, and are instructed to never say or imply attendee
+notification, a real-world cancellation, or an external calendar
+change — live-verified: even a stochastic text-only reply that never
+called the tool still correctly avoided implying an external effect.
+
+**Generic rejection-copy fix** (approved alongside this checkpoint,
+applies to every action type, not just delete_event): the single
+literal `"Okay, I won't create that."` previously used for every
+rejected action — update, delete, memory included — was replaced with
+`_reply_for_rejected_action`, keyed on the pending proposal's own
+`action_type` (read before `actions_service.reject` changes its
+status), with both English and Arabic variants reusing the existing
+`_is_arabic` per-message mechanism already used by every other
+confirmation renderer in this file — not a new localization framework.
+0 LLM, no schema change, no `ProposedAction` status change.
+
+`ConfirmResult.event_action` gained `"deleted"` alongside the existing
+`"created"`/`"updated"` — `CalendarEvent`'s own exact counterpart to
+`task_action`'s three-way precedent. Event drift (approved decision):
+deletion cares only about identity/existence, never stale field
+values — an event updated after the delete proposal but before
+confirmation still gets removed; an event already archived by another
+path before confirmation fails safely (rolls back to pending, no false
+success, no resurrection) — live-verified directly by archiving an
+event through a separate service call mid-flow and confirming the
+stale proposal.
+
+Live-verified (real provider calls, 6 fixed scenarios, no mocking): an
+EN cancel and an AR cancel each completed the full propose→confirm
+loop, the AR one with 0 confirm-turn `AiTrace` and a real archive;
+two same-titled/different-time events correctly triggering a
+clarification with no `ProposedAction`, followed by "the 2 PM one"
+correctly resolving to the right `event_id`; 3.17's adjacency guard
+protecting a delete proposal across a weather interruption (a
+subsequent real provider hiccup on the interrupted "yes" turn was
+honestly reported, not retried — the safety property itself held
+regardless, confirmed by the event remaining active); an immediate
+rejection producing the new delete-specific wording ("Okay, I won't
+remove that.") with 0 `AiTrace`; and the archived-elsewhere race
+producing a safe execution failure with the proposal correctly still
+`pending`, never a false success. One turn's own text falsely claimed
+a removal that never happened (no tool was called that turn, so
+nothing was actually written) — the same pre-existing, stochastic
+text-only reliability gap documented since 3.12b, reported honestly
+here rather than hidden; the database itself was never wrong, only
+that one turn's own generated text.
+
 ## Run locally (without Docker)
 
 ```bash
