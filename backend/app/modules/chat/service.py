@@ -10,9 +10,12 @@ from sqlalchemy.orm import Session
 from app.core.space_scoping import scoped_query
 from app.modules.actions import service as actions_service
 from app.modules.actions.schemas import ConfirmResult
+from app.modules.calendar import service as calendar_service
+from app.modules.calendar.schemas import CalendarEventResponse
 from app.modules.chat import context as context_module
 from app.modules.chat.models import ChatMessage
 from app.modules.chat.write_intent import WRITE_UNAVAILABLE_MESSAGE, detect_clear_write_intent
+from app.modules.life_areas import service as life_areas_service
 from app.modules.memory import service as memory_service
 from app.modules.memory.models import Memory
 from app.modules.orchestrator import service as orchestrator_service
@@ -124,6 +127,58 @@ _PROPOSE_DELETE_TASK_TOOL = {
     },
 }
 
+_PROPOSE_CREATE_EVENT_TOOL = {
+    "name": "propose_create_event",
+    "description": (
+        "Propose creating a new CalendarEvent — something occurring at a scheduled "
+        "time or time window (a meeting, appointment, or reserved block of time). "
+        "Use propose_create_task instead for something the user needs to do or "
+        "complete with no inherent scheduled time window. Never propose both a "
+        "task and an event for the same single request. If the user clearly "
+        "describes a duration-based event (a meeting, appointment, or scheduled "
+        "session) but gives only a start time with no end time or duration, do "
+        "NOT call this tool yet — ask a brief clarification question instead "
+        "(e.g. \"What time does it finish?\"); only call this tool once you "
+        "actually know when it ends, or once it's clear the user means a single "
+        "point in time with no meaningful duration. This does NOT create the "
+        "event — it only records a proposal that the user must explicitly "
+        "confirm before anything is actually created."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string", "description": "The event's title."},
+            "description": {"type": "string", "description": "Optional longer description."},
+            "starts_at": {
+                "type": "string",
+                "description": (
+                    "Required. A timezone-aware ISO 8601 instant with an explicit UTC "
+                    "offset, e.g. 2026-09-28T11:00:00+03:00 — the offset must match the "
+                    "user's own current UTC offset shown below, resolved from their stated "
+                    "local time. Never a naive/offset-less string."
+                ),
+            },
+            "ends_at": {
+                "type": "string",
+                "description": (
+                    "Optional. Only include once you actually know when the event ends — "
+                    "same timezone-aware ISO 8601 format with an explicit UTC offset as "
+                    "starts_at, e.g. 2026-09-28T12:00:00+03:00. Omit entirely for a "
+                    "genuine single point in time; never invent a duration."
+                ),
+            },
+            "life_area_id": {
+                "type": "integer",
+                "description": (
+                    "Optional id of an existing life area to assign the event to — only "
+                    "use an id that actually appears in Current Data below."
+                ),
+            },
+        },
+        "required": ["title", "starts_at"],
+    },
+}
+
 _PROPOSE_SAVE_MEMORY_TOOL = {
     "name": "propose_save_memory",
     "description": (
@@ -219,7 +274,7 @@ _GET_WEATHER_TOOL = {
 
 _TOOLS_OFFERED = [
     _PROPOSE_CREATE_TASK_TOOL, _PROPOSE_UPDATE_TASK_TOOL, _PROPOSE_DELETE_TASK_TOOL,
-    _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
+    _PROPOSE_CREATE_EVENT_TOOL, _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
 ]
 
 # Used by _describe_pending_proposal to tell the model which tool to call
@@ -228,6 +283,7 @@ _ACTION_TYPE_TOOL_NAMES = {
     "create_task": "propose_create_task",
     "update_task": "propose_update_task",
     "delete_task": "propose_delete_task",
+    "create_event": "propose_create_event",
     "save_memory": "propose_save_memory",
     "forget_memory": "propose_forget_memory",
 }
@@ -426,6 +482,22 @@ def _trim_to_char_budget(messages: list[ChatMessage], max_chars: int) -> list[Hi
     return list(reversed(kept))
 
 
+def _format_utc_offset(local_dt: datetime) -> str:
+    """Numeric, colon-separated UTC offset (e.g. "+03:00", "-05:00"),
+    computed fresh from the timezone-aware datetime's own utcoffset() —
+    never a fixed value, so a DST-observing zone reports whichever
+    offset is actually in effect for THIS instant, not a year-round
+    constant. strftime's own "%z" produces "+0300" (no colon, and not
+    every ISO 8601 consumer expects that shape) — this is deliberately
+    hand-formatted instead.
+    """
+    offset = local_dt.utcoffset()
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "+" if total_minutes >= 0 else "-"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    return f"{sign}{hours:02d}:{minutes:02d}"
+
+
 def _compute_current_datetime_local(timezone_name: str) -> str:
     """The server computes its own trustworthy current instant
     (datetime.now(timezone.utc)) and only trusts the CLIENT for which
@@ -434,13 +506,29 @@ def _compute_current_datetime_local(timezone_name: str) -> str:
     silent fallback would make the model confidently resolve "tomorrow"
     against the wrong day with no visible signal that anything was
     wrong).
+
+    Checkpoint 3.15: also exposes the IANA timezone name and the
+    numeric UTC offset EXPLICITLY, as their own labeled facts — the
+    3.14 inspection found the model previously received only a local
+    wall-clock string with an abbreviated zone code (e.g. "EEST"),
+    with no explicit IANA name or numeric offset to reason from, which
+    is exactly what a timezone-aware starts_at/ends_at needs to be
+    produced reliably. The offset is computed fresh from THIS instant's
+    own utcoffset() (see _format_utc_offset) — never a fixed value —
+    so it is correct across a DST transition without any special-casing
+    here; timezone_name is the caller's own already-resolved request
+    parameter, never inferred or guessed from anything else.
     """
     try:
         zone = ZoneInfo(timezone_name)
     except ZoneInfoNotFoundError as exc:
         raise InvalidTimezoneError(timezone_name) from exc
     local_now = datetime.now(timezone.utc).astimezone(zone)
-    return local_now.strftime("%A, %Y-%m-%d %H:%M %Z")
+    return (
+        f"Current local datetime: {local_now.strftime('%A, %Y-%m-%d %H:%M')}\n"
+        f"Timezone: {timezone_name}\n"
+        f"UTC offset: {_format_utc_offset(local_now)}"
+    )
 
 
 def _classify_narrow_yes_no(content: str) -> str | None:
@@ -615,6 +703,77 @@ def _render_delete_task_confirmation(task_title: str, user_message: str) -> str:
     return f'I can remove "{task_title}" from your tasks — there\'s no way to bring it back in BAZRA right now. Shall I go ahead?'
 
 
+# Deterministic, locale-independent month names (Checkpoint 3.15) —
+# NOT strftime's %B, which depends on the running system/container's
+# locale data being installed and correctly configured; an explicit,
+# fixed list guarantees the SAME confirmation text everywhere this code
+# runs, exactly the same "no locale/strftime dependency" discipline
+# _format_due_at_local already applies by avoiding month names entirely.
+_MONTH_NAMES_EN = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+_MONTH_NAMES_AR = [
+    "يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو",
+    "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر",
+]
+
+
+def _format_event_date_local(local_dt: datetime, arabic: bool) -> str:
+    month_name = (_MONTH_NAMES_AR if arabic else _MONTH_NAMES_EN)[local_dt.month - 1]
+    return f"{local_dt.day} {month_name}" if arabic else f"{month_name} {local_dt.day}"
+
+
+def _format_event_time_local(local_dt: datetime, arabic: bool) -> str:
+    """12-hour clock — deliberately different from _format_due_at_local's
+    24-hour convention: this checkpoint's own approved confirmation
+    example ("11:00 AM–12:00 PM" / natural Arabic) calls for a more
+    conversational rendering than Task's existing numeric style, which
+    this function does not touch or share.
+    """
+    hour = local_dt.hour % 12
+    hour = 12 if hour == 0 else hour
+    period = ("ص" if local_dt.hour < 12 else "م") if arabic else ("AM" if local_dt.hour < 12 else "PM")
+    return f"{hour}:{local_dt.minute:02d} {period}"
+
+
+def _render_create_event_confirmation(
+    arguments: dict, timezone_name: str, user_message: str, life_area_name: str | None,
+) -> str:
+    """Checkpoint 3.15 — same discipline as every other _render_*_confirmation:
+    built ONLY from these already-validated arguments (starts_at/ends_at
+    are always timezone-aware ISO strings here, guaranteed by
+    ProposedCalendarEventCreate's own validator) plus the Life Area's
+    CURRENT name (resolved by the caller, never restated by the model) —
+    never from the model's own free-form reply text. Converts to the
+    SAME IANA timezone this request already resolved current_datetime_
+    local against — never a hardcoded zone, never the raw UTC instant
+    shown to the user.
+    """
+    title = arguments["title"]
+    zone = ZoneInfo(timezone_name)
+    starts_local = datetime.fromisoformat(arguments["starts_at"]).astimezone(zone)
+    arabic = _is_arabic(user_message)
+
+    date_str = _format_event_date_local(starts_local, arabic)
+    start_time_str = _format_event_time_local(starts_local, arabic)
+
+    ends_at_iso = arguments.get("ends_at")
+    if ends_at_iso:
+        ends_local = datetime.fromisoformat(ends_at_iso).astimezone(zone)
+        end_time_str = _format_event_time_local(ends_local, arabic)
+        time_str = f"{start_time_str}–{end_time_str}"
+    else:
+        time_str = start_time_str
+
+    area_clause_en = f", under {life_area_name}" if life_area_name else ""
+    area_clause_ar = f"، تحت {life_area_name}" if life_area_name else ""
+
+    if arabic:
+        return f'هضيف "{title}" يوم {date_str}، الساعة {time_str}{area_clause_ar}. أضيفها؟'
+    return f'I can add "{title}" on {date_str}, {time_str}{area_clause_en}. Add it?'
+
+
 def _render_save_memory_confirmation(arguments: dict, user_message: str) -> str:
     """Same discipline as _render_create_task_confirmation: built ONLY
     from the validated arguments that will be stored/executed, never
@@ -764,6 +923,8 @@ def _reply_for_confirm_result(result: ConfirmResult) -> str:
             if result.task_action == "deleted":
                 return f'Done — I\'ve removed the task "{result.task.title}".'
             return f'Done — I\'ve created the task "{result.task.title}".'
+        if result.event is not None:
+            return f'Done — I\'ve added "{result.event.title}" to your calendar.'
         if result.memory is not None:
             if result.memory.status == "forgotten":
                 return "Done — I've forgotten that."
@@ -872,6 +1033,54 @@ def _handle_delete_task_proposal(
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
     actions_service.create_pending_action(
         db, space_id, user_id, assistant_message.id, "delete_task", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
+def _require_existing_life_area(db: Session, action_type: str, life_area_id: int):
+    """Checkpoint 3.15 — the same DB-lookup discipline as
+    _require_existing_task, adapted for LifeArea's own model: LifeArea
+    has no SpaceScopedMixin at all (see life_areas/models.py's own
+    docstring — it's deliberately global, not per-space), so there is no
+    per-space ownership check to perform, only a real-vs-nonexistent
+    one — the same check the direct REST routers already perform via
+    their own _validate_life_area. A None result becomes the SAME
+    InvalidActionArgumentsError as every other invalid reference, before
+    any proposal is created.
+    """
+    area = life_areas_service.get_life_area(db, life_area_id)
+    if area is None:
+        raise actions_service.InvalidActionArgumentsError(
+            action_type, f"life_area_id {life_area_id} does not exist"
+        )
+    return area
+
+
+def _handle_create_event_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("create_event", arguments)
+        life_area_id = validated.get("life_area_id")
+        life_area = (
+            _require_existing_life_area(db, "create_event", life_area_id) if life_area_id is not None else None
+        )
+    except actions_service.InvalidActionArgumentsError:
+        # Covers a missing title/starts_at, a naive starts_at/ends_at,
+        # ends_at before starts_at, and an unknown life_area_id — all
+        # collapse into the same "nothing valid to propose yet" fallback,
+        # never a malformed pending ProposedAction.
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    reply_text = _render_create_event_confirmation(
+        validated, timezone_name, user_message_content, life_area.name if life_area else None,
+    )
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "create_event", validated, commit=False,
     )
     db.commit()
     db.refresh(assistant_message)
@@ -993,6 +1202,7 @@ _TOOL_HANDLERS = {
     "propose_create_task": _handle_create_task_proposal,
     "propose_update_task": _handle_update_task_proposal,
     "propose_delete_task": _handle_delete_task_proposal,
+    "propose_create_event": _handle_create_event_proposal,
     "propose_save_memory": _handle_save_memory_proposal,
     "propose_forget_memory": _handle_forget_memory_proposal,
     "get_weather": _handle_get_weather,

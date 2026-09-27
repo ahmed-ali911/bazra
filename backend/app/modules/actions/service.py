@@ -7,6 +7,9 @@ from sqlalchemy.orm import Session
 
 from app.modules.actions.models import ProposedAction
 from app.modules.actions.schemas import ConfirmResult
+from app.modules.calendar import service as calendar_service
+from app.modules.calendar.schemas import CalendarEventResponse, ProposedCalendarEventCreate
+from app.modules.life_areas import service as life_areas_service
 from app.modules.memory import service as memory_service
 from app.modules.memory.schemas import MemoryCreate, MemoryForget, MemoryResponse
 from app.modules.tasks import service as tasks_service
@@ -23,6 +26,7 @@ _ACTION_ARGUMENT_SCHEMAS: dict[str, type[PydanticBaseModel]] = {
     "forget_memory": MemoryForget,
     "update_task": ProposedTaskUpdate,
     "delete_task": ProposedTaskDelete,
+    "create_event": ProposedCalendarEventCreate,
 }
 
 
@@ -265,6 +269,30 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             proposal.executed_task_id = task.id
             db.commit()
             return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="deleted")
+
+        if proposal.action_type == "create_event":
+            # Re-parsed through the SAME ProposedCalendarEventCreate
+            # schema used at proposal time (not the plain
+            # CalendarEventCreate) — timezone-awareness and range are
+            # revalidated here too, not merely trusted from proposal
+            # time, the same "re-parse, don't just trust" discipline as
+            # every other branch above. life_area_id (if present) is the
+            # only meaningful execution-time race for a brand-new row:
+            # there is no existing target that could have been archived
+            # or reassigned, only a referenced Life Area that could have
+            # been deleted between proposal and confirmation.
+            event_data = ProposedCalendarEventCreate(**proposal.arguments)
+            if event_data.life_area_id is not None:
+                if life_areas_service.get_life_area(db, event_data.life_area_id) is None:
+                    raise RuntimeError(f"life_area_id {event_data.life_area_id} no longer exists")
+            event = calendar_service.create_calendar_event(db, space_id, event_data)
+            proposal.status = "executed"
+            # No executed_event_id column exists on ProposedAction (adding
+            # one would be a migration, out of this checkpoint's scope) —
+            # ConfirmResult.event below is the only record of which
+            # CalendarEvent this proposal produced.
+            db.commit()
+            return ConfirmResult(outcome="executed", event=CalendarEventResponse.model_validate(event))
 
         if proposal.action_type == "save_memory":
             memory_data = MemoryCreate(**proposal.arguments)

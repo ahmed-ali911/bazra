@@ -18,6 +18,48 @@ class CalendarEventCreate(BaseModel):
         return self
 
 
+class ProposedCalendarEventCreate(CalendarEventCreate):
+    """Checkpoint 3.15 — the model-facing argument shape for
+    propose_create_event: identical fields to CalendarEventCreate
+    (title, description, starts_at, ends_at, life_area_id), plus one
+    additional requirement that applies ONLY to a Chat-originated
+    proposal: starts_at, and ends_at when present, must be
+    timezone-aware instants. The direct REST CalendarEventCreate is
+    deliberately left untouched by this subclass — a naive datetime
+    posted directly to POST /calendar/events remains exactly as
+    permitted as before this checkpoint, since that's an unrelated,
+    pre-existing API behavior this checkpoint must not change. Only the
+    Chat/ProposedAction path gets the extra guarantee, because a
+    model-supplied naive instant has no reliable way to be corrected
+    before it's stored, and a wrong instant is a real created event a
+    user must notice and undo manually — a materially different risk
+    than a REST caller who controls their own request.
+    """
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "ProposedCalendarEventCreate":
+        """Overrides (not merely adds to) CalendarEventCreate's own
+        same-named validator — deliberately: Pydantic v2 runs an
+        inherited "after" validator BEFORE a subclass's own differently-
+        named one, and the base class's plain `self.ends_at <
+        self.starts_at` comparison raises a raw, unhandled TypeError
+        (not a clean ValidationError) when either side is naive — e.g. a
+        timezone-aware starts_at against a naive ends_at. Overriding the
+        same method name replaces the parent's check entirely for this
+        subclass only (CalendarEventCreate itself, and REST, are
+        untouched), so the timezone-awareness check always runs first,
+        and the range comparison below only ever runs once both sides
+        are already confirmed timezone-aware.
+        """
+        if self.starts_at.tzinfo is None:
+            raise ValueError("starts_at must be a timezone-aware instant (with an explicit UTC offset)")
+        if self.ends_at is not None and self.ends_at.tzinfo is None:
+            raise ValueError("ends_at must be a timezone-aware instant (with an explicit UTC offset)")
+        if self.ends_at is not None and self.ends_at < self.starts_at:
+            raise ValueError("ends_at must be >= starts_at")
+        return self
+
+
 class CalendarEventUpdate(BaseModel):
     """All fields optional, applied with exclude_unset=True — same partial-
     update convention as TaskUpdate. ends_at >= starts_at is validated in

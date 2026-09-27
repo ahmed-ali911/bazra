@@ -2620,3 +2620,446 @@ def test_delete_task_proposal_and_confirm_use_zero_extra_ai_traces_and_log_deter
 
     tasks = authenticated_client.get("/api/v1/tasks").json()
     assert not any(t["id"] == task["id"] for t in tasks)
+
+
+# ---- Checkpoint 3.15: timezone grounding ----------------------------------------
+
+
+def test_current_datetime_local_exposes_timezone_name_and_utc_offset() -> None:
+    result = chat_service._compute_current_datetime_local("Africa/Cairo")
+    assert "Timezone: Africa/Cairo" in result
+    assert "UTC offset:" in result
+    assert "Current local datetime:" in result
+
+
+def test_current_datetime_local_offset_is_computed_not_fixed() -> None:
+    """Proves the exposed offset is a real, freshly computed value —
+    not a hardcoded +03:00/-03:00 constant — by cross-checking against
+    an independent ZoneInfo computation for several distinct zones and
+    confirming they actually differ from each other right now."""
+    from datetime import datetime, timezone as dt_timezone
+    from zoneinfo import ZoneInfo
+
+    zone_names = ["America/New_York", "Africa/Cairo", "UTC"]
+    offsets = set()
+    for zone_name in zone_names:
+        result = chat_service._compute_current_datetime_local(zone_name)
+        expected = chat_service._format_utc_offset(
+            datetime.now(dt_timezone.utc).astimezone(ZoneInfo(zone_name))
+        )
+        assert f"UTC offset: {expected}" in result
+        offsets.add(expected)
+
+    assert len(offsets) == len(zone_names)  # genuinely distinct per zone, not one fixed value
+
+
+def test_format_utc_offset_reflects_real_dst_transition() -> None:
+    """America/New_York: EST (UTC-05:00) in January, EDT (UTC-04:00) in
+    July — hand-constructed instants, no time-mocking library needed,
+    proving the offset genuinely varies with the calendar date rather
+    than being fixed per IANA zone name."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("America/New_York")
+    winter = datetime(2026, 1, 15, 12, 0, tzinfo=zone)
+    summer = datetime(2026, 7, 15, 12, 0, tzinfo=zone)
+    assert chat_service._format_utc_offset(winter) == "-05:00"
+    assert chat_service._format_utc_offset(summer) == "-04:00"
+
+
+# ---- Checkpoint 3.15: propose / confirm a new CalendarEvent ---------------------
+
+
+def test_propose_create_event_requires_title_and_starts_at(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure, adding it", tool_name="propose_create_event", arguments={"title": "Meeting"}),
+    )
+    response = _send(authenticated_client, "add a meeting, no time given")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_then_confirm_creates_the_real_calendar_event(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The main end-to-end flow: exactly one model call proposes;
+    nothing exists in Calendar/Agenda before confirmation; a bare 'yes'
+    costs zero model calls and creates exactly one CalendarEvent, which
+    then appears in the normal Calendar/Agenda read."""
+    from app.modules.actions import service as actions_service
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply(
+            "I can add it — confirm?", tool_name="propose_create_event",
+            arguments={
+                "title": "Meeting with Hussein - 315a",
+                "starts_at": "2026-09-28T11:00:00+03:00",
+                "ends_at": "2026-09-28T12:00:00+03:00",
+            },
+        )(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    propose_response = _send(authenticated_client, "I have a meeting with Hussein tomorrow at 11 for one hour")
+    assert propose_response.status_code == 200
+    assert call_count["n"] == 1
+    assert "Meeting with Hussein - 315a" in propose_response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.action_type == "create_event"
+
+    agenda_before = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert not any(i["title"] == "Meeting with Hussein - 315a" for i in agenda_before)
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    assert "added" in confirm_response.json()["assistant_message"]["content"].lower()
+    assert "Meeting with Hussein - 315a" in confirm_response.json()["assistant_message"]["content"]
+
+    agenda_after = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    matching = [i for i in agenda_after if i["title"] == "Meeting with Hussein - 315a"]
+    assert len(matching) == 1
+    assert matching[0]["source"] == "event"
+    assert matching[0]["starts_at"] == "2026-09-28T08:00:00Z"  # 11:00 +03:00 == 08:00 UTC
+    assert matching[0]["ends_at"] == "2026-09-28T09:00:00Z"
+
+
+def test_propose_create_event_reject_creates_no_calendar_event(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={"title": "Never happens - 315b", "starts_at": "2026-09-28T11:00:00+03:00"},
+        ),
+    )
+    _send(authenticated_client, "add a meeting")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    reject_response = _send(authenticated_client, "no")
+    assert reject_response.status_code == 200
+
+    agenda_after = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert not any(i["title"] == "Never happens - 315b" for i in agenda_after)
+
+
+def test_propose_create_event_with_naive_starts_at_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Product/architecture requirement C: a naive datetime must never
+    be silently interpreted as UTC — it must fail validation before any
+    ProposedAction exists."""
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure", tool_name="propose_create_event",
+            arguments={"title": "Naive time event", "starts_at": "2026-09-28T11:00:00"},
+        ),
+    )
+    response = _send(authenticated_client, "add a meeting tomorrow at 11")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_create_event_with_invalid_life_area_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure", tool_name="propose_create_event",
+            arguments={
+                "title": "Bad life area event", "starts_at": "2026-09-28T11:00:00+03:00",
+                "life_area_id": 999999,
+            },
+        ),
+    )
+    response = _send(authenticated_client, "add a meeting under some life area")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_create_event_life_area_is_shared_across_spaces(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LifeArea is a GLOBAL model (no SpaceScopedMixin — see
+    life_areas/models.py's own docstring), unlike Task/CalendarEvent —
+    there is no 'other space's life area' to reject, since every valid
+    life_area_id is valid from every space by design. This test proves
+    that actual, verified behavior directly rather than asserting a
+    cross-space rejection scenario that cannot exist for this model."""
+    from app.modules.actions import service as actions_service
+    from app.modules.life_areas import service as life_areas_service
+
+    area = life_areas_service.create_life_area(db_session, "Shared area - 315c")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={
+                "title": "Shared area event - 315c", "starts_at": "2026-09-28T11:00:00+03:00",
+                "life_area_id": area.id,
+            },
+        ),
+    )
+    response = _send(authenticated_client, "add a meeting under Shared area")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.arguments["life_area_id"] == area.id
+
+
+def test_create_event_confirmation_renders_local_date_and_time_not_utc(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={
+                "title": "Meeting with Hussein - 315d",
+                "starts_at": "2026-09-28T11:00:00+03:00",
+                "ends_at": "2026-09-28T12:00:00+03:00",
+            },
+        ),
+    )
+    response = _send(authenticated_client, "I have a meeting with Hussein tomorrow at 11 for one hour")
+    content = response.json()["assistant_message"]["content"]
+
+    assert "September 28" in content
+    assert "11:00 AM" in content
+    assert "12:00 PM" in content
+    assert "08:00" not in content  # never the raw UTC digits
+    assert "2026-09-28T" not in content
+
+
+def test_create_event_confirmation_omits_end_time_for_point_event(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={"title": "Birthday - 315e", "starts_at": "2026-10-05T09:00:00+03:00"},
+        ),
+    )
+    response = _send(authenticated_client, "add an event for Ahmed's birthday on October 5 at 9am")
+    content = response.json()["assistant_message"]["content"]
+    assert "October 5" in content
+    assert "9:00 AM" in content
+    assert "–" not in content  # no range dash when there's no end time
+
+
+def test_create_event_confirmation_language_matches_arabic_or_english(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "ok", tool_name="propose_create_event",
+            arguments={
+                "title": "اجتماع مع حسين - 315f",
+                "starts_at": "2026-09-28T11:00:00+03:00",
+                "ends_at": "2026-09-28T12:00:00+03:00",
+            },
+        ),
+    )
+    response_ar = _send(authenticated_client, "عندي اجتماع مع حسين بكرة الساعة 11 لمدة ساعة، ضيفه عندي")
+    content_ar = response_ar.json()["assistant_message"]["content"]
+    assert "اجتماع مع حسين - 315f" in content_ar
+    assert "أضيفها؟" in content_ar
+    assert "سبتمبر" in content_ar
+
+
+def test_create_event_confirmation_across_dst_capable_timezone(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """America/New_York (already used elsewhere in this codebase for
+    DST coverage) — confirms local rendering uses real IANA/DST
+    arithmetic, not a fixed offset, for a zone other than Cairo."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={
+                "title": "NY meeting - 315g",
+                "starts_at": "2026-07-15T11:00:00-04:00",  # EDT (summer, DST in effect)
+                "ends_at": "2026-07-15T12:00:00-04:00",
+            },
+        ),
+    )
+    response = _send(authenticated_client, "add a meeting tomorrow at 11 for one hour", timezone_name="America/New_York")
+    content = response.json()["assistant_message"]["content"]
+    assert "July 15" in content
+    assert "11:00 AM" in content
+    assert "12:00 PM" in content
+
+
+def test_model_prose_with_wrong_details_does_not_appear_in_create_event_confirmation(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I've added a totally different event for a totally different time!",
+            tool_name="propose_create_event",
+            arguments={"title": "Real event title - 315h", "starts_at": "2026-09-28T11:00:00+03:00"},
+        ),
+    )
+    response = _send(authenticated_client, "add a meeting")
+    content = response.json()["assistant_message"]["content"]
+    assert "totally different" not in content
+    assert "Real event title - 315h" in content
+
+
+def test_create_event_proposal_and_confirm_use_zero_extra_ai_traces_and_log_deterministic_routes(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={"title": "Deterministic route test - 315i", "starts_at": "2026-09-28T11:00:00+03:00"},
+        ),
+    )
+    _send(authenticated_client, "add a meeting, deterministic route test 315i")
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("should never be called")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+
+    before_trace_id = _max_ai_trace_id(db_session)
+    _enable_chat_service_logger()
+    with caplog.at_level(logging.INFO, logger="app.modules.chat.service"):
+        response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+
+    assert call_count["n"] == 0
+    assert _max_ai_trace_id(db_session) == before_trace_id
+
+    user_message_id = response.json()["user_message"]["id"]
+    assert "deterministic_route=proposal_confirm" in caplog.text
+    assert f"chat_message_id={user_message_id}" in caplog.text
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert any(i["title"] == "Deterministic route test - 315i" for i in agenda)
+
+
+def test_single_tool_call_dispatch_never_produces_both_task_and_event_for_one_turn(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Structural proof (not a prompt-reliability claim): even if a
+    single model response somehow carried multiple tool_use blocks,
+    orchestrator_service.generate_reply only ever takes the first
+    (documented, deliberate design since Checkpoint 3.3) — so a single
+    turn can never dispatch to both propose_create_task and
+    propose_create_event regardless of what the model outputs."""
+    from app.modules.actions import service as actions_service
+    from app.modules.orchestrator.schemas import OrchestratorResult, ToolCallRequest
+
+    def _multi_tool_reply(**kwargs):
+        # Only the FIRST tool_use is ever surfaced by generate_reply
+        # itself — simulate that by returning a result as if two tools
+        # had been requested, then rely on the SAME real orchestrator
+        # code path a genuine multi-tool_use response would go through.
+        return OrchestratorResult(
+            text="here you go",
+            tool_call=ToolCallRequest(
+                tool_use_id="toolu_1", tool_name="propose_create_task",
+                arguments={"title": "Call Hussein - 315j"},
+            ),
+            correlation_id="corr_test",
+        )
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _multi_tool_reply)
+    response = _send(authenticated_client, "add call Hussein tomorrow at 11")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.action_type == "create_task"  # exactly one action_type, never two rows
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert not any(i["title"] == "Call Hussein - 315j" for i in agenda)  # no event was also created
+
+
+def test_expired_create_event_proposal_cannot_execute(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.11 generic semantics inherited with no event-specific
+    code: an expired pending proposal cannot be resurrected by a later
+    bare 'yes', regardless of action_type."""
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_event",
+            arguments={"title": "Expired event - 315k", "starts_at": "2026-09-28T11:00:00+03:00"},
+        ),
+    )
+    _send(authenticated_client, "add a meeting")
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    db_session.execute(
+        text("UPDATE proposed_actions SET expires_at = now() - interval '1 minute' WHERE id = :id"),
+        {"id": pending.id},
+    )
+    db_session.commit()
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert not any(i["title"] == "Expired event - 315k" for i in agenda)

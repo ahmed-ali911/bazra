@@ -32,8 +32,17 @@ import re
 # this list and still decline exactly as before — this checkpoint only
 # narrows what already-implemented capability (Task) is exempted, it
 # does not touch the unimplemented ones.
+#
+# Checkpoint 3.15: CalendarEvent CREATION similarly narrowed — "event"
+# and "meeting" (and their Arabic equivalents "حدث"/"موعد") dropped from
+# the create noun list, the same precedent as every narrowing above, so
+# that phrasing now reaches the Orchestrator, which may offer
+# propose_create_event. "reminder"/"تذكير" deliberately stays declined —
+# reminders/notifications remain an unimplemented, out-of-scope concept
+# distinct from a CalendarEvent. Calendar/meeting/reminder DELETION
+# (previous paragraph) and Life-Area create/edit/delete are unaffected.
 _WRITE_INTENT_PATTERNS_EN = [
-    re.compile(r"\b(create|add|schedule|make)\b.{0,40}\b(event|meeting|reminder)\b", re.IGNORECASE),
+    re.compile(r"\b(create|add|schedule|make)\b.{0,40}\breminder\b", re.IGNORECASE),
     re.compile(r"\b(delete|remove|cancel)\b.{0,40}\b(event|meeting|reminder|life area)\b", re.IGNORECASE),
     re.compile(r"\b(update|edit|change|reschedule|rename|move)\b.{0,40}\b(life area)\b", re.IGNORECASE),
 ]
@@ -45,7 +54,7 @@ _WRITE_INTENT_PATTERNS_EN = [
 # English; this is a real, stated limitation, not a solved problem.
 # Flagged for native-speaker review before this ships to real usage.
 _WRITE_INTENT_PATTERNS_AR = [
-    re.compile(r"(ضيف|أضف|اضافة|سجل)\s+.{0,20}(حدث|موعد|تذكير)"),
+    re.compile(r"(ضيف|أضف|اضافة|سجل)\s+.{0,20}تذكير"),
     re.compile(r"(احذف|امسح|الغاء|إلغاء)\s+.{0,20}(حدث|موعد|تذكير)"),
     re.compile(r"(عدل|غير|غيّر)\s+.{0,20}(حدث|موعد)"),
 ]

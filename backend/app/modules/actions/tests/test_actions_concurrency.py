@@ -230,3 +230,85 @@ def test_two_concurrent_delete_task_confirmations_result_in_exactly_one_executio
         assert second_attempt.outcome == "nothing_pending"  # no duplicate execution possible after the fact
     finally:
         verify_session.close()
+
+
+def test_two_concurrent_create_event_confirmations_result_in_exactly_one_calendar_event(
+    db_session: Session,
+) -> None:
+    """Checkpoint 3.15: the SAME real-Postgres row-lock proof, for the
+    new create_event action_type. No executed_event_id FK column exists
+    on ProposedAction (adding one would be a migration, out of scope),
+    so success is verified by ProposedAction.status plus counting the
+    matching CalendarEvent rows directly — the same "one execution
+    wins, exactly one domain row results" guarantee, just checked
+    through the row itself rather than a FK back-reference.
+    """
+    from app.modules.calendar import service as calendar_service
+
+    SessionLocal = sessionmaker(bind=db_session.get_bind())
+
+    user = auth_service.get_the_user(db_session)
+    if user is None:
+        user = User(password_hash=auth_service.hash_password("owner-fixture-password"))
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    space = spaces_service.get_or_create_default_space_for_user(db_session, user.id)
+
+    source_message = chat_service.record_assistant_message(
+        db_session, space.id, user.id, "concurrency create_event test proposal"
+    )
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_message.id, "create_event",
+        {"title": "Concurrent create-event test", "starts_at": "2026-09-28T11:00:00+03:00"},
+    )
+    space_id, user_id = space.id, user.id
+
+    results: list = [None, None]
+
+    def _attempt(index: int) -> None:
+        session: Session = SessionLocal()
+        try:
+            results[index] = actions_service.confirm_and_execute(session, space_id, user_id)
+        finally:
+            session.close()
+
+    t1 = threading.Thread(target=_attempt, args=(0,))
+    t2 = threading.Thread(target=_attempt, args=(1,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    outcomes = sorted(r.outcome for r in results)
+    assert outcomes == ["executed", "nothing_pending"], (
+        "exactly one concurrent confirmation attempt should execute; the other "
+        f"should observe nothing left pending (row-lock replay guard), got {outcomes}"
+    )
+
+    verify_session: Session = SessionLocal()
+    try:
+        proposal = (
+            verify_session.query(ProposedAction)
+            .filter(ProposedAction.source_chat_message_id == source_message.id)
+            .one()
+        )
+        assert proposal.status == "executed"
+
+        from datetime import datetime, timezone
+
+        events = calendar_service.build_agenda(
+            verify_session, space_id,
+            from_at=datetime(2026, 9, 28, tzinfo=timezone.utc),
+            to_at=datetime(2026, 9, 29, tzinfo=timezone.utc),
+        )
+        matching = [e for e in events if e.title == "Concurrent create-event test"]
+        assert len(matching) == 1, (
+            f"exactly one CalendarEvent should have been created despite two concurrent "
+            f"confirmation attempts, found {len(matching)}"
+        )
+
+        second_attempt = actions_service.confirm_and_execute(verify_session, space_id, user_id)
+        assert second_attempt.outcome == "nothing_pending"  # no duplicate execution possible after the fact
+    finally:
+        verify_session.close()

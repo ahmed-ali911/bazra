@@ -1,17 +1,18 @@
 from dataclasses import dataclass
 from typing import Literal
 
+from app.modules.calendar.schemas import CalendarEventResponse
 from app.modules.memory.schemas import MemoryResponse
 from app.modules.tasks.schemas import TaskResponse
 
 # Closed, code-level sets — plain strings at rest (matching Task.status/
 # AiTrace.purpose's own convention), not native DB enums. Extended in
 # Checkpoint 3.4 (save_memory, forget_memory), Checkpoint 3.10
-# (update_task), and Checkpoint 3.13 (delete_task) rather than accepting
-# an arbitrary string.
-ActionType = Literal["create_task", "save_memory", "forget_memory", "update_task", "delete_task"]
+# (update_task), Checkpoint 3.13 (delete_task), and Checkpoint 3.15
+# (create_event) rather than accepting an arbitrary string.
+ActionType = Literal["create_task", "save_memory", "forget_memory", "update_task", "delete_task", "create_event"]
 VALID_ACTION_TYPES: frozenset[str] = frozenset(
-    {"create_task", "save_memory", "forget_memory", "update_task", "delete_task"}
+    {"create_task", "save_memory", "forget_memory", "update_task", "delete_task", "create_event"}
 )
 
 # Deliberately no "failed" — see actions/service.py's
@@ -46,3 +47,4 @@ class ConfirmResult:
     task: TaskResponse | None = None
     memory: MemoryResponse | None = None
     task_action: Literal["created", "updated", "deleted"] | None = None
+    event: CalendarEventResponse | None = None

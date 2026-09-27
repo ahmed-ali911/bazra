@@ -204,12 +204,55 @@ def test_system_prompt_no_longer_claims_tasks_cannot_be_edited_or_marked_complet
     assert "you still cannot delete a task" not in prompt
 
 
-def test_system_prompt_still_declines_calendar_inbox_life_area_writes() -> None:
+def test_system_prompt_still_declines_calendar_edit_delete_and_inbox_life_area_writes() -> None:
     """The blanket 'not available yet' decline remains true for
-    Calendar/Inbox/Life Areas — only Task's own write capabilities
-    (create/update/delete) have ever been carved out of it."""
+    Calendar event edit/delete/mark-complete and for Inbox/Life Areas —
+    only Task's own write capabilities (create/update/delete) and,
+    since 3.15, CalendarEvent's own create capability have ever been
+    carved out of it."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
-    assert "for Calendar, Inbox, or Life Areas, say plainly that this isn't available yet" in prompt
+    assert "edit, delete, or mark complete an existing Calendar event" in prompt
+    assert "edit, delete, mark complete, or create anything for Inbox or Life Areas" in prompt
+    assert "say plainly that this isn't available yet" in prompt
+
+
+def test_system_prompt_describes_propose_create_event_as_a_proposal_not_an_execution() -> None:
+    """Checkpoint 3.15: the model must be told the tool call itself only
+    proposes creation (still requires explicit confirmation), following
+    the same MUST-call/NOT-a-substitute pattern as propose_create_task/
+    propose_update_task/propose_delete_task."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "propose_create_event" in prompt
+    assert "you MUST call the propose_create_event tool" in prompt
+    assert "This does NOT create the event — it only proposes it" in prompt
+
+
+def test_system_prompt_gives_task_vs_event_semantic_boundary() -> None:
+    """Checkpoint 3.15, Part K/F: a concise semantic rule, not a keyword
+    list — never propose both a task and an event for the same request."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "no inherent scheduled time window required" in prompt
+    assert "occurring at a scheduled time or time window" in prompt
+    assert "never propose both a task and an event for the same single request" in prompt.lower()
+
+
+def test_system_prompt_requires_clarification_for_missing_event_duration() -> None:
+    """Checkpoint 3.15, Part G: a duration-based event with only a start
+    time must get a clarification question, not a propose_create_event
+    call — model-facing semantic guidance, not a Python detector."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "do NOT call propose_create_event yet" in prompt
+    assert "ask a brief clarification question instead" in prompt
+    assert "Do not invent or assume a duration" in prompt
+
+
+def test_system_prompt_requires_explicit_utc_offset_for_event_times() -> None:
+    """Checkpoint 3.15, Part D: the model must be told to encode an
+    explicit UTC offset, using the current-datetime fact's own IANA
+    timezone/offset — never a fixed or omitted offset."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "timezone-aware ISO 8601 instants with an explicit UTC offset" in prompt
+    assert "Never omit the offset" in prompt
 
 
 def test_system_prompt_includes_current_datetime_anchor() -> None:

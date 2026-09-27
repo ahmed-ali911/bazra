@@ -537,6 +537,89 @@ new tool.
   deletion, physical row deletion, Calendar/Inbox/Life-Area deletion —
   the same deferral reasoning as 3.10's own list, one domain later.
 
+### Checkpoint 3.15
+
+Conversational CalendarEvent creation: `propose_create_event` — creates
+a new CalendarEvent (a meeting, appointment, or reserved block of
+time), distinguished from Task by a concise model-facing semantic rule
+(no keyword router): a Task is something to do or complete; a
+CalendarEvent occurs at a scheduled time or window. `CalendarEventCreate`
+is reused directly as the action-argument schema (no wrapper needed,
+same as `create_task`'s own `TaskCreate` reuse) via a new
+`ProposedCalendarEventCreate` subclass that adds exactly one extra
+requirement on top of it — see below. No migration.
+
+**Timezone-awareness, validated only on the Chat path.** The direct
+REST `POST /calendar/events` endpoint is completely unchanged — it
+still accepts a naive datetime exactly as before this checkpoint.
+`ProposedCalendarEventCreate` (`calendar/schemas.py`) subclasses
+`CalendarEventCreate` and overrides its own `_validate_range` validator
+(same method name, deliberately — Pydantic v2 runs an inherited "after"
+validator before a differently-named subclass one, and the base
+class's plain `ends_at < starts_at` comparison raises a raw `TypeError`,
+not a clean `ValidationError`, when either side is naive; overriding
+the same name guarantees the timezone-awareness check always runs
+first) to reject a naive `starts_at`/`ends_at` before any
+`ProposedAction` can exist. This is a real, tested asymmetry: Chat-
+created events are held to a stricter guarantee than the REST API,
+deliberately, since a model-supplied naive instant has no reliable way
+to be corrected before it's stored.
+
+**Model time grounding strengthened for every turn, not just Calendar.**
+The 3.14 inspection found the model previously received only a local
+wall-clock string with an abbreviated zone code (e.g. `"EEST"`) — no
+explicit IANA name, no numeric UTC offset. `chat/service.py`'s
+`_compute_current_datetime_local` now also states `Timezone: <IANA
+name>` and `UTC offset: <±HH:MM>` explicitly, computed fresh from the
+current instant via `ZoneInfo`/`astimezone` (never fixed, correct
+across a DST transition) — this is a Chat-wide grounding improvement,
+not Calendar-specific, and every existing `due_at`/task-reasoning use
+of "Current date/time" benefits from it too.
+
+**Missing duration/end time.** No default duration was invented. When
+the user clearly describes a duration-based event (meeting,
+appointment, scheduled session) but gives only a start time, the model
+is instructed to ask a brief clarification question and NOT call
+`propose_create_event` yet — pure system-prompt guidance, not a Python
+detector; a genuine point-in-time event (e.g. a birthday) still
+completes with `ends_at` left absent, unchanged from the existing
+domain semantics.
+
+**Confirmation wording** uses a natural month-name/12-hour format
+("September 28, 11:00 AM–12:00 PM") deliberately different from Task's
+existing numeric `DD/MM/YYYY 24h` style — month names are a fixed,
+hand-written list (`_MONTH_NAMES_EN`/`_MONTH_NAMES_AR`), never
+`strftime`'s locale-dependent `%B`, for the same determinism reason
+`_format_due_at_local` already avoids month names entirely. Never shows
+raw UTC; always converts through the request's own IANA timezone.
+
+**Life Area backlog note** (not fixed in this checkpoint, per explicit
+instruction): `chat/context.py`'s Life Areas section never exposes
+`life_area_id` to the model — only name/counts — despite
+`LifeAreaSummary` already carrying a real `id`. This was first found in
+the 3.14 inspection and already affects `propose_create_task`'s own
+`life_area_id` argument identically; `propose_create_event`'s
+`life_area_id` inherits the same limitation, unchanged. Also worth
+noting precisely: `LifeArea` itself is a **global**, not space-scoped,
+model (`life_areas/models.py` — `BaseModel` only, no
+`SpaceScopedMixin`) — there is no "other space's life area" to reject;
+any valid `life_area_id` is valid from every space by construction.
+
+Overlap/conflict semantics, all-day events, recurrence, and
+`update_event`/`delete_event` are all unaffected/out of scope — the
+existing Calendar domain's overlap-permitting behavior is preserved
+exactly as-is.
+
+Live-verified (real provider calls, 5 fixed trials, no mocking): an
+explicit English event request, a natural Arabic event request, a Task
+control request, a read-only control request, and a duration-missing
+event request — all five produced the expected tool selection (or
+correctly no tool call), with the duration-missing trial correctly
+producing a plain clarification question ("What time does it finish?")
+and no `ProposedAction`. Both real event-creation trials: exactly 1
+`AiTrace` on the propose turn, 0 on confirm, zero `CalendarEvent` rows
+before confirmation, exactly one afterward, at the correct UTC instant.
+
 ## Run locally (without Docker)
 
 ```bash

@@ -630,3 +630,172 @@ def test_reject_delete_task_proposal_leaves_task_active(db_session: Session, own
     db_session.refresh(task)
     assert task.archived_at is None
     assert tasks_service.get_task(db_session, space.id, task.id) is not None
+
+
+# ---- Checkpoint 3.15: create_event ---------------------------------------------------
+
+
+def test_validate_arguments_create_event_rejects_naive_starts_at(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments(
+            "create_event", {"title": "x", "starts_at": "2026-09-28T11:00:00"},
+        )
+
+
+def test_validate_arguments_create_event_rejects_naive_ends_at(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments(
+            "create_event",
+            {
+                "title": "x",
+                "starts_at": "2026-09-28T11:00:00+03:00",
+                "ends_at": "2026-09-28T12:00:00",
+            },
+        )
+
+
+def test_validate_arguments_create_event_rejects_end_before_start(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments(
+            "create_event",
+            {
+                "title": "x",
+                "starts_at": "2026-09-28T11:00:00+03:00",
+                "ends_at": "2026-09-28T10:00:00+03:00",
+            },
+        )
+
+
+def test_validate_arguments_create_event_accepts_valid_timezone_aware_arguments(db_session: Session) -> None:
+    validated = actions_service.validate_arguments(
+        "create_event",
+        {
+            "title": "Meeting with Hussein",
+            "starts_at": "2026-09-28T11:00:00+03:00",
+            "ends_at": "2026-09-28T12:00:00+03:00",
+        },
+    )
+    assert validated["title"] == "Meeting with Hussein"
+    assert validated["starts_at"] == "2026-09-28T11:00:00+03:00"
+    assert validated["ends_at"] == "2026-09-28T12:00:00+03:00"
+
+
+def test_validate_arguments_create_event_accepts_a_point_event_with_no_ends_at(db_session: Session) -> None:
+    """A genuine point-like event (Product decision 6) — ends_at simply
+    absent, not an error."""
+    validated = actions_service.validate_arguments(
+        "create_event", {"title": "Birthday", "starts_at": "2026-09-28T11:00:00+03:00"},
+    )
+    assert "ends_at" not in validated
+
+
+def test_confirm_and_execute_dispatches_create_event_creates_exactly_one_calendar_event(
+    db_session: Session, owner,
+) -> None:
+    from app.modules.calendar import service as calendar_service
+
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_event",
+        {
+            "title": "Meeting with Hussein - actions315a",
+            "description": "Quarterly sync",
+            "starts_at": "2026-09-28T11:00:00+03:00",
+            "ends_at": "2026-09-28T12:00:00+03:00",
+        },
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event is not None
+    assert result.event.title == "Meeting with Hussein - actions315a"
+    assert result.event.description == "Quarterly sync"
+    assert result.event.starts_at == datetime(2026, 9, 28, 11, 0, tzinfo=timezone(timedelta(hours=3)))
+    assert result.event.ends_at == datetime(2026, 9, 28, 12, 0, tzinfo=timezone(timedelta(hours=3)))
+
+    events = calendar_service.build_agenda(
+        db_session, space.id, datetime(2026, 9, 28, tzinfo=timezone.utc), datetime(2026, 9, 29, tzinfo=timezone.utc),
+    )
+    matching = [e for e in events if e.title == "Meeting with Hussein - actions315a"]
+    assert len(matching) == 1
+
+
+def test_confirm_and_execute_create_event_with_point_in_time_preserves_ends_at_none(
+    db_session: Session, owner,
+) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_event",
+        {"title": "Point event - actions315b", "starts_at": "2026-09-28T11:00:00+03:00"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event.ends_at is None
+
+
+def test_confirm_and_execute_create_event_with_valid_life_area_accepted(db_session: Session, owner) -> None:
+    from app.modules.life_areas import service as life_areas_service
+
+    user, space = owner
+    area = life_areas_service.create_life_area(db_session, "Work - actions315c")
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_event",
+        {"title": "Work meeting - actions315c", "starts_at": "2026-09-28T11:00:00+03:00", "life_area_id": area.id},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event.life_area_id == area.id
+
+
+def test_confirm_and_execute_create_event_life_area_deleted_between_proposal_and_confirmation_rolls_back(
+    db_session: Session, owner,
+) -> None:
+    """Execution-time race (3.15 design report Part O): the referenced
+    Life Area is deleted after the proposal was created but before it's
+    confirmed — execution must fail safely, not silently create the
+    event with a dangling life_area_id."""
+    from app.modules.life_areas import service as life_areas_service
+
+    user, space = owner
+    area = life_areas_service.create_life_area(db_session, "Temporary area - actions315d")
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_event",
+        {"title": "Orphaned event - actions315d", "starts_at": "2026-09-28T11:00:00+03:00", "life_area_id": area.id},
+    )
+
+    life_areas_service.delete_life_area(db_session, area.id)  # the race
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"
+
+
+def test_reject_create_event_proposal_creates_no_calendar_event(db_session: Session, owner) -> None:
+    from app.modules.calendar import service as calendar_service
+
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_event",
+        {"title": "Never happens - actions315e", "starts_at": "2026-09-28T11:00:00+03:00"},
+    )
+
+    rejected = actions_service.reject(db_session, space.id, user.id)
+    assert rejected is True
+
+    events = calendar_service.build_agenda(
+        db_session, space.id, datetime(2026, 9, 28, tzinfo=timezone.utc), datetime(2026, 9, 29, tzinfo=timezone.utc),
+    )
+    assert not any(e.title == "Never happens - actions315e" for e in events)
