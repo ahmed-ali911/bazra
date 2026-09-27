@@ -74,6 +74,43 @@ class CalendarEventUpdate(BaseModel):
     life_area_id: int | None = None
 
 
+class ProposedCalendarEventUpdate(CalendarEventUpdate):
+    """Checkpoint 3.18 — the model-facing argument shape for
+    propose_update_event: CalendarEventUpdate's own optional fields,
+    plus the event_id being referenced, plus a timezone-awareness
+    requirement scoped ONLY to whichever of starts_at/ends_at the model
+    actually supplied — both remain fully optional here (unlike
+    ProposedCalendarEventCreate's always-required starts_at), so
+    model_fields_set (not the dumped value) decides what was actually
+    named, the same exclude_unset-aware discipline
+    ProposedTaskUpdate/ProposedCalendarEventCreate already established.
+
+    Unlike CalendarEventUpdate, this class has no inherited same-named
+    validator to override — the base class deliberately has no range
+    check at all (see its own docstring: a partial payload may name
+    only one of starts_at/ends_at, so "ends_at >= starts_at" can only
+    be checked once merged with the EXISTING event, which happens in
+    the proposal handler and confirm_and_execute, not here) — so there
+    is no repeat of 3.15's validator-ordering hazard to guard against
+    in this class.
+    """
+
+    event_id: int
+
+    @model_validator(mode="after")
+    def _validate_update(self) -> "ProposedCalendarEventUpdate":
+        if not (self.model_fields_set - {"event_id"}):
+            raise ValueError("at least one field to change must be provided")
+        if "starts_at" in self.model_fields_set:
+            if self.starts_at is None:
+                raise ValueError("starts_at cannot be cleared — it is a required field")
+            if self.starts_at.tzinfo is None:
+                raise ValueError("starts_at must be a timezone-aware instant (with an explicit UTC offset)")
+        if "ends_at" in self.model_fields_set and self.ends_at is not None and self.ends_at.tzinfo is None:
+            raise ValueError("ends_at must be a timezone-aware instant (with an explicit UTC offset)")
+        return self
+
+
 class CalendarEventResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

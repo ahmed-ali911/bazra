@@ -407,3 +407,76 @@ def test_conversation_lock_prevents_the_adjacency_race_under_forced_interleaving
         assert adjacent_now is False  # T1's real interruption is correctly seen as intervening now
     finally:
         verify_session.close()
+
+
+def test_two_concurrent_update_event_confirmations_result_in_exactly_one_update(db_session: Session) -> None:
+    """Checkpoint 3.18: the SAME real-Postgres row-lock proof, for the
+    new update_event action_type — proves the generic dispatcher
+    extends to CalendarEvent updates for free, exactly as it already
+    did for update_task (3.10) and create_event (3.15)."""
+    from datetime import datetime, timezone
+
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    SessionLocal = sessionmaker(bind=db_session.get_bind())
+
+    user = auth_service.get_the_user(db_session)
+    if user is None:
+        user = User(password_hash=auth_service.hash_password("owner-fixture-password"))
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    space = spaces_service.get_or_create_default_space_for_user(db_session, user.id)
+
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Concurrent update-event test", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_message = chat_service.record_assistant_message(
+        db_session, space.id, user.id, "concurrency update_event test proposal"
+    )
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_message.id, "update_event",
+        {"event_id": event.id, "starts_at": "2026-09-28T14:00:00+00:00"},
+    )
+    space_id, user_id, event_id = space.id, user.id, event.id
+
+    results: list = [None, None]
+
+    def _attempt(index: int) -> None:
+        session: Session = SessionLocal()
+        try:
+            results[index] = actions_service.confirm_and_execute(session, space_id, user_id)
+        finally:
+            session.close()
+
+    t1 = threading.Thread(target=_attempt, args=(0,))
+    t2 = threading.Thread(target=_attempt, args=(1,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    outcomes = sorted(r.outcome for r in results)
+    assert outcomes == ["executed", "nothing_pending"], (
+        "exactly one concurrent confirmation attempt should execute; the other "
+        f"should observe nothing left pending (row-lock replay guard), got {outcomes}"
+    )
+
+    verify_session: Session = SessionLocal()
+    try:
+        proposal = (
+            verify_session.query(ProposedAction)
+            .filter(ProposedAction.source_chat_message_id == source_message.id)
+            .one()
+        )
+        assert proposal.status == "executed"
+
+        real_event = calendar_service.get_calendar_event(verify_session, space_id, event_id)
+        assert real_event.starts_at == datetime(2026, 9, 28, 14, 0, tzinfo=timezone.utc)  # updated exactly once
+
+        second_attempt = actions_service.confirm_and_execute(verify_session, space_id, user_id)
+        assert second_attempt.outcome == "nothing_pending"
+    finally:
+        verify_session.close()

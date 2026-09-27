@@ -8,7 +8,12 @@ from sqlalchemy.orm import Session
 from app.modules.actions.models import ProposedAction
 from app.modules.actions.schemas import ConfirmResult
 from app.modules.calendar import service as calendar_service
-from app.modules.calendar.schemas import CalendarEventResponse, ProposedCalendarEventCreate
+from app.modules.calendar.schemas import (
+    CalendarEventResponse,
+    CalendarEventUpdate,
+    ProposedCalendarEventCreate,
+    ProposedCalendarEventUpdate,
+)
 from app.modules.chat.models import ChatMessage
 from app.modules.life_areas import service as life_areas_service
 from app.modules.memory import service as memory_service
@@ -28,6 +33,7 @@ _ACTION_ARGUMENT_SCHEMAS: dict[str, type[PydanticBaseModel]] = {
     "update_task": ProposedTaskUpdate,
     "delete_task": ProposedTaskDelete,
     "create_event": ProposedCalendarEventCreate,
+    "update_event": ProposedCalendarEventUpdate,
 }
 
 
@@ -333,7 +339,41 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             # ConfirmResult.event below is the only record of which
             # CalendarEvent this proposal produced.
             db.commit()
-            return ConfirmResult(outcome="executed", event=CalendarEventResponse.model_validate(event))
+            return ConfirmResult(
+                outcome="executed", event=CalendarEventResponse.model_validate(event), event_action="created",
+            )
+
+        if proposal.action_type == "update_event":
+            # Checkpoint 3.18 — same "re-parse, don't just trust"
+            # discipline as update_task: ProposedCalendarEventUpdate
+            # reconstructs model_fields_set correctly from the sparse
+            # (exclude_unset) stored dict, so re-dumping with
+            # exclude_unset below and handing THAT to CalendarEventUpdate
+            # produces a genuinely partial update, never a silent wipe of
+            # untouched fields. life_area_id (if present) is revalidated
+            # for the same reason as create_event's own branch above.
+            # calendar_service.update_calendar_event itself performs the
+            # authoritative merged-state temporal validation (raises
+            # ValueError, caught by the shared except below) — no
+            # duplicate check needed here. Per the approved event-drift
+            # decision: the stored final patch is applied against
+            # whatever the event's CURRENT state is (re-fetched fresh by
+            # update_calendar_event itself), exactly like update_task's
+            # own already-accepted "last write wins" behavior — no
+            # optimistic concurrency/versioning.
+            update_data = ProposedCalendarEventUpdate(**proposal.arguments)
+            if update_data.life_area_id is not None:
+                if life_areas_service.get_life_area(db, update_data.life_area_id) is None:
+                    raise RuntimeError(f"life_area_id {update_data.life_area_id} no longer exists")
+            event_update = CalendarEventUpdate(**update_data.model_dump(exclude={"event_id"}, exclude_unset=True))
+            event = calendar_service.update_calendar_event(db, space_id, update_data.event_id, event_update)
+            if event is None:
+                raise RuntimeError(f"event_id {update_data.event_id} no longer exists")
+            proposal.status = "executed"
+            db.commit()
+            return ConfirmResult(
+                outcome="executed", event=CalendarEventResponse.model_validate(event), event_action="updated",
+            )
 
         if proposal.action_type == "save_memory":
             memory_data = MemoryCreate(**proposal.arguments)

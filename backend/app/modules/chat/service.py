@@ -180,6 +180,64 @@ _PROPOSE_CREATE_EVENT_TOOL = {
     },
 }
 
+_PROPOSE_UPDATE_EVENT_TOOL = {
+    "name": "propose_update_event",
+    "description": (
+        "Propose changing an EXISTING CalendarEvent — moving it to a new time, "
+        "changing its duration, renaming it, editing its description, or "
+        "reassigning its life area. Reference it by the event_id shown next to it "
+        "in Current Data below (shown as event_id=N) — never guess an id, and "
+        "never resolve one by matching a title yourself. If more than one event "
+        "could plausibly match what the user described (e.g. two events with a "
+        "similar title), ask which one they mean instead of picking one; never "
+        "update more than one event for a single request. When moving a bounded "
+        "event (one with both a start and an end) to a new time without the user "
+        "asking to change its duration, preserve the existing duration — compute "
+        "and include BOTH the new starts_at AND the new ends_at yourself from the "
+        "event's own current values shown in Current Data (e.g. a 11:00-12:00 "
+        "event moved to 2 PM becomes starts_at=14:00, ends_at=15:00); never send "
+        "only one end of a move and leave the other implicit. For a genuine point "
+        "event (no ends_at shown), moving it only changes starts_at. For a "
+        "duration-only change ('make it 30 minutes longer', 'have it finish at "
+        "3'), compute and send the resulting final ends_at. Only include the "
+        "fields that are actually changing. This does NOT change it — it only "
+        "records a proposal that the user must explicitly confirm before "
+        "anything is actually changed."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "event_id": {
+                "type": "integer",
+                "description": "The event_id of the existing event to change, exactly as shown in Current Data.",
+            },
+            "title": {"type": "string", "description": "New title, only if it's changing."},
+            "description": {"type": "string", "description": "New description, only if it's changing."},
+            "starts_at": {
+                "type": "string",
+                "description": (
+                    "New timezone-aware ISO 8601 instant with an explicit UTC offset, only if "
+                    "it's changing, e.g. 2026-09-28T14:00:00+03:00. Never a naive/offset-less "
+                    "string."
+                ),
+            },
+            "ends_at": {
+                "type": "string",
+                "description": (
+                    "New timezone-aware ISO 8601 instant with an explicit UTC offset, only if "
+                    "it's changing (including when moving a bounded event — see above). Same "
+                    "format as starts_at."
+                ),
+            },
+            "life_area_id": {
+                "type": "integer",
+                "description": "New life area id, only if it's changing — must appear in Current Data below.",
+            },
+        },
+        "required": ["event_id"],
+    },
+}
+
 _PROPOSE_SAVE_MEMORY_TOOL = {
     "name": "propose_save_memory",
     "description": (
@@ -275,7 +333,8 @@ _GET_WEATHER_TOOL = {
 
 _TOOLS_OFFERED = [
     _PROPOSE_CREATE_TASK_TOOL, _PROPOSE_UPDATE_TASK_TOOL, _PROPOSE_DELETE_TASK_TOOL,
-    _PROPOSE_CREATE_EVENT_TOOL, _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
+    _PROPOSE_CREATE_EVENT_TOOL, _PROPOSE_UPDATE_EVENT_TOOL,
+    _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
 ]
 
 # Used by _describe_pending_proposal to tell the model which tool to call
@@ -285,6 +344,7 @@ _ACTION_TYPE_TOOL_NAMES = {
     "update_task": "propose_update_task",
     "delete_task": "propose_delete_task",
     "create_event": "propose_create_event",
+    "update_event": "propose_update_event",
     "save_memory": "propose_save_memory",
     "forget_memory": "propose_forget_memory",
 }
@@ -838,6 +898,73 @@ def _render_create_event_confirmation(
     return f'I can add "{title}" on {date_str}, {time_str}{area_clause_en}. Add it?'
 
 
+def _render_update_event_confirmation(
+    event, changes: dict, timezone_name: str, user_message: str, life_area_name: str | None,
+) -> str:
+    """Checkpoint 3.18 — same discipline as _render_update_task_confirmation:
+    built ONLY from the event's own CURRENT state (re-fetched via
+    _require_existing_event, never restated by the model) and the
+    already-validated `changes` (proposal.arguments minus event_id) —
+    never from the model's own free-form reply text. A time-related
+    change (starts_at and/or ends_at) shows the old range and the new
+    range so a model misunderstanding is visible before the write;
+    other changes get a plain verb-phrase fragment, matching
+    _render_update_task_confirmation's own combining style.
+    """
+    arabic = _is_arabic(user_message)
+    zone = ZoneInfo(timezone_name)
+    fragments_en: list[str] = []
+    fragments_ar: list[str] = []
+
+    if "starts_at" in changes:
+        old_start_local = event.starts_at.astimezone(zone)
+        old_range = _format_event_time_local(old_start_local, arabic)
+        if event.ends_at is not None:
+            old_range += f"–{_format_event_time_local(event.ends_at.astimezone(zone), arabic)}"
+
+        new_start_local = datetime.fromisoformat(changes["starts_at"]).astimezone(zone)
+        new_range = _format_event_time_local(new_start_local, arabic)
+        new_ends_iso = changes.get("ends_at")
+        if new_ends_iso:
+            new_ends_local = datetime.fromisoformat(new_ends_iso).astimezone(zone)
+            new_range += f"–{_format_event_time_local(new_ends_local, arabic)}"
+        new_date_str = _format_event_date_local(new_start_local, arabic)
+
+        if arabic:
+            fragments_ar.append(f"أنقلها من {old_range} لـ {new_range} يوم {new_date_str}")
+        else:
+            fragments_en.append(f"move it from {old_range} to {new_range} on {new_date_str}")
+    elif "ends_at" in changes:
+        new_ends_iso = changes["ends_at"]
+        if new_ends_iso:
+            new_end_str = _format_event_time_local(datetime.fromisoformat(new_ends_iso).astimezone(zone), arabic)
+            fragments_en.append(f"have it finish at {new_end_str}")
+            fragments_ar.append(f"أخليها تخلص الساعة {new_end_str}")
+        else:
+            fragments_en.append("clear its end time")
+            fragments_ar.append("أشيل ميعاد انتهاءها")
+
+    if "title" in changes:
+        fragments_en.append(f'rename it to "{changes["title"]}"')
+        fragments_ar.append(f'أغير اسمها لـ "{changes["title"]}"')
+    if "description" in changes:
+        fragments_en.append("update its description")
+        fragments_ar.append("أعدل وصفها")
+    if "life_area_id" in changes:
+        if life_area_name:
+            fragments_en.append(f"assign it to {life_area_name}")
+            fragments_ar.append(f"أحطها تحت {life_area_name}")
+        else:
+            fragments_en.append("move it to a different life area")
+            fragments_ar.append("أنقلها لمجال حياة تاني")
+
+    if arabic:
+        joined = " و".join(fragments_ar)
+        return f'هـ{joined} — "{event.title}". أنفذ؟'
+    joined = " and ".join(fragments_en)
+    return f'I can {joined} — "{event.title}". Make that change?'
+
+
 def _render_save_memory_confirmation(arguments: dict, user_message: str) -> str:
     """Same discipline as _render_create_task_confirmation: built ONLY
     from the validated arguments that will be stored/executed, never
@@ -988,6 +1115,8 @@ def _reply_for_confirm_result(result: ConfirmResult) -> str:
                 return f'Done — I\'ve removed the task "{result.task.title}".'
             return f'Done — I\'ve created the task "{result.task.title}".'
         if result.event is not None:
+            if result.event_action == "updated":
+                return f'Done — I\'ve updated "{result.event.title}".'
             return f'Done — I\'ve added "{result.event.title}" to your calendar.'
         if result.memory is not None:
             if result.memory.status == "forgotten":
@@ -1151,6 +1280,84 @@ def _handle_create_event_proposal(
     return assistant_message
 
 
+def _require_existing_event(db: Session, space_id: int, action_type: str, event_id: int):
+    """Checkpoint 3.18 — the same DB-lookup discipline as
+    _require_existing_task: calendar_service.get_calendar_event is
+    already space-scoped and already filters archived_at IS NULL, so a
+    wrong id, wrong space, or archived event all collapse into the SAME
+    None -> InvalidActionArgumentsError, before any proposal is created
+    — an archived event can never be conversationally updated, exactly
+    like it already can't be updated via direct REST.
+    """
+    event = calendar_service.get_calendar_event(db, space_id, event_id)
+    if event is None:
+        raise actions_service.InvalidActionArgumentsError(
+            action_type, f"event_id {event_id} is not an event you own"
+        )
+    return event
+
+
+def _validate_merged_event_temporal_range(event, changes: dict) -> None:
+    """Checkpoint 3.18 — proposal-time merged-state validation: a
+    partial `changes` dict may name only one of starts_at/ends_at (e.g.
+    "starts_at=14:00 only"), so checking the supplied fields alone
+    would miss that the event's own EXISTING ends_at=12:00 no longer
+    follows a new starts_at=14:00. Merges changes onto the event's
+    current values in plain Python and applies the exact same
+    `ends_at < starts_at` check calendar_service.update_calendar_event
+    itself performs against the merged ORM object at execution time —
+    duplicated here deliberately (not refactored out of that
+    REST-facing function) so this stays a proposal-time PREVIEW that
+    never touches the real row. changes' values are JSON-round-tripped
+    ISO strings (validate_arguments's own mode="json" dump) — parsed
+    back to datetimes here for the comparison.
+    """
+    merged_starts_at = (
+        datetime.fromisoformat(changes["starts_at"]) if "starts_at" in changes else event.starts_at
+    )
+    if "ends_at" in changes:
+        merged_ends_at = datetime.fromisoformat(changes["ends_at"]) if changes["ends_at"] else None
+    else:
+        merged_ends_at = event.ends_at
+    if merged_ends_at is not None and merged_ends_at < merged_starts_at:
+        raise actions_service.InvalidActionArgumentsError(
+            "update_event", "resulting ends_at must be >= starts_at"
+        )
+
+
+def _handle_update_event_proposal(
+    db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
+    timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
+) -> ChatMessage:
+    try:
+        validated = actions_service.validate_arguments("update_event", arguments)
+        event = _require_existing_event(db, space_id, "update_event", validated["event_id"])
+        changes = {k: v for k, v in validated.items() if k != "event_id"}
+        _validate_merged_event_temporal_range(event, changes)
+        life_area_id = changes.get("life_area_id")
+        life_area = (
+            _require_existing_life_area(db, "update_event", life_area_id) if life_area_id is not None else None
+        )
+    except actions_service.InvalidActionArgumentsError:
+        # Covers a missing/nonexistent/archived event_id, a naive or
+        # merged-invalid starts_at/ends_at, an unknown life_area_id, and
+        # a no-op proposal (no field actually changing) — all collapse
+        # into the same "nothing valid to propose yet" fallback, never
+        # a malformed pending ProposedAction.
+        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+
+    reply_text = _render_update_event_confirmation(
+        event, changes, timezone_name, user_message_content, life_area.name if life_area else None,
+    )
+    assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
+    actions_service.create_pending_action(
+        db, space_id, user_id, assistant_message.id, "update_event", validated, commit=False,
+    )
+    db.commit()
+    db.refresh(assistant_message)
+    return assistant_message
+
+
 def _handle_save_memory_proposal(
     db: Session, space_id: int, user_id: int, arguments: dict, model_text: str | None,
     timezone_name: str, user_message_content: str, tool_use_id: str, correlation_id: str,
@@ -1267,6 +1474,7 @@ _TOOL_HANDLERS = {
     "propose_update_task": _handle_update_task_proposal,
     "propose_delete_task": _handle_delete_task_proposal,
     "propose_create_event": _handle_create_event_proposal,
+    "propose_update_event": _handle_update_event_proposal,
     "propose_save_memory": _handle_save_memory_proposal,
     "propose_forget_memory": _handle_forget_memory_proposal,
     "get_weather": _handle_get_weather,

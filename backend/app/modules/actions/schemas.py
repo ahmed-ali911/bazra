@@ -8,11 +8,14 @@ from app.modules.tasks.schemas import TaskResponse
 # Closed, code-level sets — plain strings at rest (matching Task.status/
 # AiTrace.purpose's own convention), not native DB enums. Extended in
 # Checkpoint 3.4 (save_memory, forget_memory), Checkpoint 3.10
-# (update_task), Checkpoint 3.13 (delete_task), and Checkpoint 3.15
-# (create_event) rather than accepting an arbitrary string.
-ActionType = Literal["create_task", "save_memory", "forget_memory", "update_task", "delete_task", "create_event"]
+# (update_task), Checkpoint 3.13 (delete_task), Checkpoint 3.15
+# (create_event), and Checkpoint 3.18 (update_event) rather than
+# accepting an arbitrary string.
+ActionType = Literal[
+    "create_task", "save_memory", "forget_memory", "update_task", "delete_task", "create_event", "update_event",
+]
 VALID_ACTION_TYPES: frozenset[str] = frozenset(
-    {"create_task", "save_memory", "forget_memory", "update_task", "delete_task", "create_event"}
+    {"create_task", "save_memory", "forget_memory", "update_task", "delete_task", "create_event", "update_event"}
 )
 
 # Deliberately no "failed" — see actions/service.py's
@@ -41,6 +44,12 @@ class ConfirmResult:
     None (its default) for every action_type that predates 3.10, so
     create_task's own existing "I've created..." reply is unaffected by
     construction, not by a special case.
+
+    event_action (Checkpoint 3.18) is CalendarEvent's own exact
+    counterpart to task_action, for the exact same reason: 'event' is
+    now shared between create_event ("created") and update_event
+    ("updated"), and without this the deterministic reply would have no
+    way to say "updated" instead of "added" for the latter.
     """
 
     outcome: Literal["executed", "rejected", "nothing_pending", "execution_failed"]
@@ -48,3 +57,4 @@ class ConfirmResult:
     memory: MemoryResponse | None = None
     task_action: Literal["created", "updated", "deleted"] | None = None
     event: CalendarEventResponse | None = None
+    event_action: Literal["created", "updated"] | None = None

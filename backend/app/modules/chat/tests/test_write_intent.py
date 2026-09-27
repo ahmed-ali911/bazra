@@ -139,3 +139,23 @@ def test_genuinely_ambiguous_phrasing_is_not_detected() -> None:
     in exactly this case).
     """
     assert detect_clear_write_intent("I won't be free for my dentist appointment anymore") is False
+
+
+def test_update_event_phrasing_was_never_declined_no_narrowing_needed() -> None:
+    """Checkpoint 3.18's own inspection found (and this locks in): the
+    UPDATE pattern's noun group has only ever contained 'life area' —
+    'event'/'meeting' were never in it, so every CalendarEvent-update
+    phrasing already reached the Orchestrator before this checkpoint,
+    unlike create (3.15) and delete (3.13), which both required
+    narrowing. No write_intent.py change was made for update_event."""
+    assert detect_clear_write_intent("Move my meeting with Hussein tomorrow to 2 PM.") is False
+    assert detect_clear_write_intent("Change tomorrow's meeting to 3.") is False
+    assert detect_clear_write_intent("Push the Hussein meeting back one hour.") is False
+    assert detect_clear_write_intent("Reschedule my meeting.") is False
+    assert detect_clear_write_intent("Rename tomorrow's meeting to Project Review.") is False
+
+
+def test_arabic_update_event_phrasing_was_never_declined_no_narrowing_needed() -> None:
+    assert detect_clear_write_intent("انقل اجتماع حسين بكرة للساعة ٢.") is False
+    assert detect_clear_write_intent("أخر الاجتماع ساعة.") is False
+    assert detect_clear_write_intent("غير ميعاد الاجتماع.") is False

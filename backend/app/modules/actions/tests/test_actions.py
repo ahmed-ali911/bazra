@@ -799,3 +799,259 @@ def test_reject_create_event_proposal_creates_no_calendar_event(db_session: Sess
         db_session, space.id, datetime(2026, 9, 28, tzinfo=timezone.utc), datetime(2026, 9, 29, tzinfo=timezone.utc),
     )
     assert not any(e.title == "Never happens - actions315e" for e in events)
+
+
+# ---- Checkpoint 3.18: update_event ---------------------------------------------------
+
+
+def test_validate_arguments_update_event_requires_event_id(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("update_event", {"title": "New title"})
+
+
+def test_validate_arguments_update_event_rejects_a_no_op_with_no_changes(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("update_event", {"event_id": 1})
+
+
+def test_validate_arguments_update_event_rejects_naive_starts_at(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments(
+            "update_event", {"event_id": 1, "starts_at": "2026-09-28T14:00:00"},
+        )
+
+
+def test_validate_arguments_update_event_rejects_naive_ends_at(db_session: Session) -> None:
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments(
+            "update_event", {"event_id": 1, "ends_at": "2026-09-28T15:00:00"},
+        )
+
+
+def test_validate_arguments_update_event_rejects_explicit_null_starts_at(db_session: Session) -> None:
+    """starts_at is not nullable on the domain model — an explicit null
+    must never reach a pending proposal."""
+    with pytest.raises(actions_service.InvalidActionArgumentsError):
+        actions_service.validate_arguments("update_event", {"event_id": 1, "starts_at": None})
+
+
+def test_validate_arguments_update_event_accepts_explicit_null_ends_at(db_session: Session) -> None:
+    """Clearing ends_at (turning a bounded event back into a point
+    event) is a real, meaningful, valid change."""
+    validated = actions_service.validate_arguments("update_event", {"event_id": 1, "ends_at": None})
+    assert validated["ends_at"] is None
+
+
+def test_validate_arguments_update_event_only_returns_explicitly_set_fields(db_session: Session) -> None:
+    validated = actions_service.validate_arguments(
+        "update_event", {"event_id": 1, "title": "Project Review"},
+    )
+    assert validated == {"event_id": 1, "title": "Project Review"}
+    assert "starts_at" not in validated
+    assert "ends_at" not in validated
+    assert "description" not in validated
+    assert "life_area_id" not in validated
+
+
+def test_confirm_and_execute_dispatches_update_event_title_only(db_session: Session, owner) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Old title - actions318a", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "title": "New title - actions318a"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event_action == "updated"
+    assert result.event.id == event.id
+    assert result.event.title == "New title - actions318a"
+    assert result.event.starts_at == datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)  # untouched
+
+
+def test_confirm_and_execute_dispatches_update_event_move_preserving_duration(db_session: Session, owner) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(
+            title="Meeting - actions318b",
+            starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc),
+            ends_at=datetime(2026, 9, 28, 12, 0, tzinfo=timezone.utc),
+        ),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {
+            "event_id": event.id,
+            "starts_at": "2026-09-28T14:00:00+00:00",
+            "ends_at": "2026-09-28T15:00:00+00:00",
+        },
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event.starts_at == datetime(2026, 9, 28, 14, 0, tzinfo=timezone.utc)
+    assert result.event.ends_at == datetime(2026, 9, 28, 15, 0, tzinfo=timezone.utc)
+
+
+def test_confirm_and_execute_dispatches_update_event_point_event_move_leaves_ends_at_none(
+    db_session: Session, owner,
+) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Point event - actions318c", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "starts_at": "2026-09-28T14:00:00+00:00"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event.starts_at == datetime(2026, 9, 28, 14, 0, tzinfo=timezone.utc)
+    assert result.event.ends_at is None
+
+
+def test_confirm_and_execute_update_event_with_valid_life_area_accepted(db_session: Session, owner) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+    from app.modules.life_areas import service as life_areas_service
+
+    user, space = owner
+    area = life_areas_service.create_life_area(db_session, "Work - actions318d")
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Event - actions318d", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "life_area_id": area.id},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event.life_area_id == area.id
+
+
+def test_confirm_and_execute_update_event_nonexistent_event_rolls_back_to_pending(
+    db_session: Session, owner,
+) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": 999999, "title": "Ghost event"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"
+
+
+def test_confirm_and_execute_update_event_life_area_deleted_between_proposal_and_confirmation_rolls_back(
+    db_session: Session, owner,
+) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+    from app.modules.life_areas import service as life_areas_service
+
+    user, space = owner
+    area = life_areas_service.create_life_area(db_session, "Temporary area - actions318e")
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Event - actions318e", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "life_area_id": area.id},
+    )
+
+    life_areas_service.delete_life_area(db_session, area.id)  # the race
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "execution_failed"
+
+    proposal = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert proposal is not None
+    assert proposal.status == "pending"
+
+
+def test_confirm_and_execute_update_event_drift_applies_stored_patch_against_latest_state(
+    db_session: Session, owner,
+) -> None:
+    """Checkpoint 3.18's approved event-drift decision: no optimistic
+    concurrency — the stored final patch is applied against whatever
+    the event's CURRENT state is at confirmation time, exactly like
+    update_task's own already-accepted 'last write wins' behavior. A
+    field the proposal does NOT touch (here, title, changed by a
+    separate path between proposal and confirmation) survives the
+    drift; the field the proposal DOES touch is still applied."""
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate, CalendarEventUpdate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Original - actions318f", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "starts_at": "2026-09-28T14:00:00+00:00"},
+    )
+
+    # The race: another path renames the event before confirmation.
+    calendar_service.update_calendar_event(db_session, space.id, event.id, CalendarEventUpdate(title="Renamed by drift - actions318f"))
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.event.starts_at == datetime(2026, 9, 28, 14, 0, tzinfo=timezone.utc)  # the proposal's own change
+    assert result.event.title == "Renamed by drift - actions318f"  # the drifted value, untouched by this proposal
+
+
+def test_reject_update_event_proposal_leaves_event_unchanged(db_session: Session, owner) -> None:
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="Untouched - actions318g", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "title": "Should never apply"},
+    )
+
+    rejected = actions_service.reject(db_session, space.id, user.id)
+    assert rejected is True
+
+    db_session.refresh(event)
+    assert event.title == "Untouched - actions318g"

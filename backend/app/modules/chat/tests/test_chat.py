@@ -1883,6 +1883,13 @@ def _create_real_task(authenticated_client: TestClient, title: str, **extra) -> 
     return response.json()
 
 
+def _create_real_event(authenticated_client: TestClient, title: str, starts_at: str, **extra) -> dict:
+    payload = {"title": title, "starts_at": starts_at, **extra}
+    response = authenticated_client.post("/api/v1/calendar/events", json=payload)
+    assert response.status_code == 201
+    return response.json()
+
+
 def test_context_exposes_task_id_for_referencing_existing_tasks(
     authenticated_client: TestClient, db_session: Session,
 ) -> None:
@@ -3445,3 +3452,394 @@ def test_adjacency_check_works_from_a_brand_new_session_simulating_a_restart(db_
         assert interruption.id  # sanity: the row really was created
     finally:
         fresh_db.close()
+
+
+# ---- Checkpoint 3.18: propose / confirm an update to an EXISTING CalendarEvent ----
+
+
+def test_propose_then_confirm_updates_the_real_event(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The main end-to-end flow: a valid event_id + duration-preserving
+    move produces exactly one pending update_event ProposedAction and
+    exactly one model call; the event is untouched until confirmation;
+    a bare 'yes' costs zero model calls and updates exactly that event,
+    which then reflects the new time in the normal Calendar/Agenda
+    read."""
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(
+        authenticated_client, "Meeting with Hussein - 318a", "2026-09-28T11:00:00+03:00", ends_at="2026-09-28T12:00:00+03:00",
+    )
+
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply(
+            "confirm?", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "starts_at": "2026-09-28T14:00:00+03:00", "ends_at": "2026-09-28T15:00:00+03:00"},
+        )(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    propose_response = _send(authenticated_client, "move my meeting with Hussein tomorrow to 2 PM")
+    assert propose_response.status_code == 200
+    assert call_count["n"] == 1
+    assert "Meeting with Hussein - 318a" in propose_response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.action_type == "update_event"
+
+    agenda_before = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    unchanged = next(i for i in agenda_before if i["id"] == event["id"] and i["source"] == "event")
+    assert unchanged["starts_at"] == "2026-09-28T08:00:00Z"  # still the ORIGINAL 11:00 +03:00 instant
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    assert "updated" in confirm_response.json()["assistant_message"]["content"].lower()
+
+    agenda_after = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    updated = next(i for i in agenda_after if i["id"] == event["id"] and i["source"] == "event")
+    assert updated["starts_at"] == "2026-09-28T11:00:00Z"  # 14:00 +03:00 == 11:00 UTC
+    assert updated["ends_at"] == "2026-09-28T12:00:00Z"
+
+
+def test_propose_update_event_reject_leaves_event_unchanged(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "Do not touch me - 318b", "2026-09-28T11:00:00+03:00")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "title": "Renamed - 318b"},
+        ),
+    )
+    _send(authenticated_client, "rename that meeting")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    reject_response = _send(authenticated_client, "no")
+    assert reject_response.status_code == 200
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    unchanged = next(i for i in agenda if i["id"] == event["id"] and i["source"] == "event")
+    assert unchanged["title"] == "Do not touch me - 318b"
+
+
+def test_propose_update_event_with_nonexistent_event_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("sure", tool_name="propose_update_event", arguments={"event_id": 999999, "title": "Ghost"}),
+    )
+    response = _send(authenticated_client, "rename event 999999")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_update_event_with_other_space_event_id_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+    from app.modules.auth import service as auth_service
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+    from app.modules.spaces.models import Space
+
+    owner = auth_service.get_the_user(db_session)
+    other_space = Space(name="Other Space - 318c", is_default=False, user_id=owner.id)
+    db_session.add(other_space)
+    db_session.commit()
+    db_session.refresh(other_space)
+    foreign_event = calendar_service.create_calendar_event(
+        db_session, other_space.id,
+        CalendarEventCreate(title="Foreign event - 318c", starts_at=datetime(2026, 9, 28, 11, 0, tzinfo=timezone.utc)),
+    )
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure", tool_name="propose_update_event",
+            arguments={"event_id": foreign_event.id, "title": "Hijacked"},
+        ),
+    )
+    response = _send(authenticated_client, "rename that other event")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    still_untouched = calendar_service.get_calendar_event(db_session, other_space.id, foreign_event.id)
+    assert still_untouched.title == "Foreign event - 318c"
+
+
+def test_propose_update_event_with_archived_event_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+    from app.modules.calendar import service as calendar_service
+
+    event = _create_real_event(authenticated_client, "Archived event - 318d", "2026-09-28T11:00:00+03:00")
+    user, space = _get_space_and_user(db_session)
+    calendar_service.delete_calendar_event(db_session, space.id, event["id"])
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "title": "Should never apply"},
+        ),
+    )
+    response = _send(authenticated_client, "rename that archived event")
+    assert response.status_code == 200
+
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_update_event_merged_temporal_validation_rejects_invalid_result(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.18 Part 9: a starts_at-only proposal that would push
+    the START past the EXISTING (untouched) end time must be rejected
+    at proposal time — before any ProposedAction exists — not merely
+    at confirmation time."""
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(
+        authenticated_client, "Bounded event - 318e", "2026-09-28T11:00:00+03:00", ends_at="2026-09-28T12:00:00+03:00",
+    )
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure", tool_name="propose_update_event",
+            # starts_at moved to 14:00, but ends_at (still 12:00, untouched) would now precede it.
+            arguments={"event_id": event["id"], "starts_at": "2026-09-28T14:00:00+03:00"},
+        ),
+    )
+    response = _send(authenticated_client, "move the start time only")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_propose_update_event_with_invalid_life_area_creates_no_proposal_and_replies_honestly(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    event = _create_real_event(authenticated_client, "Event - 318f", "2026-09-28T11:00:00+03:00")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "sure", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "life_area_id": 999999},
+        ),
+    )
+    response = _send(authenticated_client, "move that event under some life area")
+    assert response.status_code == 200
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_update_event_confirmation_shows_old_and_new_time_range(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(
+        authenticated_client, "Meeting with Hussein - 318g", "2026-09-28T11:00:00+03:00", ends_at="2026-09-28T12:00:00+03:00",
+    )
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "starts_at": "2026-09-28T14:00:00+03:00", "ends_at": "2026-09-28T15:00:00+03:00"},
+        ),
+    )
+    response = _send(authenticated_client, "move my meeting with Hussein tomorrow to 2 PM")
+    content = response.json()["assistant_message"]["content"]
+
+    assert "Meeting with Hussein - 318g" in content
+    assert "11:00 AM" in content
+    assert "12:00 PM" in content
+    assert "2:00 PM" in content
+    assert "3:00 PM" in content
+    assert "September 28" in content
+    assert "08:00" not in content  # never raw UTC
+
+
+def test_update_event_confirmation_title_only(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "Meeting with Hussein - 318h", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "title": "Project Review"},
+        ),
+    )
+    response = _send(authenticated_client, "rename tomorrow's meeting with Hussein to Project Review")
+    content = response.json()["assistant_message"]["content"]
+    assert "rename it to \"Project Review\"" in content
+    assert "Meeting with Hussein - 318h" in content
+    assert "11:00 AM" not in content  # no time clause when only the title changes
+
+
+def test_update_event_confirmation_duration_only(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(
+        authenticated_client, "Meeting with Hussein - 318i", "2026-09-28T11:00:00+03:00", ends_at="2026-09-28T12:00:00+03:00",
+    )
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "ends_at": "2026-09-28T12:30:00+03:00"},
+        ),
+    )
+    response = _send(authenticated_client, "make the meeting 30 minutes longer")
+    content = response.json()["assistant_message"]["content"]
+    assert "finish at 12:30 PM" in content
+    assert "11:00 AM" not in content  # start unaffected, not restated
+
+
+def test_update_event_confirmation_language_matches_arabic_or_english(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(
+        authenticated_client, "اجتماع مع حسين - 318j", "2026-09-28T11:00:00+03:00", ends_at="2026-09-28T12:00:00+03:00",
+    )
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "تمام", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "starts_at": "2026-09-28T16:00:00+03:00", "ends_at": "2026-09-28T17:00:00+03:00"},
+        ),
+    )
+    response = _send(authenticated_client, "انقل اجتماع حسين بكرة للساعة ٤")
+    content = response.json()["assistant_message"]["content"]
+    assert "اجتماع مع حسين - 318j" in content
+    assert "أنفذ؟" in content
+    assert "سبتمبر" in content
+
+
+def test_update_event_confirmation_across_dst_capable_timezone(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "NY meeting - 318k", "2026-07-15T11:00:00-04:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "starts_at": "2026-07-15T14:00:00-04:00"},
+        ),
+    )
+    response = _send(authenticated_client, "move it to 2 PM", timezone_name="America/New_York")
+    content = response.json()["assistant_message"]["content"]
+    assert "2:00 PM" in content
+    assert "July 15" in content
+
+
+def test_model_prose_with_wrong_details_does_not_appear_in_update_event_confirmation(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event = _create_real_event(authenticated_client, "Real event title - 318l", "2026-09-28T11:00:00+03:00")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I've renamed it to something totally different!", tool_name="propose_update_event",
+            arguments={"event_id": event["id"], "title": "Actual New Title"},
+        ),
+    )
+    response = _send(authenticated_client, "rename it")
+    content = response.json()["assistant_message"]["content"]
+    assert "totally different" not in content
+    assert "Real event title - 318l" in content
+    assert 'rename it to "Actual New Title"' in content
+
+
+def test_update_event_ambiguity_then_disambiguating_followup_produces_correct_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.18 Part 14: two plausibly-matching events — the
+    model should clarify (no tool call, no ProposedAction) rather than
+    guess; the SAME history-only continuation mechanism already proven
+    for Task/Event creation (3.16) carries the disambiguating follow-up
+    through to a correct, specific proposal."""
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    actions_service.reject(db_session, space.id, user.id)  # clean slate regardless of prior tests in this run
+
+    event_am = _create_real_event(authenticated_client, "Meeting with Hussein - 318m", "2026-09-28T09:00:00+03:00")
+    event_pm = _create_real_event(authenticated_client, "Meeting with Hussein - 318m", "2026-09-28T14:00:00+03:00")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Do you mean the 9 AM one or the 2 PM one?"),
+    )
+    clarify_response = _send(authenticated_client, "move my meeting with Hussein")
+    assert clarify_response.status_code == 200
+
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_event",
+            arguments={"event_id": event_pm["id"], "starts_at": "2026-09-28T16:00:00+03:00"},
+        ),
+    )
+    disambiguated_response = _send(authenticated_client, "the 2 PM one — move it to 4")
+    assert disambiguated_response.status_code == 200
+
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.arguments["event_id"] == event_pm["id"]
+
+
+def test_update_event_interruption_then_yes_does_not_execute(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.17 inheritance — no update_event-specific adjacency
+    logic was written; this proves the generic guard already covers
+    it."""
+    event = _create_real_event(authenticated_client, "Interruption target - 318n", "2026-09-28T11:00:00+03:00")
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="rename 'Interruption target - 318n' to something else",
+        tool_name="propose_update_event", arguments={"event_id": event["id"], "title": "Renamed - 318n"},
+        bare_answer="yes",
+    )
+    assert result["call_count"] == 1  # reached the model, not deterministic
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    unchanged = next(i for i in agenda if i["id"] == event["id"] and i["source"] == "event")
+    assert unchanged["title"] == "Interruption target - 318n"  # NOT updated

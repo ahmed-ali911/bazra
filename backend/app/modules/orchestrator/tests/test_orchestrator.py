@@ -204,14 +204,16 @@ def test_system_prompt_no_longer_claims_tasks_cannot_be_edited_or_marked_complet
     assert "you still cannot delete a task" not in prompt
 
 
-def test_system_prompt_still_declines_calendar_edit_delete_and_inbox_life_area_writes() -> None:
+def test_system_prompt_still_declines_calendar_delete_mark_complete_and_inbox_life_area_writes() -> None:
     """The blanket 'not available yet' decline remains true for
-    Calendar event edit/delete/mark-complete and for Inbox/Life Areas —
-    only Task's own write capabilities (create/update/delete) and,
-    since 3.15, CalendarEvent's own create capability have ever been
-    carved out of it."""
+    Calendar event delete/mark-complete and for Inbox/Life Areas — only
+    Task's own write capabilities (create/update/delete) and
+    CalendarEvent's own create (3.15) and update (3.18) capabilities
+    have ever been carved out of it. 'edit' was deliberately removed
+    from the Calendar decline clause in 3.18, since editing an existing
+    event is now a real capability via propose_update_event."""
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
-    assert "edit, delete, or mark complete an existing Calendar event" in prompt
+    assert "delete or mark complete an existing Calendar event" in prompt
     assert "edit, delete, mark complete, or create anything for Inbox or Life Areas" in prompt
     assert "say plainly that this isn't available yet" in prompt
 
@@ -253,6 +255,42 @@ def test_system_prompt_requires_explicit_utc_offset_for_event_times() -> None:
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
     assert "timezone-aware ISO 8601 instants with an explicit UTC offset" in prompt
     assert "Never omit the offset" in prompt
+
+
+def test_system_prompt_describes_propose_update_event_as_a_proposal_not_an_execution() -> None:
+    """Checkpoint 3.18: the model must be told plainly that it MUST call
+    propose_update_event for a supported CalendarEvent change, that a
+    plain-text description is NOT a substitute, and that the tool call
+    itself only proposes (still requires explicit confirmation) —
+    following the same MUST-call/NOT-a-substitute pattern as every
+    other propose_* tool."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "propose_update_event" in prompt
+    assert "you MUST call the propose_update_event tool" in prompt
+    assert "is NOT a substitute for calling it" in prompt
+    assert "This does NOT change it — it only proposes it" in prompt
+    assert "event's own event_id shown in Current Data below" in prompt
+
+
+def test_system_prompt_requires_disambiguation_for_ambiguous_event_reference() -> None:
+    """Checkpoint 3.18 Part 14: never guess between multiple plausibly-
+    matching events, never update more than one for a single request —
+    model-facing semantic guidance, not a Python matcher."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "ask which one they mean instead of guessing" in prompt
+    assert "never update more than one event for a single request" in prompt
+
+
+def test_system_prompt_requires_duration_preserving_move_semantics() -> None:
+    """Checkpoint 3.18 Part 6/7: moving a bounded event preserves its
+    existing duration via explicit final starts_at/ends_at values; a
+    point event's move only changes starts_at; a pure duration change
+    sends only the resulting final ends_at."""
+    prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
+    assert "preserve its existing duration" in prompt
+    assert "compute and include BOTH the new starts_at and the new ends_at" in prompt
+    assert "For a genuine point event (no ends_at shown), moving it only changes starts_at" in prompt
+    assert "compute and send only the resulting final ends_at" in prompt
 
 
 def test_system_prompt_includes_current_datetime_anchor() -> None:

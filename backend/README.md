@@ -689,6 +689,98 @@ turns hit the same pre-existing, stochastic text-only tool-call miss
 already documented since 3.12b — unrelated to this fix, honestly
 reported rather than retried.
 
+### Checkpoint 3.18
+
+Conversational CalendarEvent update: `propose_update_event` — moves,
+renames, extends/shortens, or reassigns the life area of an EXISTING
+event. Reuses the update_task (3.10) and create_event (3.15) patterns
+simultaneously, plus inherits 3.17's adjacency guard automatically —
+no genuinely new architecture, only a new `action_type` following
+three already-established precedents at once.
+
+**Context Assembly now exposes `event_id` and `ends_at`** for
+CalendarEvent entries in "Coming Up" (`chat/context.py`'s
+`_format_agenda_line`) — both were already fetched by the existing
+`home_summary` aggregation, just not previously printed. `ends_at`
+matters concretely: the model needs an event's *current* end time to
+preserve its duration when proposing a move. Task-sourced agenda lines
+are byte-for-byte unchanged.
+
+**Duration-preserving move semantics** are pure model reasoning, not
+Python: moving a bounded event (both `starts_at` and `ends_at` visible)
+without a duration change means the model computes and submits BOTH
+final values itself (an 11:00–12:00 event moved to 2 PM becomes
+`starts_at=14:00, ends_at=15:00`); a point event's move only touches
+`starts_at`; a pure duration edit ("30 minutes longer") sends only the
+resulting final `ends_at`. No `duration_delta`/shift representation
+anywhere — the `ProposedAction` always stores final, already-resolved
+values.
+
+**Merged-state validation happens twice, for two different reasons.**
+At proposal time, `chat/service.py`'s own
+`_validate_merged_event_temporal_range` merges the supplied `changes`
+onto the EXISTING event's current values in plain Python and rejects
+an invalid result (e.g. `starts_at=14:00` alone against an untouched
+`ends_at=12:00`) *before* any `ProposedAction` exists — a small,
+deliberate duplication of the same check
+`calendar_service.update_calendar_event` already performs against the
+merged ORM object, not a refactor of that REST-facing function. At
+confirmation time, that existing function's own check remains
+authoritative (via `confirm_and_execute`'s `update_event` branch),
+since the event may have drifted since proposal.
+
+**Timezone-awareness** is scoped to `ProposedCalendarEventUpdate`
+(`calendar/schemas.py`) exactly like 3.15's create-side schema — the
+direct REST `CalendarEventUpdate`/`PATCH /calendar/events/{id}` is
+completely unchanged. Unlike the create schema, there was no inherited
+same-named validator to override here (the base `CalendarEventUpdate`
+deliberately has no range check at all, by its own long-standing
+design), so this is a fresh validator with no repeat of 3.15's
+ordering hazard. An explicit `null` for `starts_at` (not nullable on
+the domain model) is rejected outright; an explicit `null` for
+`ends_at` is accepted — it's a real, meaningful "make this a point
+event again" change.
+
+**Event drift** (the event changes between proposal and confirmation)
+uses the exact same "last write wins" behavior already accepted for
+`update_task` since 3.10 — no optimistic concurrency/versioning was
+added. The stored final patch is applied against whatever the event's
+current state is at confirmation time; a field the proposal doesn't
+touch simply survives whatever else changed it in the meantime.
+
+`ConfirmResult` gained `event_action: Literal["created", "updated"]`,
+`CalendarEvent`'s own exact counterpart to `task_action` (3.10/3.13) —
+needed for the same reason: one shared `event` field, two producing
+action types, no way to say "updated" instead of "added" without it.
+
+Live-verified (real provider calls, 7 fixed scenarios, no mocking): an
+EN move and an AR move each independently completed the full
+propose→confirm loop with 0 confirm-turn `AiTrace` and the correct
+duration-preserving final instant; a duration-only extension; a
+title-only rename (start time confirmed unaffected); two
+same-titled/different-time events correctly triggering a clarification
+with no `ProposedAction`, followed by a disambiguating reply
+("the 2 PM one") correctly resolving to the right `event_id`; and 3.17's
+adjacency guard correctly protecting an update proposal across an
+unrelated weather interruption — the interrupted "yes" reached the
+model (not 0 `AiTrace`) and produced a fresh, correct re-proposal
+rather than executing the stale one, with zero update_event-specific
+code required for that protection. Three of the run's proposal turns
+hit the same pre-existing, stochastic text-only tool-call miss already
+documented since 3.12b (the model's own text reasoned correctly about
+duration preservation but didn't call the tool that turn) — unrelated
+to this checkpoint's own correctness, honestly reported rather than
+retried; every tool call that DID happen was correct (right `event_id`,
+right preserved duration, right point-event/title-only/duration-only
+handling), and no false completion claim occurred anywhere in the run.
+
+- Documented limitation, unchanged: the "Coming Up" context window is
+  ~8 days out (`tomorrow + 7 days`, computed client-side) capped at 15
+  items per section — an event further out has no visible `event_id`
+  for the model to reference, and BAZRA must not guess one. A Calendar
+  search/read tool or expanded horizon would address this; deliberately
+  out of scope here (see the 3.18 design report's own Part T finding).
+
 ## Run locally (without Docker)
 
 ```bash

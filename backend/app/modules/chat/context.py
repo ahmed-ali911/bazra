@@ -27,6 +27,23 @@ def _format_task_line(task) -> str:
 
 
 def _format_agenda_line(item) -> str:
+    """Checkpoint 3.18: CalendarEvent entries additionally expose
+    event_id and ends_at (and life_area_id when present) — the stable
+    identifier and duration data propose_update_event needs to safely
+    reference and duration-preservingly move an existing event, the
+    same "expose the real id so a later propose_* tool can reference
+    it" need _format_task_line already serves for task_id. Task-sourced
+    entries are completely UNCHANGED — Task has its own task_id
+    convention via _format_task_line elsewhere, and a due_at (mapped to
+    starts_at here) has no end time to show. No new query: AgendaItem
+    already carries id/ends_at/life_area_id for every item, event or
+    task, from the existing home_summary aggregation — this only
+    changes which of those already-fetched fields get printed.
+    """
+    if item.source == "event":
+        ends = f"–{item.ends_at.isoformat()}" if item.ends_at else ""
+        life_area = f", life_area_id={item.life_area_id}" if item.life_area_id is not None else ""
+        return f"- [event] {item.title} at {item.starts_at.isoformat()}{ends} (event_id={item.id}{life_area})"
     return f"- [{item.source}] {item.title} at {item.starts_at.isoformat()}"
 
 
