@@ -156,6 +156,165 @@ def test_complete_passes_system_prompt_through_to_the_provider_call(
     assert captured["system"] == "You are a helpful assistant."
 
 
+def test_complete_passes_tool_choice_through_to_the_provider_call(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.23: tool_choice is additive and purpose-agnostic —
+    same "prove it reaches _call_anthropic" discipline as system's own
+    test above. This module never inspects or builds the dict itself,
+    just forwards whatever the caller (Orchestrator) supplies."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    captured = {}
+
+    def _capture(model, messages, **kwargs):
+        captured["tool_choice"] = kwargs.get("tool_choice")
+        return _FakeMessageToolOnly("respond_with_text", {"kind": "answer", "text": "hi"})
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _capture)
+
+    model_router_service.complete(
+        purpose="chat_completion",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=[{"name": "respond_with_text"}],
+        tool_choice={"type": "any", "disable_parallel_tool_use": True},
+    )
+
+    assert captured["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
+
+
+def test_complete_omitted_tool_choice_preserves_existing_call_behavior(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A caller that never passes tool_choice (every purpose except the
+    primary chat call, and that call itself whenever no tools are
+    offered) must see byte-for-byte the same kwargs as before this
+    checkpoint — None reaches _call_anthropic, which itself omits the
+    key entirely (see the dedicated _call_anthropic-level tests below)."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    captured = {}
+
+    def _capture(model, messages, **kwargs):
+        captured.update(kwargs)
+        return _FakeMessage("Hello there", 10, 20)
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _capture)
+
+    model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+
+    assert captured.get("tool_choice") is None
+
+
+def test_tool_result_reasoning_call_never_receives_tool_choice(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.23 — the interpretive-weather continuation must
+    remain byte-for-byte unaffected: tools=None, no tool_choice, ever,
+    regardless of what the primary chat call now does. This test calls
+    complete() directly with the exact shape generate_tool_result_reply
+    itself uses (tools=None, no tool_choice kwarg at all)."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    captured = {}
+
+    def _capture(model, messages, **kwargs):
+        captured.update(kwargs)
+        return _FakeMessage("some reasoning text", 10, 20)
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _capture)
+
+    model_router_service.complete(
+        purpose="tool_result_reasoning",
+        messages=[{"role": "user", "content": "hi"}],
+        tools=None,
+    )
+
+    assert captured.get("tools") is None
+    assert captured.get("tool_choice") is None
+
+
+def test_complete_exposes_stop_reason_on_model_response(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.22/3.23: stop_reason is read straight off the raw
+    provider response and exposed on ModelResponse for Orchestrator's
+    own defensive cross-check — never persisted to AiTrace (see this
+    file's own absence tests elsewhere for that guarantee, unchanged)."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+
+    class _FakeMessageWithStopReason(_FakeMessageToolOnly):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.stop_reason = "tool_use"
+
+    monkeypatch.setattr(
+        model_router_service, "_call_anthropic",
+        lambda model, messages, **kwargs: _FakeMessageWithStopReason("respond_with_text", {"kind": "answer", "text": "hi"}),
+    )
+
+    response = model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+    assert response.stop_reason == "tool_use"
+
+
+def test_complete_stop_reason_defaults_to_none_when_absent_from_the_raw_response(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every pre-3.23 fake in this file (_FakeMessage etc.) has no
+    stop_reason attribute at all — confirms getattr's own safe default
+    keeps all of them working unchanged, never raising."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("hi", 5, 5))
+
+    response = model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+    assert response.stop_reason is None
+
+
+class _CapturingMessages:
+    def __init__(self, captured: dict, response):
+        self._captured = captured
+        self._response = response
+
+    def create(self, **kwargs):
+        self._captured.update(kwargs)
+        return self._response
+
+
+class _CapturingClient:
+    def __init__(self, captured: dict, response):
+        self.messages = _CapturingMessages(captured, response)
+
+
+def test_call_anthropic_omits_tool_choice_key_entirely_when_not_supplied(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 3.23 — tool_choice=None must NOT add a literal
+    "tool_choice": None key to the real SDK kwargs, omitted entirely,
+    the exact same "additive, no request-shape change for existing
+    callers" discipline tools/system already follow (see
+    _call_anthropic's own docstring). Tests _call_anthropic directly,
+    bypassing complete()'s own bookkeeping, against a fake client that
+    captures the literal kwargs .messages.create() would receive."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        model_router_service, "_get_client",
+        lambda: _CapturingClient(captured, _FakeMessage("hi", 5, 5)),
+    )
+    model_router_service._call_anthropic("claude-sonnet-5", [{"role": "user", "content": "hi"}])
+    assert "tool_choice" not in captured
+
+
+def test_call_anthropic_forwards_tool_choice_dict_verbatim(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dict is forwarded exactly as given — this module never
+    inspects, validates, or reconstructs it (see _call_anthropic's own
+    docstring on staying BAZRA-action-agnostic)."""
+    captured: dict = {}
+    monkeypatch.setattr(
+        model_router_service, "_get_client",
+        lambda: _CapturingClient(captured, _FakeMessageToolOnly("respond_with_text", {"kind": "answer", "text": "hi"})),
+    )
+    model_router_service._call_anthropic(
+        "claude-sonnet-5", [{"role": "user", "content": "hi"}],
+        tools=[{"name": "respond_with_text"}], tool_choice={"type": "any", "disable_parallel_tool_use": True},
+    )
+    assert captured["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
+
+
 def test_provider_call_failure_records_exactly_one_error_trace(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
     monkeypatch.setattr(model_router_service, "_call_anthropic", _raise(RuntimeError("simulated provider failure")))

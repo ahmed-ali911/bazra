@@ -57,6 +57,25 @@ def _mock_reply(
     text: str | None, tool_name: str | None = None, arguments: dict | None = None,
     tool_use_id: str = "toolu_test", correlation_id: str = "corr_test",
 ):
+    """Checkpoint 3.23: a bare-text response (no tool_name given) is no
+    longer a real possible shape from generate_reply — the model MUST
+    return exactly one tool call now (see
+    orchestrator_service._PRIMARY_CHAT_TOOL_CHOICE). Every existing
+    caller of this helper across this file was written against the
+    pre-3.23 "plain text, no tool" shape to mean "an ordinary
+    ungrounded answer" — rather than rewriting every one of those call
+    sites, that same intent is now expressed as a respond_with_text
+    tool call (kind="answer") automatically here, so `text` still ends
+    up as the persisted assistant reply exactly as before. A caller
+    that explicitly passes its OWN tool_name (propose_*, get_weather,
+    or an explicit "respond_with_text") is never touched by this
+    default — only the historical "no tool at all" shape is remapped.
+    """
+    if tool_name is None and text is not None:
+        tool_name = "respond_with_text"
+        arguments = {"kind": "answer", "text": text}
+        text = None
+
     tool_call = (
         ToolCallRequest(tool_use_id=tool_use_id, tool_name=tool_name, arguments=arguments or {})
         if tool_name else None
@@ -165,7 +184,14 @@ def test_chat_answers_grounded_in_real_seeded_data(
     def _fake_generate_reply(**kwargs):
         captured["context"] = kwargs["context"]
         captured["user_message"] = kwargs["user_message"]
-        return OrchestratorResult(text="Your task list shows File Q3 taxes is overdue.", tool_call=None, correlation_id="corr_test")
+        return OrchestratorResult(
+            text=None,
+            tool_call=ToolCallRequest(
+                tool_use_id="toolu_test", tool_name="respond_with_text",
+                arguments={"kind": "answer", "text": "Your task list shows File Q3 taxes is overdue."},
+            ),
+            correlation_id="corr_test",
+        )
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -191,7 +217,14 @@ def test_clear_write_request_gets_unavailability_message_without_calling_model(
     def _track(**kwargs):
         nonlocal call_count
         call_count += 1
-        return OrchestratorResult(text="should never be called", tool_call=None, correlation_id="corr_test")
+        return OrchestratorResult(
+            text=None,
+            tool_call=ToolCallRequest(
+                tool_use_id="toolu_test", tool_name="respond_with_text",
+                arguments={"kind": "answer", "text": "should never be called"},
+            ),
+            correlation_id="corr_test",
+        )
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _track)
 
@@ -201,33 +234,43 @@ def test_clear_write_request_gets_unavailability_message_without_calling_model(
     assert response.json()["assistant_message"]["content"] == chat_service.WRITE_UNAVAILABLE_MESSAGE
 
 
-def test_fresh_write_text_only_miss_is_a_documented_residual_truthfulness_gap(
+def test_fresh_write_misrouted_to_respond_with_text_is_a_documented_residual_truthfulness_gap(
     authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Checkpoint 3.21 — formerly named
-    test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds.
-    Renamed and re-documented, NOT because behavior changed here — it
-    hasn't — but because the old name/docstring read as though this
-    were simply "fine." It is not fully fine: this is precisely
-    population C from the 3.20/3.21 inspection ("arbitrary FRESH
-    supported-write text-only miss"), the one population 3.21
-    explicitly did NOT structurally guard, because doing so would
+    """Checkpoint 3.21 introduced this test (then named
+    test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds)
+    to demonstrate population C: a fresh, ambiguous-phrasing write
+    request with no pre-existing pending proposal. Checkpoint 3.23
+    changes the MECHANISM but deliberately not the OBSERVABLE OUTCOME:
+    before 3.23, the model could return bare text with no tool call at
+    all (now structurally impossible — tool_choice="any" plus the
+    respond_with_text escape hatch guarantees some tool always fires,
+    see orchestrator_service._PRIMARY_CHAT_TOOL_CHOICE and its own
+    OrchestratorContractViolationError). After 3.23, the SAME failure
+    is only reachable via a MISROUTE: the model calls the always-legal
+    respond_with_text tool (kind="answer") instead of propose_create_task,
+    and that tool's own `text` argument is what falsely claims
+    completion — _mock_reply's own 3.23 default wraps a bare-text mock
+    exactly this way now, so this test still exercises the real,
+    current failure shape without needing its own rewrite.
+
+    This remains UNGUARDED on purpose: chat_service has no structural
+    signal, when pending is None, distinguishing "the model correctly
+    judged this needs no action" from "the model incorrectly routed a
+    genuine write to respond_with_text" — both produce an identical
+    respond_with_text(kind="answer", ...) call. Guarding this would
     require either a lexical blacklist or a second classifier model —
-    both explicitly excluded by this checkpoint's own brief. There is
-    no pending ProposedAction here at all (unlike the now-guarded
-    stale-yes/no tests below), so none of 3.21's new structural
-    signals (pending + non-adjacent + narrow yes/no) apply — the model
-    was simply never asked to call a tool for this message, and its
-    own free text is persisted verbatim, exactly as before 3.21.
+    both explicitly excluded by the 3.21 AND 3.23 briefs. See the 3.23
+    close-out's own explicit residual-gap answer.
 
     Still seeds real Task/CalendarEvent/LifeArea data, sends a phrasing
     detect_clear_write_intent does NOT catch, mocks the model to
-    falsely claim an action was taken (no tool call attached), and
-    proves the actual database is byte-for-byte unchanged regardless —
-    that adversarial DB-integrity guarantee is real, structural, and
-    unaffected by 3.21. Only the CONVERSATIONAL claim remains
-    unguarded here, honestly left that way per the 3.21 brief's own
-    "do not overclaim closure" instruction.
+    falsely claim an action was taken via a MISROUTED respond_with_text
+    call, and proves the actual database is byte-for-byte unchanged
+    regardless — that adversarial DB-integrity guarantee is real,
+    structural, and unaffected by either checkpoint. Only the
+    CONVERSATIONAL claim remains unguarded here, honestly left that way
+    per both checkpoints' own "do not overclaim closure" instruction.
     """
     from app.modules.chat.write_intent import detect_clear_write_intent
 
@@ -270,6 +313,136 @@ def test_fresh_write_text_only_miss_is_a_documented_residual_truthfulness_gap(
     assert task_before["id"] in [t["id"] for t in tasks_after]
     assert any(e["id"] == event_before["id"] for e in events_after if e["source"] == "event")
     assert life_area_before["id"] in [a["id"] for a in life_areas_after]
+
+
+# ---- Checkpoint 3.23: mandatory structured turn routing ---------------------------
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Can you add tasks in BAZRA?",
+        "How do I delete an event?",
+        "If I said delete this, what would happen?",
+        "Don't delete my meeting.",
+        "I deleted the meeting myself.",
+        "Remind me why we removed that task.",
+        "هو ينفع تضيف مهام؟",
+        "إزاي أمسح موعد؟",
+        "متلغيش الاجتماع.",
+        "أنا لغيت الاجتماع بنفسي.",
+    ],
+)
+def test_adversarial_non_write_messages_route_to_respond_with_text_not_a_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch, message: str,
+) -> None:
+    """Checkpoint 3.23 Part 14 — the full adversarial false-positive
+    set (informational, explanatory, hypothetical, negated, past-fact,
+    history-question, English and Egyptian Arabic). Mocks the model to
+    do exactly what the 3.22 inspection's own real-provider experiments
+    observed it reliably do for each of these: call respond_with_text
+    with kind="answer" rather than any propose_* tool. Proves
+    chat_service's own dispatch persists that natural text and creates
+    NO ProposedAction — this test is about chat_service's DISPATCH
+    mechanics given that (real, provider-validated) tool choice, not a
+    fresh claim about model reliability itself (see the live gate for
+    that).
+    """
+    from app.modules.actions import service as actions_service
+
+    _ensure_no_pending_proposal(db_session)
+    reply_text = f"Sure — here's an answer for: {message}"
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(None, tool_name="respond_with_text", arguments={"kind": "answer", "text": reply_text}),
+    )
+
+    response = _send(authenticated_client, message)
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == reply_text
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_ambiguous_update_routes_to_clarification_with_no_guessed_id(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.23 Part 15/Q — two matching events exist; mocks the
+    model doing what 3.22's own real-provider experiments proved it
+    reliably does here: call respond_with_text(kind="clarification")
+    naming both candidates rather than guessing an event_id via
+    propose_update_event. No ProposedAction is created."""
+    from app.modules.actions import service as actions_service
+
+    _ensure_no_pending_proposal(db_session)
+    event_a = _create_real_event(authenticated_client, "Meeting with Hussein - 323amb", "2026-09-29T09:00:00+03:00")
+    event_b = _create_real_event(authenticated_client, "Meeting with Hussein - 323amb", "2026-09-29T14:00:00+03:00")
+
+    clarification_text = "You have two 'Meeting with Hussein' events tomorrow — which one do you mean?"
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(None, tool_name="respond_with_text", arguments={"kind": "clarification", "text": clarification_text}),
+    )
+
+    response = _send(authenticated_client, "Move my meeting tomorrow to 3pm.")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == clarification_text
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+    # neither candidate event was touched — both still exist, untouched
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-29T00:00:00Z", "to": "2026-09-30T00:00:00Z"},
+    ).json()
+    event_ids_present = {i["id"] for i in agenda if i["source"] == "event"}
+    assert event_a["id"] in event_ids_present
+    assert event_b["id"] in event_ids_present
+
+
+def test_respond_with_text_answer_persists_natural_text_and_creates_no_proposal(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.23 Part 9/12 — plain conversation (a joke, an
+    explanation) through the new mandatory-tool contract: persisted
+    verbatim, no ProposedAction, personality intact."""
+    from app.modules.actions import service as actions_service
+
+    _ensure_no_pending_proposal(db_session)
+    joke = "Why did the calendar app break up with the to-do list? Too many unchecked commitments!"
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(None, tool_name="respond_with_text", arguments={"kind": "answer", "text": joke}),
+    )
+
+    response = _send(authenticated_client, "Tell me a joke.")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == joke
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_respond_with_text_invalid_arguments_fall_back_deterministically(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.23 — respond_with_text itself is subject to the SAME
+    validation discipline as every propose_* tool: missing/empty text
+    or an invalid kind never reaches the user verbatim (RespondWithTextArguments
+    rejects it), falling back to the plain deterministic
+    _NO_REPLY_FALLBACK_MESSAGE — never to any accompanying top-level
+    model text either (MODEL TEXT IS NEVER EXECUTION EVIDENCE applies
+    here exactly as it does to every other tool's invalid-argument
+    path)."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("some top-level text that must not leak through", tool_name="respond_with_text", arguments={"kind": "answer", "text": "   "}),
+    )
+
+    response = _send(authenticated_client, "hi")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == chat_service._NO_REPLY_FALLBACK_MESSAGE
 
 
 def test_stale_yes_with_false_completion_claim_never_surfaces_the_claim(
@@ -949,7 +1122,14 @@ def test_history_capped_at_max_message_count(
 
     def _fake_generate_reply(**kwargs):
         captured["history"] = kwargs["history"]
-        return OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")
+        return OrchestratorResult(
+                text=None,
+                tool_call=ToolCallRequest(
+                    tool_use_id="toolu_test", tool_name="respond_with_text",
+                    arguments={"kind": "answer", "text": "ok"},
+                ),
+                correlation_id="corr_test",
+            )
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -1027,7 +1207,14 @@ def test_incoming_and_history_budgets_are_independent(
 
     def _fake_generate_reply(**kwargs):
         captured["history_len"] = len(kwargs["history"])
-        return OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")
+        return OrchestratorResult(
+                text=None,
+                tool_call=ToolCallRequest(
+                    tool_use_id="toolu_test", tool_name="respond_with_text",
+                    arguments={"kind": "answer", "text": "ok"},
+                ),
+                correlation_id="corr_test",
+            )
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
@@ -1115,12 +1302,18 @@ def test_no_prompt_or_response_or_key_in_ai_traces_for_chat_calls(
         input_tokens = 5
         output_tokens = 5
 
-    class _FakeTextBlock:
-        type = "text"
-        text = f"response with {marker}"
+    class _FakeToolUseBlock:
+        # Checkpoint 3.23: a bare text block is no longer a possible
+        # response shape (tool_choice="any" forces exactly one tool
+        # call) — the marker now travels inside respond_with_text's
+        # own "text" argument instead of a top-level text block.
+        type = "tool_use"
+        id = "toolu_trace_test"
+        name = "respond_with_text"
+        input = {"kind": "answer", "text": f"response with {marker}"}
 
     class _FakeMessage:
-        content = [_FakeTextBlock()]
+        content = [_FakeToolUseBlock()]
         usage = _FakeUsage()
 
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
@@ -1355,7 +1548,14 @@ def test_relevant_memory_appears_in_a_later_conversations_context(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(
+                text=None,
+                tool_call=ToolCallRequest(
+                    tool_use_id="toolu_test", tool_name="respond_with_text",
+                    arguments={"kind": "answer", "text": "ok"},
+                ),
+                correlation_id="corr_test",
+            )),
     )
     _send(authenticated_client, "اشرحلي الـ Model Router")
 
@@ -1381,7 +1581,14 @@ def test_forgotten_memory_does_not_appear_in_context(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(
+                text=None,
+                tool_call=ToolCallRequest(
+                    tool_use_id="toolu_test", tool_name="respond_with_text",
+                    arguments={"kind": "answer", "text": "ok"},
+                ),
+                correlation_id="corr_test",
+            )),
     )
     _send(authenticated_client, "what's up?")
 
@@ -1405,7 +1612,14 @@ def test_inference_type_memory_is_labeled_tentative_in_context(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(
+                text=None,
+                tool_call=ToolCallRequest(
+                    tool_use_id="toolu_test", tool_name="respond_with_text",
+                    arguments={"kind": "answer", "text": "ok"},
+                ),
+                correlation_id="corr_test",
+            )),
     )
     _send(authenticated_client, "what's up?")
 
@@ -1442,7 +1656,14 @@ def test_memory_context_discloses_truncation_when_active_count_exceeds_the_cap(
     captured = {}
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
-        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(text="...", tool_call=None, correlation_id="corr_test")),
+        lambda **kwargs: (captured.update(context=kwargs["context"]) or OrchestratorResult(
+            text=None,
+            tool_call=ToolCallRequest(
+                tool_use_id="toolu_test", tool_name="respond_with_text",
+                arguments={"kind": "answer", "text": "..."},
+            ),
+            correlation_id="corr_test",
+        )),
     )
     _send(authenticated_client, "إيه اللي فاكره عني؟")
 
@@ -1565,14 +1786,20 @@ def test_identity_and_personality_instructions_reach_a_real_chat_turns_system_pr
     driven by a real chat_service.send_message call.
     """
     from app.modules.model_router import service as model_router_service
-    from app.modules.model_router.schemas import ModelResponse
+    from app.modules.model_router.schemas import ModelResponse, ToolUseBlock
 
     captured = {}
 
-    def _fake_complete(*, purpose, messages, system=None, tools=None):
+    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None):
         captured["system"] = system
+        # Checkpoint 3.23: the real (unmocked) generate_reply now
+        # requires exactly one tool_use — respond_with_text stands in
+        # for "just an ordinary answer" here, the same remapping
+        # _mock_reply itself does for the higher-level (generate_reply-
+        # mocking) tests elsewhere in this file.
         return ModelResponse(
-            text="ok", model="claude-sonnet-5", prompt_tokens=1, completion_tokens=1, tool_uses=[],
+            text=None, model="claude-sonnet-5", prompt_tokens=1, completion_tokens=1,
+            tool_uses=[ToolUseBlock(id="toolu_test", name="respond_with_text", input={"kind": "answer", "text": "ok"})],
             correlation_id="corr_test",
         )
 
@@ -2379,7 +2606,14 @@ def _capture_context(monkeypatch: pytest.MonkeyPatch) -> dict:
     def _fake(**kwargs):
         captured["context"] = kwargs["context"]
         captured["history"] = kwargs["history"]
-        return OrchestratorResult(text="ok", tool_call=None, correlation_id="corr_test")
+        return OrchestratorResult(
+                text=None,
+                tool_call=ToolCallRequest(
+                    tool_use_id="toolu_test", tool_name="respond_with_text",
+                    arguments={"kind": "answer", "text": "ok"},
+                ),
+                correlation_id="corr_test",
+            )
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake)
     return captured
@@ -2613,12 +2847,16 @@ def test_no_active_proposal_branch_adds_no_extra_ai_trace(
         input_tokens = 5
         output_tokens = 5
 
-    class _FakeTextBlock:
-        type = "text"
-        text = "ok"
+    class _FakeToolUseBlock:
+        # Checkpoint 3.23: bare text is no longer a possible response
+        # shape — a real, single tool call is required.
+        type = "tool_use"
+        id = "toolu_trace_test"
+        name = "respond_with_text"
+        input = {"kind": "answer", "text": "ok"}
 
     class _FakeMessage:
-        content = [_FakeTextBlock()]
+        content = [_FakeToolUseBlock()]
         usage = _FakeUsage()
 
     monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
@@ -3389,12 +3627,17 @@ def test_create_event_proposal_and_confirm_use_zero_extra_ai_traces_and_log_dete
 def test_single_tool_call_dispatch_never_produces_both_task_and_event_for_one_turn(
     authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Structural proof (not a prompt-reliability claim): even if a
-    single model response somehow carried multiple tool_use blocks,
-    orchestrator_service.generate_reply only ever takes the first
-    (documented, deliberate design since Checkpoint 3.3) — so a single
-    turn can never dispatch to both propose_create_task and
-    propose_create_event regardless of what the model outputs."""
+    """Structural proof (not a prompt-reliability claim) at the
+    chat_service dispatch layer: given an already-resolved single
+    ToolCallRequest (whatever orchestrator_service.generate_reply
+    itself decided — as of Checkpoint 3.23 that function raises
+    OrchestratorContractViolationError on a genuine multi-tool-use
+    response rather than silently taking the first; see its own
+    dedicated tests in test_orchestrator.py), send_message's own
+    dispatch never produces more than one ProposedAction from one
+    tool_call — so a single turn can never dispatch to both
+    propose_create_task and propose_create_event regardless of what
+    the model outputs."""
     from app.modules.actions import service as actions_service
     from app.modules.orchestrator.schemas import OrchestratorResult, ToolCallRequest
 

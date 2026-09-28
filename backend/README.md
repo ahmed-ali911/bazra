@@ -935,6 +935,70 @@ observed to misfire during this particular live-gate run.
 `ProposedAction`'s state machine, the 3.17 advisory lock, and AiTrace
 are all byte-for-byte unchanged — no migration.
 
+### Checkpoint 3.23
+
+Mandatory structured turn routing — the primary chat model contract changed
+from "text OR a tool call" to "exactly one tool call, always." A new
+`respond_with_text(kind: "answer" | "clarification", text: string)` tool is
+now offered alongside every `propose_*`/`get_weather` tool, and the primary
+chat call now forces `tool_choice={"type": "any", "disable_parallel_tool_use":
+true}` (`orchestrator/service.py`'s `_PRIMARY_CHAT_TOOL_CHOICE`) — a bare,
+tool-less text reply is no longer a possible response shape at all. This
+structurally eliminates the specific failure the 3.20/3.21/3.22 checkpoints
+tracked as "Population C, part 1": the model silently omitting a required
+`propose_*` call for a fresh write and defaulting to plain text.
+
+**`generate_reply` enforces the contract itself, not just the provider**:
+zero or multiple parsed `tool_use` blocks both raise
+`OrchestratorContractViolationError` (a subclass of the existing
+`OrchestratorError`, so `chat_service`'s existing failure handling catches it
+with no new code there) — never silently falling back to bare text or
+picking the first of several calls. A defensive `stop_reason` cross-check
+(now exposed on `ModelResponse`, read straight off the raw provider response,
+never persisted to `AiTrace`) logs a warning on disagreement but never gates
+correctness by itself — parsed `tool_use` blocks remain authoritative.
+
+**`respond_with_text` is exactly as inert as every `propose_*` tool call**:
+it creates no `ProposedAction`, touches no domain module, and its own
+`_handle_respond_with_text` returns a plain candidate string rather than
+persisting immediately — specifically so the existing 3.21 stale-proposal
+guard can still override it before anything is persisted. MODEL TEXT IS
+STILL NEVER EXECUTION EVIDENCE: the guard's own condition
+(`narrow_answer is not None and pending is not None and not adjacent`) is
+completely unchanged, it just now fires against `respond_with_text`'s
+candidate text instead of the old bare `result.text`.
+
+**The honest, explicitly-not-solved residual**: a fresh write with no
+pre-existing pending proposal can still be *misrouted* — the model calls the
+always-legal `respond_with_text(kind="answer", ...)` instead of the correct
+`propose_*` tool, and that tool's own `text` argument can still falsely claim
+completion. `chat_service` has no structural signal, when `pending is None`,
+to distinguish that misroute from a `respond_with_text` call that correctly
+judged no action was needed — both produce an identical shape. Guarding this
+would require either a lexical blacklist or a second classifier model, both
+explicitly excluded. The pre-existing adversarial test for this exact case
+(`test_fresh_write_misrouted_to_respond_with_text_is_a_documented_residual_truthfulness_gap`)
+still passes, now demonstrating the misroute shape instead of the old bare-
+text shape, with identical DB-integrity guarantees.
+
+Live-verified against the real provider (15 scenarios, no mocking): ordinary
+English/Egyptian-Arabic conversation, a clear task creation, a clear event
+deletion, an ambiguous event move (two same-titled candidates — correctly
+asked which one, never guessed an id), a missing-duration meeting request
+(correctly asked for the time), informational/negated write-shaped questions
+in both languages, factual and interpretive weather (AiTrace deltas exactly
+1 and 2, matching the unchanged cost model), and the full stale-yes/stale-no/
+immediate-confirm/immediate-reject family. One especially instructive result:
+on a non-adjacent stale "yes," the model sometimes correctly *re-proposes* a
+fresh, real `propose_delete_task` call (a new `ProposedAction`, requiring its
+own fresh confirmation) rather than needing the deterministic override at
+all — both outcomes are safe; the override exists for when the model doesn't
+do that. No false completion claims were observed in this run; DB state and
+disposable data were verified clean afterward.
+
+No new `ProposedAction` status, no change to the 3.17 advisory lock or the
+confirm/reject/execution-failure paths, no migration.
+
 ## Run locally (without Docker)
 
 ```bash

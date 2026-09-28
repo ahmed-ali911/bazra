@@ -1,7 +1,11 @@
+import logging
+
 from app.modules.model_router import service as model_router_service
 from app.modules.model_router.schemas import TextBlock, ToolResultBlock, ToolUseBlock
 from app.modules.orchestrator.identity import BAZRA_IDENTITY_INSTRUCTIONS
 from app.modules.orchestrator.schemas import HistoryTurn, OrchestratorResult, ToolCallRequest
+
+logger = logging.getLogger(__name__)
 
 # Checkpoint 3.8: the terminal tool-result continuation's own system
 # prompt — deliberately NOT _build_system_prompt's full Task/Calendar/
@@ -42,10 +46,32 @@ def _build_tool_result_system_prompt() -> str:
 # has no path to reach. See this module's own test proving that, plus
 # chat's adversarial test proving the database stays unchanged even
 # when the model's own text falsely claims otherwise.
+#
+# Checkpoint 3.23: respond_with_text is exactly as inert as
+# propose_create_task in this same sense — it is UNTRUSTED MODEL
+# PROSE, never execution/confirmation/mutation evidence, and chat/
+# never treats calling it as anything more than "here is some text to
+# maybe show the user" (subject to the same 3.21 truthfulness guard as
+# the old bare-text path it replaces). tool_choice is now forced to
+# "any" for this primary chat call (see generate_reply), so a bare,
+# tool-less text reply is no longer a possible SHAPE of response at
+# all — but that is a STRUCTURAL guarantee about response shape, not a
+# new guarantee about what the model chooses to say inside
+# respond_with_text's own text argument.
 _SYSTEM_INSTRUCTIONS = (
     "## Your job in this conversation\n"
     "Answer questions about the user's own tasks, calendar, inbox, and life "
     "areas, using the rules below.\n\n"
+    "Every response you give MUST be exactly one tool call — never plain text "
+    "outside a tool call. For ordinary conversation, explanations, informational "
+    "or hypothetical questions, negations, statements of past fact, humor, or a "
+    "clarifying question, call the respond_with_text tool (kind=\"answer\" for "
+    "the first group, kind=\"clarification\" when you need more information or "
+    "the target of a write is ambiguous before you could safely propose it). "
+    "Never guess a target or invent missing details merely to avoid asking — "
+    "call respond_with_text with kind=\"clarification\" instead. This does not "
+    "make you robotic: the text you put in respond_with_text's own text field "
+    "is your normal, natural reply, in the user's own language and tone.\n\n"
     "Rules you must follow:\n"
     "- You can only READ Inbox items and Life Areas in \"Current Data\" below — "
     "you have NO ability to edit, delete, mark complete, or create either of "
@@ -216,6 +242,29 @@ class OrchestratorError(Exception):
     module don't need to import model_router directly."""
 
 
+class OrchestratorContractViolationError(OrchestratorError):
+    """Checkpoint 3.23 — raised when the primary chat call's own
+    tool_choice="any" contract was violated by the provider: zero tool
+    calls, or more than one. The provider CALL itself succeeded (this
+    is deliberately a SUBCLASS of OrchestratorError, not a sibling —
+    chat_service's existing `except OrchestratorError` already catches
+    it without any new code there, folding into the same, already-
+    proven-safe ChatModelCallFailed path: no assistant message is ever
+    persisted for a turn that never produced a real, contract-
+    conforming reply, exactly like any other genuine provider/parsing
+    failure). Expected to be exceptionally rare — the 3.22 inspection's
+    own real-provider experiments observed zero violations across ~30
+    forced tool_choice="any" trials — this exists purely as the
+    "reinforce the provider guarantee with application validation"
+    defensive backstop the 3.23 brief calls for, not a routine path.
+    """
+
+    def __init__(self, reason: str, tool_call_count: int):
+        self.reason = reason
+        self.tool_call_count = tool_call_count
+        super().__init__(f"{reason} (tool_call_count={tool_call_count})")
+
+
 def _build_system_prompt(context: str, current_datetime_local: str) -> str:
     """Identity/personality (who BAZRA is, Checkpoint 3.5) comes first,
     establishing character before the operational tool-use/data rules —
@@ -228,6 +277,17 @@ def _build_system_prompt(context: str, current_datetime_local: str) -> str:
         f"## Current date/time\n{current_datetime_local}\n\n"
         f"## Current Data\n{context}"
     )
+
+
+# Checkpoint 3.23 — the primary chat call's own fixed policy: always
+# require exactly one tool call, and disable parallel tool use so the
+# provider itself cannot even attempt more than one. A plain dict,
+# forwarded through Model Router verbatim (see that module's own
+# _call_anthropic docstring for why it stays generic/BAZRA-agnostic).
+# This is deliberately NOT parametrized per-caller — generate_reply
+# has exactly one call site (chat_service.send_message) and this IS
+# that call's contract now, not a per-request choice.
+_PRIMARY_CHAT_TOOL_CHOICE = {"type": "any", "disable_parallel_tool_use": True}
 
 
 def generate_reply(
@@ -247,7 +307,25 @@ def generate_reply(
     tools is additive (Checkpoint 3.3) — passed straight through to
     Model Router; this function never inspects or validates a tool's
     arguments itself, that happens at the domain boundary in whichever
-    module owns the tool (actions_service, for propose_create_task).
+    module owns the tool (actions_service, for propose_create_task;
+    chat_service itself, for the new respond_with_text — see its own
+    RespondWithTextArguments).
+
+    Checkpoint 3.23: when tools are offered, this call now forces
+    _PRIMARY_CHAT_TOOL_CHOICE — the model MUST return exactly one tool
+    call (a real propose_*/get_weather action, or the safe
+    respond_with_text escape hatch); a bare, tool-less text reply is no
+    longer a possible response SHAPE at all. This function enforces
+    that contract itself rather than trusting the provider alone (see
+    OrchestratorContractViolationError) — zero or multiple tool calls
+    both raise, never silently degrading to "pick the first" or
+    "return bare text as if it were normal." This eliminates ONE
+    specific failure class (the model omitting a required tool call
+    entirely — Population C's "fresh write, text-only miss" as
+    originally observed). It does NOT and cannot guarantee the model
+    picks the RIGHT tool — see chat_service's own stale-proposal guard
+    and the 3.23 close-out's own documented residual for the failure
+    class this does not close.
 
     NOT a pure function: the underlying model call is a real side
     effect (network I/O, real cost, non-deterministic output). The
@@ -257,21 +335,52 @@ def generate_reply(
     messages = [{"role": turn.role, "content": turn.content} for turn in history]
     messages.append({"role": "user", "content": user_message})
 
+    # tool_choice is omitted from the call entirely (not passed as an
+    # explicit None) when no tools are offered — the same "backward-
+    # compatible when omitted" shape model_router_service.complete
+    # itself follows, so a caller/test that never offers tools sees a
+    # byte-for-byte unchanged call.
+    complete_kwargs = {
+        "purpose": "chat_completion",
+        "messages": messages,
+        "system": _build_system_prompt(context, current_datetime_local),
+        "tools": tools,
+    }
+    if tools:
+        complete_kwargs["tool_choice"] = _PRIMARY_CHAT_TOOL_CHOICE
+
     try:
-        response = model_router_service.complete(
-            purpose="chat_completion",
-            messages=messages,
-            system=_build_system_prompt(context, current_datetime_local),
-            tools=tools,
-        )
+        response = model_router_service.complete(**complete_kwargs)
     except model_router_service.ModelRouterError as exc:
         raise OrchestratorError(str(exc)) from exc
 
-    # Multiple tools may be offered (3.3: propose_create_task; 3.4 adds
-    # propose_save_memory/propose_forget_memory), but at most one CALL is
-    # expected per turn — the first is taken deliberately rather than
-    # building support for multiple simultaneous tool calls that nothing
-    # in this checkpoint's scope can produce.
+    # Checkpoint 3.23 — exactly-one-tool-call enforcement. Applied only
+    # when tools were actually offered (tool_choice was only set in
+    # that case above); a caller that never offers tools keeps the
+    # pre-3.23 "any number of tool_uses from zero up, first one wins"
+    # behavior, since no contract was ever requested of the provider
+    # for that call. Reinforces the provider's own tool_choice="any"
+    # guarantee with real application-side validation rather than
+    # trusting it blindly — see OrchestratorContractViolationError's
+    # own docstring for how rare this is expected to be in practice.
+    if tools:
+        call_count = len(response.tool_uses)
+        if call_count == 0:
+            raise OrchestratorContractViolationError("no_tool_call", call_count)
+        if call_count > 1:
+            raise OrchestratorContractViolationError("multiple_tool_calls", call_count)
+        if response.stop_reason not in (None, "tool_use"):
+            # Defensive cross-check only (Checkpoint 3.22/3.23) — never
+            # gates correctness by itself, per the explicit instruction
+            # that parsed tool_use blocks remain primary. A disagreement
+            # here (a real tool_use was parsed, but the provider's own
+            # stop_reason says something else) is logged for visibility,
+            # not raised — the parsed block is still trusted.
+            logger.warning(
+                "orchestrator: stop_reason=%r disagrees with parsed tool_uses (count=%d)",
+                response.stop_reason, call_count,
+            )
+
     tool_call = None
     if response.tool_uses:
         first = response.tool_uses[0]

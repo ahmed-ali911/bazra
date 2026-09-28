@@ -74,3 +74,4 @@ class ModelResponse:
     completion_tokens: int
     tool_uses: list[ToolUseBlock]
     correlation_id: str
+    stop_reason: str | None = None

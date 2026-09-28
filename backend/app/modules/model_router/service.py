@@ -94,6 +94,7 @@ def _call_anthropic(
     messages: list[dict],
     system: str | None = None,
     tools: list[dict] | None = None,
+    tool_choice: dict | None = None,
 ) -> Message:
     """The only function in this module that talks to the Anthropic SDK
     directly — everything else in complete() is boundary/bookkeeping
@@ -101,12 +102,26 @@ def _call_anthropic(
     top-level parameter, not a role inside `messages` — the Messages API
     has no "system" message role. tools is additive (Checkpoint 3.3) —
     omitted entirely when not passed, so existing callers see no change
-    in the request shape at all."""
+    in the request shape at all.
+
+    tool_choice (Checkpoint 3.23) is additive the same way — a plain
+    dict forwarded to the SDK verbatim (e.g. {"type": "any",
+    "disable_parallel_tool_use": True}), never interpreted or
+    constructed here. This module stays generic and BAZRA-action-
+    agnostic: the POLICY of which tool_choice shape to use for which
+    call purpose lives entirely in Orchestrator (see generate_reply's
+    own _PRIMARY_CHAT_TOOL_CHOICE), not here. Omitted entirely when
+    not passed, so a caller that never passes it (every purpose except
+    the primary chat call) sees byte-for-byte the same request shape
+    as before this checkpoint.
+    """
     kwargs = {"model": model, "max_tokens": _MAX_TOKENS, "messages": _serialize_messages(messages)}
     if system is not None:
         kwargs["system"] = system
     if tools is not None:
         kwargs["tools"] = tools
+    if tool_choice is not None:
+        kwargs["tool_choice"] = tool_choice
     return _get_client().messages.create(**kwargs)
 
 
@@ -218,6 +233,7 @@ def complete(
     system: str | None = None,
     tools: list[dict] | None = None,
     correlation_id: str | None = None,
+    tool_choice: dict | None = None,
 ) -> ModelResponse:
     """The only function other modules call to reach a model provider.
 
@@ -231,6 +247,14 @@ def complete(
     omitted, behavior is byte-for-byte identical to before this
     checkpoint. ModelResponse.text may be None only when tools were
     offered and the model chose to call one with no accompanying text.
+
+    tool_choice (Checkpoint 3.23) is additive and purpose-agnostic —
+    forwarded to _call_anthropic verbatim, never inspected or built
+    here. Omitted (every purpose except the primary chat call today)
+    means byte-for-byte the same request shape as before this
+    checkpoint; this module has no idea what "any" or
+    disable_parallel_tool_use mean, and no BAZRA action name ever
+    appears here — see _call_anthropic's own docstring.
 
     correlation_id (Checkpoint 3.8) is an opaque grouping identifier for
     AiTrace rows that belong to the same logical model workflow — no
@@ -277,7 +301,7 @@ def complete(
     try:
         if not settings.anthropic_api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not configured")
-        raw = _call_anthropic(model, messages, system=system, tools=tools)
+        raw = _call_anthropic(model, messages, system=system, tools=tools, tool_choice=tool_choice)
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
         _safe_record_trace(
@@ -355,4 +379,10 @@ def complete(
         completion_tokens=completion_tokens,
         tool_uses=tool_uses,
         correlation_id=resolved_correlation_id,
+        # Checkpoint 3.23 — exposed for Orchestrator's own defensive
+        # exactly-one-tool-call cross-check (see generate_reply). Read
+        # straight off the raw provider response, never persisted
+        # (AiTrace gets no new field — see _record_trace above, whose
+        # own fields are completely unchanged by this checkpoint).
+        stop_reason=getattr(raw, "stop_reason", None),
     )

@@ -2,9 +2,10 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -363,11 +364,90 @@ _GET_WEATHER_TOOL = {
     },
 }
 
+# Checkpoint 3.23 — the mandatory no-action escape hatch. Offered
+# alongside every propose_*/get_weather tool with tool_choice forced
+# to "any" (see orchestrator/service.py's _PRIMARY_CHAT_TOOL_CHOICE),
+# this is what makes "any" SAFE rather than a forced guess: the 3.22
+# inspection proved directly (real, unmocked provider calls) that
+# tool_choice="any" over ONLY the action tools produces garbage/
+# sentinel arguments on informational, hypothetical, negated, or
+# ambiguous messages, but is 100% correct once a genuine, always-legal
+# "just reply" tool exists in the same offered set. Carries no
+# execution/completion/action_type/metadata field by construction —
+# see RespondWithTextArguments — purely a structured carrier for
+# natural-language text. Calling this NEVER creates a ProposedAction
+# and NEVER mutates anything; chat_service treats its own `text`
+# argument as exactly as untrusted as the old bare-text fallthrough it
+# replaces (see _handle_respond_with_text and the 3.21 stale-proposal
+# guard, both unchanged in what they distrust, only in where the text
+# now arrives from).
+_RESPOND_WITH_TEXT_TOOL = {
+    "name": "respond_with_text",
+    "description": (
+        "Reply in natural language WITHOUT taking any action. Every response you give must be "
+        "exactly one tool call — this is the tool to call whenever no propose_* action or "
+        "get_weather read is actually being requested right now. Use kind=\"answer\" for ordinary "
+        "conversation, explanations, informational or hypothetical questions, negations, "
+        "statements of past fact, humor, or anything else that isn't a request to change data. "
+        "Use kind=\"clarification\" when the user wants a supported write but the target is "
+        "ambiguous (e.g. more than one matching task or event) or a required detail is missing — "
+        "never guess an id or invent a missing detail merely to avoid asking."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["answer", "clarification"],
+                "description": (
+                    "'answer' for ordinary conversation/explanation/informational or hypothetical "
+                    "questions/negation/past fact. 'clarification' when more information or a "
+                    "disambiguated target is needed before a write could safely be proposed."
+                ),
+            },
+            "text": {
+                "type": "string",
+                "description": "The natural-language reply to show the user, in their own language and tone. Must not be empty.",
+            },
+        },
+        "required": ["kind", "text"],
+    },
+}
+
 _TOOLS_OFFERED = [
     _PROPOSE_CREATE_TASK_TOOL, _PROPOSE_UPDATE_TASK_TOOL, _PROPOSE_DELETE_TASK_TOOL,
     _PROPOSE_CREATE_EVENT_TOOL, _PROPOSE_UPDATE_EVENT_TOOL, _PROPOSE_DELETE_EVENT_TOOL,
     _PROPOSE_SAVE_MEMORY_TOOL, _PROPOSE_FORGET_MEMORY_TOOL, _GET_WEATHER_TOOL,
+    _RESPOND_WITH_TEXT_TOOL,
 ]
+
+
+class RespondWithTextArguments(BaseModel):
+    """Checkpoint 3.23 — the pure shape-validator for respond_with_text,
+    the same "validate before trusting" discipline as every domain
+    action schema (e.g. TaskCreate for propose_create_task), even
+    though this tool creates no ProposedAction and reaches no domain
+    module at all. Deliberately minimal and closed: exactly `kind` and
+    `text`, nothing else — no execution/completion field, no
+    action_type, no free-form metadata dict, by design (see
+    _RESPOND_WITH_TEXT_TOOL's own input_schema, which the model is
+    already constrained to). A model-supplied `text` that is empty or
+    all-whitespace is rejected here — the same "no valid structured
+    data to trust" outcome InvalidActionArgumentsError represents for
+    every other tool, handled identically by _handle_respond_with_text
+    below (falls back to the deterministic _NO_REPLY_FALLBACK_MESSAGE,
+    never to any other model-authored text).
+    """
+
+    kind: Literal["answer", "clarification"]
+    text: str
+
+    @field_validator("text")
+    @classmethod
+    def _text_must_be_non_empty(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("text must not be empty")
+        return value
 
 # Used by _describe_pending_proposal to tell the model which tool to call
 # again for a revision, regardless of which action_type is pending.
@@ -1311,6 +1391,39 @@ def _reply_for_stale_proposal_text(user_message: str) -> str:
     )
 
 
+def _handle_respond_with_text(arguments: dict) -> str:
+    """Checkpoint 3.23 — the structural replacement for the old bare-
+    text ("no tool call at all") fallthrough, now that tool_choice
+    forces every primary chat turn to call exactly one tool (see
+    orchestrator/service.py's _PRIMARY_CHAT_TOOL_CHOICE).
+
+    Deliberately DOES NOT follow the _handle_*_proposal/_handle_get_weather
+    shape (db/space_id/... in, ChatMessage persisted and returned) —
+    unlike every one of those, respond_with_text's own reply is not
+    unconditionally authoritative: send_message's existing 3.21
+    stale-proposal guard must still be able to override it (see that
+    guard's own docstring, and send_message's call site below) before
+    anything is persisted. Returning a plain candidate string, not a
+    persisted ChatMessage, is what leaves that override possible.
+
+    respond_with_text is UNTRUSTED MODEL PROSE — MODEL TEXT IS NEVER
+    EXECUTION EVIDENCE. It creates no ProposedAction, touches no
+    domain module, and its own schema (RespondWithTextArguments)
+    structurally carries no execution/completion/action_type field at
+    all; nothing about calling this tool is ever treated as evidence
+    that anything happened. On invalid arguments (matching every other
+    handler's own "never trust accompanying model text on a validation
+    failure" discipline, fixed in 3.21) this falls back to the plain
+    deterministic _NO_REPLY_FALLBACK_MESSAGE — never to any raw model
+    text, from any source.
+    """
+    try:
+        validated = RespondWithTextArguments(**arguments)
+    except ValidationError:
+        return _NO_REPLY_FALLBACK_MESSAGE
+    return validated.text
+
+
 def _reply_for_confirm_result(result: ConfirmResult, action_type: str, user_message: str) -> str:
     if result.outcome == "executed":
         if result.task is not None:
@@ -1741,20 +1854,28 @@ def send_message(
        'pending' in the database, describable but not bare-yes/no-
        actionable.
     4. Everything else -> the Orchestrator, with propose_create_task/
-       propose_save_memory/propose_forget_memory all offered and any
-       pending proposal (of whichever type) folded into context, plus
-       (Checkpoint 3.4) the user's own active memories. A tool call
-       creates/revises a pending proposal (atomically with the
-       assistant message describing it); no tool call is an ordinary
-       answer that leaves any pending proposal untouched — UNLESS
-       (Checkpoint 3.21) the current message was itself a bare yes/no
-       aimed at a real pending proposal that just failed step 3's own
-       adjacency check (narrow_answer is not None, pending is not
-       None, not adjacent) — that specific, narrow population never
-       gets the model's own raw text as its reply (MODEL TEXT IS NEVER
-       EXECUTION EVIDENCE), since nothing executed or rejected on this
-       turn regardless of what that text says. See
-       _reply_for_stale_proposal_text's own docstring.
+       propose_save_memory/propose_forget_memory/.../get_weather and
+       (Checkpoint 3.23) respond_with_text ALL offered, and any pending
+       proposal (of whichever type) folded into context, plus
+       (Checkpoint 3.4) the user's own active memories. As of 3.23 the
+       model MUST return exactly one tool call for this turn (see
+       orchestrator_service.generate_reply's own _PRIMARY_CHAT_TOOL_CHOICE)
+       — a bare, tool-less text reply is no longer a possible response
+       shape at all; zero or multiple tool calls raise
+       OrchestratorContractViolationError, caught by the same
+       `except OrchestratorError` below as any other provider failure.
+       A propose_*/get_weather call creates/revises a pending proposal
+       or executes a read exactly as before; a respond_with_text call
+       is chat_service's OWN, untrusted, no-action reply — UNLESS
+       (Checkpoint 3.21, unchanged in what it distrusts) the current
+       message was itself a bare yes/no aimed at a real pending
+       proposal that just failed step 3's own adjacency check
+       (narrow_answer is not None, pending is not None, not adjacent)
+       — that specific, narrow population never gets respond_with_text's
+       own text as its reply (MODEL TEXT IS NEVER EXECUTION EVIDENCE),
+       since nothing executed or rejected on this turn regardless of
+       what that text says. See _reply_for_stale_proposal_text's own
+       docstring.
 
     Checkpoint 3.17: a transaction-scoped conversation advisory lock
     (_acquire_conversation_lock) is held from just before the incoming
@@ -1839,34 +1960,48 @@ def send_message(
     except orchestrator_service.OrchestratorError as exc:
         raise ChatModelCallFailed(user_message.id) from exc
 
-    if result.tool_call is not None:
-        handler = _TOOL_HANDLERS.get(result.tool_call.tool_name)
-        if handler is not None:
-            assistant_message = handler(
-                db, space_id, user_id, result.tool_call.arguments, result.text, timezone_name, content,
-                result.tool_call.tool_use_id, result.correlation_id,
-            )
-            return user_message, assistant_message
+    # Checkpoint 3.23 — result.tool_call is now guaranteed non-None on
+    # a successful return from generate_reply (it raises
+    # OrchestratorContractViolationError otherwise, caught above like
+    # any other OrchestratorError) — the `is not None` check stays as
+    # explicit defense-in-depth, not because it can currently be False.
+    tool_call = result.tool_call
+    handler = _TOOL_HANDLERS.get(tool_call.tool_name) if tool_call is not None else None
 
-    # Checkpoint 3.21 — MODEL TEXT IS NEVER EXECUTION EVIDENCE. This
-    # turn produced no tool call, so nothing executed (the dispatch
-    # above is the ONLY thing that can create/change/remove anything).
-    # If the CURRENT message was itself a bare yes/no directed at a
-    # real, still-pending proposal that reached here only because it
-    # was no longer conversationally adjacent (3.17), the model's own
-    # text must never be trusted to honestly report that — it may (and,
-    # per the 3.19/3.20 live-gate finding, sometimes does) claim the
-    # stale action completed anyway. narrow_answer/pending/adjacent are
-    # all already computed above (not re-derived, not a new query) —
-    # narrow_answer is None for every ordinary read, weather question,
-    # or ambiguity-clarification turn, so none of those ever reach this
-    # branch (see _classify_narrow_yes_no).
-    if narrow_answer is not None and pending is not None and not adjacent:
-        assistant_message = record_assistant_message(db, space_id, user_id, _reply_for_stale_proposal_text(content))
+    if handler is not None:
+        assistant_message = handler(
+            db, space_id, user_id, tool_call.arguments, result.text, timezone_name, content,
+            tool_call.tool_use_id, result.correlation_id,
+        )
         return user_message, assistant_message
 
-    # Ordinary answer — no tool call (or an unrecognized one, which
-    # should never happen since only the three tools above are ever
-    # offered). Any pending proposal is left untouched.
-    assistant_message = record_assistant_message(db, space_id, user_id, result.text or _NO_REPLY_FALLBACK_MESSAGE)
+    # Checkpoint 3.23 — respond_with_text (the structural no-action
+    # escape hatch that replaces the old bare-text fallthrough), or
+    # defensively, any tool name this dispatch doesn't recognize.
+    # _handle_respond_with_text returns a plain CANDIDATE string, not a
+    # persisted message — see its own docstring for why this handler
+    # alone doesn't follow the "persist and return ChatMessage"
+    # shape every other handler uses.
+    candidate_reply = _handle_respond_with_text(tool_call.arguments if tool_call is not None else {})
+
+    # Checkpoint 3.21 — MODEL TEXT IS NEVER EXECUTION EVIDENCE. Still
+    # wins here even though "no tool call at all" is now structurally
+    # impossible (3.23) — nothing executed or was rejected on THIS turn
+    # regardless of which tool fired or what its text says, so the
+    # same narrow, structural override applies unchanged. If the
+    # CURRENT message was itself a bare yes/no directed at a real,
+    # still-pending proposal that reached here only because it was no
+    # longer conversationally adjacent (3.17), respond_with_text's own
+    # candidate text must never be trusted to honestly report that —
+    # it may (and, per the 3.19/3.20 live-gate findings, sometimes
+    # did, in its pre-3.23 bare-text form) claim the stale action
+    # completed anyway. narrow_answer/pending/adjacent are all already
+    # computed above (not re-derived, not a new query) — narrow_answer
+    # is None for every ordinary read, weather question, or
+    # ambiguity-clarification turn, so none of those ever reach this
+    # override (see _classify_narrow_yes_no).
+    if narrow_answer is not None and pending is not None and not adjacent:
+        candidate_reply = _reply_for_stale_proposal_text(content)
+
+    assistant_message = record_assistant_message(db, space_id, user_id, candidate_reply)
     return user_message, assistant_message

@@ -14,10 +14,16 @@ class _FakeToolUse:
 
 
 class _FakeModelResponse:
-    def __init__(self, text=None, tool_uses=None, correlation_id="corr_test"):
+    def __init__(self, text=None, tool_uses=None, correlation_id="corr_test", stop_reason=None):
         self.text = text
         self.tool_uses = tool_uses or []
         self.correlation_id = correlation_id
+        # Checkpoint 3.23 — mirrors the real ModelResponse.stop_reason
+        # field; defaults to the natural value for whichever shape this
+        # fake was given (a real provider response with tool_uses
+        # always reports stop_reason="tool_use"), so existing callers
+        # that never pass it still get a realistic, consistent fake.
+        self.stop_reason = stop_reason if stop_reason is not None else ("tool_use" if tool_uses else "end_turn")
 
 
 def test_generate_reply_builds_correct_message_list_and_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -60,8 +66,9 @@ def test_generate_reply_builds_correct_message_list_and_system_prompt(monkeypatc
 def test_generate_reply_with_tools_offered_returns_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
-    def _fake_complete(*, purpose, messages, system=None, tools=None):
+    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None):
         captured["tools"] = tools
+        captured["tool_choice"] = tool_choice
         return _FakeModelResponse(
             text="I'll add that task.",
             tool_uses=[_FakeToolUse("propose_create_task", {"title": "Call Hussein"})],
@@ -80,6 +87,126 @@ def test_generate_reply_with_tools_offered_returns_tool_call(monkeypatch: pytest
     assert result.tool_call is not None
     assert result.tool_call.tool_name == "propose_create_task"
     assert result.tool_call.arguments == {"title": "Call Hussein"}
+
+
+def test_generate_reply_forces_the_primary_chat_tool_choice_when_tools_offered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.23: whenever tools are offered, the model MUST
+    return exactly one tool call — verifies the exact tool_choice shape
+    (forced "any" + parallel tool use disabled) actually reaches Model
+    Router, the same "prove it reaches the provider call" discipline
+    every other additive parameter here already gets."""
+    captured = {}
+
+    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None):
+        captured["tool_choice"] = tool_choice
+        return _FakeModelResponse(tool_uses=[_FakeToolUse("respond_with_text", {"kind": "answer", "text": "hi"})])
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    orchestrator_service.generate_reply(
+        history=[], context="", user_message="hi", current_datetime_local=_ANCHOR,
+        tools=[{"name": "respond_with_text"}],
+    )
+
+    assert captured["tool_choice"] == {"type": "any", "disable_parallel_tool_use": True}
+
+
+def test_generate_reply_omits_tool_choice_when_no_tools_offered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The interpretive-weather continuation and any tool-less caller
+    must see a byte-for-byte unchanged call — no explicit
+    tool_choice=None either, omitted entirely (see complete's own
+    "additive, backward-compatible" discipline)."""
+    def _fake_complete_strict(**kwargs):
+        assert "tool_choice" not in kwargs
+        return _FakeModelResponse(text="just an answer")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete_strict)
+
+    result = orchestrator_service.generate_reply(
+        history=[], context="", user_message="hi", current_datetime_local=_ANCHOR,
+    )
+    assert result.text == "just an answer"
+
+
+def test_generate_reply_raises_contract_violation_on_zero_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 3.23 — the primary defensive check: tools were
+    offered (tool_choice="any" forced) but the provider returned no
+    tool_uses at all. Must not silently fall back to bare text as a
+    normal answer — raises, caught by chat_service exactly like any
+    other OrchestratorError (it IS one, by subclassing)."""
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(text="some stray text", tool_uses=[]),
+    )
+
+    with pytest.raises(orchestrator_service.OrchestratorContractViolationError) as exc_info:
+        orchestrator_service.generate_reply(
+            history=[], context="", user_message="hi", current_datetime_local=_ANCHOR,
+            tools=[{"name": "respond_with_text"}],
+        )
+    assert exc_info.value.reason == "no_tool_call"
+    assert exc_info.value.tool_call_count == 0
+    assert isinstance(exc_info.value, orchestrator_service.OrchestratorError)
+
+
+def test_generate_reply_raises_contract_violation_on_multiple_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The provider is asked for disable_parallel_tool_use=True, but
+    this function does not TRUST that guarantee blindly — if more than
+    one tool_use somehow arrives, it must not silently execute the
+    first and discard the rest."""
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(tool_uses=[
+            _FakeToolUse("propose_create_task", {"title": "A"}),
+            _FakeToolUse("propose_delete_task", {"task_id": 1}),
+        ]),
+    )
+
+    with pytest.raises(orchestrator_service.OrchestratorContractViolationError) as exc_info:
+        orchestrator_service.generate_reply(
+            history=[], context="", user_message="hi", current_datetime_local=_ANCHOR,
+            tools=[{"name": "propose_create_task"}, {"name": "propose_delete_task"}],
+        )
+    assert exc_info.value.reason == "multiple_tool_calls"
+    assert exc_info.value.tool_call_count == 2
+
+
+def test_generate_reply_parses_respond_with_text_like_any_other_tool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """respond_with_text is not special-cased at the Orchestrator layer
+    at all — it is parsed into an ordinary ToolCallRequest exactly like
+    propose_create_task or get_weather; chat_service is the only layer
+    that treats its name specially."""
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(
+            tool_uses=[_FakeToolUse("respond_with_text", {"kind": "clarification", "text": "Which one do you mean?"})],
+        ),
+    )
+
+    result = orchestrator_service.generate_reply(
+        history=[], context="", user_message="move my meeting", current_datetime_local=_ANCHOR,
+        tools=[{"name": "respond_with_text"}],
+    )
+    assert result.tool_call.tool_name == "respond_with_text"
+    assert result.tool_call.arguments == {"kind": "clarification", "text": "Which one do you mean?"}
+
+
+def test_generate_reply_does_not_enforce_contract_when_no_tools_offered(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A caller that never offers tools never asked for the contract in
+    the first place — zero tool_uses in that case is the ordinary,
+    pre-3.23 "plain answer" shape, not a violation."""
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(text="a plain answer", tool_uses=[]),
+    )
+
+    result = orchestrator_service.generate_reply(
+        history=[], context="", user_message="hi", current_datetime_local=_ANCHOR,
+    )
+    assert result.text == "a plain answer"
+    assert result.tool_call is None
 
 
 def test_generate_reply_tool_only_response_has_none_text(monkeypatch: pytest.MonkeyPatch) -> None:
