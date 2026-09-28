@@ -438,10 +438,58 @@ _REJECTED_MESSAGE_AR_BY_ACTION_TYPE = {
     "forget_memory": "تمام، مش هنساها.",
 }
 _NOTHING_PENDING_MESSAGE = "I don't have a pending proposal to confirm right now."
+
+# Checkpoint 3.21 — fixes a pre-existing defect flagged by the 3.20
+# inspection: this single, generic string was used for EVERY action
+# type's execution failure, so a failed delete_event confirmation used
+# to say "Something went wrong while creating that task." Keyed on the
+# row's own action_type, read by the caller BEFORE confirm_and_execute
+# runs (the same pending.action_type send_message already has in
+# scope) — the exact same deterministic, 0-LLM, no-new-status pattern
+# as 3.19's _REJECTED_MESSAGE_*_BY_ACTION_TYPE tables. _EXECUTION_FAILED_MESSAGE
+# remains the fallback for any future/unrecognized action_type.
 _EXECUTION_FAILED_MESSAGE = "Something went wrong while creating that task — could you say yes again?"
+_EXECUTION_FAILED_MESSAGE_EN_BY_ACTION_TYPE = {
+    "create_task": "I couldn't add that just now. You can confirm again to retry.",
+    "update_task": "I couldn't make that change just now. You can confirm again to retry.",
+    "delete_task": "I couldn't remove that just now. You can confirm again to retry.",
+    "create_event": "I couldn't add that just now. You can confirm again to retry.",
+    "update_event": "I couldn't make that change just now. You can confirm again to retry.",
+    "delete_event": "I couldn't remove that just now. You can confirm again to retry.",
+    "save_memory": "I couldn't save that just now. You can confirm again to retry.",
+    "forget_memory": "I couldn't forget that just now. You can confirm again to retry.",
+}
+_EXECUTION_FAILED_MESSAGE_AR_BY_ACTION_TYPE = {
+    "create_task": "معرفتش أضيفها دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+    "update_task": "معرفتش أغيرها دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+    "delete_task": "معرفتش أشيلها دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+    "create_event": "معرفتش أضيفه دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+    "update_event": "معرفتش أغيره دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+    "delete_event": "معرفتش أشيله دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+    "save_memory": "معرفتش أحفظها دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+    "forget_memory": "معرفتش أنساها دلوقتي. تقدر تأكد تاني وهحاول تاني.",
+}
+
+# Checkpoint 3.21 — same discipline as the rejection-copy fix: a proposal
+# tool call whose arguments/target failed deterministic validation
+# never created a ProposedAction and never executed anything, so
+# model_text accompanying that call (which the model may have written
+# BEFORE knowing its own call would fail — e.g. "Sure, deleting that
+# now!") is not authoritative and must never be preferred over this
+# deterministic reply. MODEL TEXT IS NEVER EXECUTION EVIDENCE.
 _INVALID_PROPOSAL_FALLBACK_MESSAGE = (
-    "I tried to put together a task proposal but couldn't — could you rephrase what you'd like to create?"
+    "I couldn't prepare that change safely. Please clarify what you want changed."
 )
+_INVALID_PROPOSAL_FALLBACK_MESSAGE_AR = "مقدرتش أجهز التغيير ده بشكل آمن. وضّحلي تقصد إيه بالظبط."
+
+# Checkpoint 3.21 — the deterministic reply for the narrow, structural
+# "stale yes/no" population: see _reply_for_stale_proposal_text's own
+# docstring below for exactly which turns reach this.
+_STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_EN = (
+    "That change wasn't executed. If you still want it, I can prepare it again."
+)
+_STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_AR = "التغيير ده ما اتنفذش. لو لسه عايزه، أقدر أجهزهولك تاني."
+
 _NO_REPLY_FALLBACK_MESSAGE = "Sorry, I don't have a reply for that."
 
 _ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿ]")
@@ -1215,7 +1263,55 @@ def _reply_for_rejected_action(action_type: str, user_message: str) -> str:
     return table.get(action_type, _REJECTED_MESSAGE)
 
 
-def _reply_for_confirm_result(result: ConfirmResult) -> str:
+def _reply_for_execution_failed(action_type: str, user_message: str) -> str:
+    """Checkpoint 3.21 — see _EXECUTION_FAILED_MESSAGE_*_BY_ACTION_TYPE's
+    own comment above for why this exists. Falls back to the old
+    generic _EXECUTION_FAILED_MESSAGE for any action_type not in the
+    table (structurally unreachable today, same safety margin as
+    _reply_for_rejected_action's own fallback)."""
+    table = (
+        _EXECUTION_FAILED_MESSAGE_AR_BY_ACTION_TYPE if _is_arabic(user_message)
+        else _EXECUTION_FAILED_MESSAGE_EN_BY_ACTION_TYPE
+    )
+    return table.get(action_type, _EXECUTION_FAILED_MESSAGE)
+
+
+def _reply_for_invalid_proposal(user_message: str) -> str:
+    """Checkpoint 3.21 — see _INVALID_PROPOSAL_FALLBACK_MESSAGE's own
+    comment above. Deliberately takes ONLY user_message, never
+    model_text — the whole point is that the model's own accompanying
+    text is not trusted here, regardless of what it says."""
+    return _INVALID_PROPOSAL_FALLBACK_MESSAGE_AR if _is_arabic(user_message) else _INVALID_PROPOSAL_FALLBACK_MESSAGE
+
+
+def _reply_for_stale_proposal_text(user_message: str) -> str:
+    """Checkpoint 3.21 — MODEL TEXT IS NEVER EXECUTION EVIDENCE. Called
+    only from send_message's own narrow, structural population: the
+    CURRENT message was itself classified by the SAME deterministic
+    _classify_narrow_yes_no already used for the adjacent dispatch as a
+    bare yes/no, directed at a real, still-pending ProposedAction
+    (`pending is not None`) that is no longer conversationally adjacent
+    (Checkpoint 3.17's `adjacent`). This is never reached merely
+    because a proposal happens to be pending — an unrelated read,
+    weather question, or clarification-worthy new request all produce
+    narrow_answer=None and never reach this function at all (see
+    send_message's own call site).
+
+    Nothing executed or rejected on THIS turn either way — that is
+    exactly what non-adjacent means, and it is unconditionally true
+    regardless of what the model's own (possibly completion-sounding —
+    see the 3.20 inspection's live-gate finding) text said. This
+    function therefore never inspects that text at all; it replaces it
+    outright rather than trying to detect whether it happened to be
+    honest this one time.
+    """
+    return (
+        _STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_AR if _is_arabic(user_message)
+        else _STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_EN
+    )
+
+
+def _reply_for_confirm_result(result: ConfirmResult, action_type: str, user_message: str) -> str:
     if result.outcome == "executed":
         if result.task is not None:
             if result.task_action == "updated":
@@ -1236,7 +1332,7 @@ def _reply_for_confirm_result(result: ConfirmResult) -> str:
     if result.outcome == "nothing_pending":
         return _NOTHING_PENDING_MESSAGE
     if result.outcome == "execution_failed":
-        return _EXECUTION_FAILED_MESSAGE
+        return _reply_for_execution_failed(action_type, user_message)
     return _REJECTED_MESSAGE
 
 
@@ -1290,7 +1386,7 @@ def _handle_create_task_proposal(
         # back. There's no valid structured data to render a
         # deterministic confirmation from here, so (only in this
         # error case) the model's own text is used as a fallback.
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     reply_text = _render_create_task_confirmation(validated, timezone_name, user_message_content)
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
@@ -1310,7 +1406,7 @@ def _handle_update_task_proposal(
         validated = actions_service.validate_arguments("update_task", arguments)
         task = _require_existing_task(db, space_id, "update_task", validated["task_id"])
     except actions_service.InvalidActionArgumentsError:
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     changes = {k: v for k, v in validated.items() if k != "task_id"}
     reply_text = _render_update_task_confirmation(task.title, changes, timezone_name, user_message_content)
@@ -1331,7 +1427,7 @@ def _handle_delete_task_proposal(
         validated = actions_service.validate_arguments("delete_task", arguments)
         task = _require_existing_task(db, space_id, "delete_task", validated["task_id"])
     except actions_service.InvalidActionArgumentsError:
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     reply_text = _render_delete_task_confirmation(task.title, user_message_content)
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
@@ -1377,7 +1473,7 @@ def _handle_create_event_proposal(
         # ends_at before starts_at, and an unknown life_area_id — all
         # collapse into the same "nothing valid to propose yet" fallback,
         # never a malformed pending ProposedAction.
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     reply_text = _render_create_event_confirmation(
         validated, timezone_name, user_message_content, life_area.name if life_area else None,
@@ -1455,7 +1551,7 @@ def _handle_update_event_proposal(
         # a no-op proposal (no field actually changing) — all collapse
         # into the same "nothing valid to propose yet" fallback, never
         # a malformed pending ProposedAction.
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     reply_text = _render_update_event_confirmation(
         event, changes, timezone_name, user_message_content, life_area.name if life_area else None,
@@ -1477,7 +1573,7 @@ def _handle_delete_event_proposal(
         validated = actions_service.validate_arguments("delete_event", arguments)
         event = _require_existing_event(db, space_id, "delete_event", validated["event_id"])
     except actions_service.InvalidActionArgumentsError:
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     reply_text = _render_delete_event_confirmation(event, timezone_name, user_message_content)
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
@@ -1499,7 +1595,7 @@ def _handle_save_memory_proposal(
         if supersedes_id is not None:
             _require_active_memory(db, space_id, user_id, "save_memory", supersedes_id)
     except actions_service.InvalidActionArgumentsError:
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     reply_text = _render_save_memory_confirmation(validated, user_message_content)
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
@@ -1519,7 +1615,7 @@ def _handle_forget_memory_proposal(
         validated = actions_service.validate_arguments("forget_memory", arguments)
         target = _require_active_memory(db, space_id, user_id, "forget_memory", validated["memory_id"])
     except actions_service.InvalidActionArgumentsError:
-        return record_assistant_message(db, space_id, user_id, model_text or _INVALID_PROPOSAL_FALLBACK_MESSAGE)
+        return record_assistant_message(db, space_id, user_id, _reply_for_invalid_proposal(user_message_content))
 
     reply_text = _render_forget_memory_confirmation(target.content, user_message_content)
     assistant_message = record_assistant_message(db, space_id, user_id, reply_text, commit=False)
@@ -1650,7 +1746,15 @@ def send_message(
        (Checkpoint 3.4) the user's own active memories. A tool call
        creates/revises a pending proposal (atomically with the
        assistant message describing it); no tool call is an ordinary
-       answer that leaves any pending proposal untouched.
+       answer that leaves any pending proposal untouched — UNLESS
+       (Checkpoint 3.21) the current message was itself a bare yes/no
+       aimed at a real pending proposal that just failed step 3's own
+       adjacency check (narrow_answer is not None, pending is not
+       None, not adjacent) — that specific, narrow population never
+       gets the model's own raw text as its reply (MODEL TEXT IS NEVER
+       EXECUTION EVIDENCE), since nothing executed or rejected on this
+       turn regardless of what that text says. See
+       _reply_for_stale_proposal_text's own docstring.
 
     Checkpoint 3.17: a transaction-scoped conversation advisory lock
     (_acquire_conversation_lock) is held from just before the incoming
@@ -1690,8 +1794,11 @@ def send_message(
     narrow_answer = _classify_narrow_yes_no(content) if pending is not None else None
 
     if narrow_answer == "yes" and adjacent:
+        action_type = pending.action_type
         result = actions_service.confirm_and_execute(db, space_id, user_id)
-        assistant_message = record_assistant_message(db, space_id, user_id, _reply_for_confirm_result(result))
+        assistant_message = record_assistant_message(
+            db, space_id, user_id, _reply_for_confirm_result(result, action_type, content)
+        )
         _log_deterministic_route("proposal_confirm", user_message.id)
         return user_message, assistant_message
 
@@ -1740,6 +1847,23 @@ def send_message(
                 result.tool_call.tool_use_id, result.correlation_id,
             )
             return user_message, assistant_message
+
+    # Checkpoint 3.21 — MODEL TEXT IS NEVER EXECUTION EVIDENCE. This
+    # turn produced no tool call, so nothing executed (the dispatch
+    # above is the ONLY thing that can create/change/remove anything).
+    # If the CURRENT message was itself a bare yes/no directed at a
+    # real, still-pending proposal that reached here only because it
+    # was no longer conversationally adjacent (3.17), the model's own
+    # text must never be trusted to honestly report that — it may (and,
+    # per the 3.19/3.20 live-gate finding, sometimes does) claim the
+    # stale action completed anyway. narrow_answer/pending/adjacent are
+    # all already computed above (not re-derived, not a new query) —
+    # narrow_answer is None for every ordinary read, weather question,
+    # or ambiguity-clarification turn, so none of those ever reach this
+    # branch (see _classify_narrow_yes_no).
+    if narrow_answer is not None and pending is not None and not adjacent:
+        assistant_message = record_assistant_message(db, space_id, user_id, _reply_for_stale_proposal_text(content))
+        return user_message, assistant_message
 
     # Ordinary answer — no tool call (or an unrecognized one, which
     # should never happen since only the three tools above are ever

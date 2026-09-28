@@ -76,6 +76,7 @@ def _get_space_and_user(db_session: Session):
 def _propose_interrupt_then_bare_answer(
     authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
     propose_message: str, tool_name: str, arguments: dict, bare_answer: str,
+    bare_answer_model_reply: str = "Just to confirm, what would you like me to do?",
 ) -> dict:
     """Checkpoint 3.17 shared shape: propose a real pending action, send
     an unrelated interruption (answered as ordinary weather text, no
@@ -83,6 +84,14 @@ def _propose_interrupt_then_bare_answer(
     bare-answer turn (0 = deterministic dispatch, 1 = reached the model)
     plus the final assistant reply, so callers only need to add their
     own action-specific "was anything actually written?" check.
+
+    bare_answer_model_reply (Checkpoint 3.21) lets a caller control
+    exactly what the mocked model says on the (now non-adjacent) bare-
+    answer turn — defaulting to the original, harmless placeholder text
+    so every pre-3.21 caller is byte-for-byte unaffected. The 3.21
+    truthfulness tests below pass a FALSE completion claim here (e.g.
+    "Done — I've removed that meeting.") specifically to prove it never
+    reaches the user verbatim.
     """
     monkeypatch.setattr(
         orchestrator_service, "generate_reply",
@@ -100,7 +109,7 @@ def _propose_interrupt_then_bare_answer(
 
     def _counted_reply(**kwargs):
         call_count["n"] += 1
-        return _mock_reply("Just to confirm, what would you like me to do?")(**kwargs)
+        return _mock_reply(bare_answer_model_reply)(**kwargs)
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
     response = _send(authenticated_client, bare_answer)
@@ -192,14 +201,33 @@ def test_clear_write_request_gets_unavailability_message_without_calling_model(
     assert response.json()["assistant_message"]["content"] == chat_service.WRITE_UNAVAILABLE_MESSAGE
 
 
-def test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds(
+def test_fresh_write_text_only_miss_is_a_documented_residual_truthfulness_gap(
     authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The undetected case. Seeds real Task/CalendarEvent/InboxItem/
-    LifeArea data, sends a phrasing detect_clear_write_intent does NOT
-    catch, mocks the model to falsely claim an action was taken (with no
-    tool call attached), and proves the actual database is byte-for-byte
-    unchanged regardless.
+    """Checkpoint 3.21 — formerly named
+    test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds.
+    Renamed and re-documented, NOT because behavior changed here — it
+    hasn't — but because the old name/docstring read as though this
+    were simply "fine." It is not fully fine: this is precisely
+    population C from the 3.20/3.21 inspection ("arbitrary FRESH
+    supported-write text-only miss"), the one population 3.21
+    explicitly did NOT structurally guard, because doing so would
+    require either a lexical blacklist or a second classifier model —
+    both explicitly excluded by this checkpoint's own brief. There is
+    no pending ProposedAction here at all (unlike the now-guarded
+    stale-yes/no tests below), so none of 3.21's new structural
+    signals (pending + non-adjacent + narrow yes/no) apply — the model
+    was simply never asked to call a tool for this message, and its
+    own free text is persisted verbatim, exactly as before 3.21.
+
+    Still seeds real Task/CalendarEvent/LifeArea data, sends a phrasing
+    detect_clear_write_intent does NOT catch, mocks the model to
+    falsely claim an action was taken (no tool call attached), and
+    proves the actual database is byte-for-byte unchanged regardless —
+    that adversarial DB-integrity guarantee is real, structural, and
+    unaffected by 3.21. Only the CONVERSATIONAL claim remains
+    unguarded here, honestly left that way per the 3.21 brief's own
+    "do not overclaim closure" instruction.
     """
     from app.modules.chat.write_intent import detect_clear_write_intent
 
@@ -224,6 +252,10 @@ def test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds
 
     response = _send(authenticated_client, ambiguous_message)
     assert response.status_code == 200
+    # Documented residual gap (population C): with no pending proposal
+    # and no tool call, the model's own text still passes through
+    # verbatim today. This assertion exists to make that fact visible
+    # and tracked, not to endorse it as correct.
     assert response.json()["assistant_message"]["content"] == "I've canceled your dentist appointment for you."
 
     tasks_after = authenticated_client.get("/api/v1/tasks").json()
@@ -238,6 +270,291 @@ def test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds
     assert task_before["id"] in [t["id"] for t in tasks_after]
     assert any(e["id"] == event_before["id"] for e in events_after if e["source"] == "event")
     assert life_area_before["id"] in [a["id"] for a in life_areas_after]
+
+
+def test_stale_yes_with_false_completion_claim_never_surfaces_the_claim(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.21 — the actual fix, proven directly: a real
+    pending delete_event proposal, an interruption, then a bare "yes"
+    that reaches the model (non-adjacent, per 3.17) because the mocked
+    model FALSELY claims the deletion completed ("Done — I've removed
+    that meeting from your calendar.") with NO tool call attached. The
+    false claim must never reach the user, and the event must remain
+    untouched.
+    """
+    event = _create_real_event(
+        authenticated_client, "Stale yes truthfulness target - 321a", "2026-09-28T11:00:00+03:00",
+    )
+
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message=f"cancel my meeting '{event['title']}'",
+        tool_name="propose_delete_event", arguments={"event_id": event["id"]},
+        bare_answer="yes",
+        bare_answer_model_reply="Done — I've removed that meeting from your calendar.",
+    )
+    assert result["call_count"] == 1  # reached the model, not deterministic
+    assert result["content"] == chat_service._STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_EN
+    assert "Done" not in result["content"]
+    assert "removed" not in result["content"]
+
+    agenda = authenticated_client.get(
+        "/api/v1/calendar/agenda", params={"from": "2026-09-28T00:00:00Z", "to": "2026-09-29T00:00:00Z"},
+    ).json()
+    assert any(i["title"] == event["title"] for i in agenda)  # NOT deleted
+
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"  # untouched — neither executed nor rejected
+
+
+def test_stale_no_with_false_transition_claim_never_surfaces_the_claim(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.21 — the symmetric "no" case: the mocked model
+    falsely claims the proposal was cancelled/discarded, with no tool
+    call. The proposal must remain exactly 'pending' (never actually
+    rejected by this stale message), and the false claim must not
+    reach the user.
+    """
+    task = _create_real_task(authenticated_client, "Stale no truthfulness target - 321b")
+
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message=f"remove the '{task['title']}' task",
+        tool_name="propose_delete_task", arguments={"task_id": task["id"]},
+        bare_answer="no",
+        bare_answer_model_reply="Okay, I've cancelled that request — nothing was removed.",
+    )
+    assert result["call_count"] == 1
+    assert result["content"] == chat_service._STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_EN
+
+    from app.modules.actions import service as actions_service
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"  # NOT rejected by the stale "no" or the model's own claim
+
+
+def test_stale_yes_arabic_message_gets_arabic_safe_reply(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stale-proposal guard reply is language-selected off the
+    CURRENT (bare-answer) message, the same _is_arabic mechanism every
+    other confirmation/rejection renderer already uses — not a new
+    localization framework."""
+    task = _create_real_task(authenticated_client, "Stale yes AR target - 321c")
+
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message=f"remove the '{task['title']}' task",
+        tool_name="propose_delete_task", arguments={"task_id": task["id"]},
+        bare_answer="نعم",
+        bare_answer_model_reply="تمام، شيلتها خلاص.",
+    )
+    assert result["call_count"] == 1
+    assert result["content"] == chat_service._STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_AR
+
+
+# ---- Checkpoint 3.21: invalid proposal tool call never trusts model_text ----------
+
+
+@pytest.mark.parametrize(
+    "tool_name,arguments",
+    [
+        ("propose_create_task", {"description": "missing title - 321invalid"}),
+        ("propose_update_task", {"task_id": 999999, "status": "done"}),
+        ("propose_delete_task", {"task_id": 999999}),
+        ("propose_create_event", {"title": "missing starts_at - 321invalid"}),
+        ("propose_update_event", {"event_id": 999999, "title": "New title - 321invalid"}),
+        ("propose_delete_event", {"event_id": 999999}),
+        ("propose_save_memory", {"type": "FACT"}),
+        ("propose_forget_memory", {"memory_id": 999999}),
+    ],
+)
+def test_invalid_proposal_tool_call_never_surfaces_the_models_own_false_claim(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    tool_name: str, arguments: dict,
+) -> None:
+    """Checkpoint 3.21 — generic across all 8 proposal tools (same
+    dispatch pattern every _handle_*_proposal shares, so one
+    parameterized test covers all of them rather than eight unrelated
+    special cases). A proposal tool call whose arguments fail schema
+    validation OR whose target doesn't resolve (both collapse into the
+    same InvalidActionArgumentsError, per actions_service) creates NO
+    ProposedAction and executes nothing — so the model's own
+    accompanying text, which may have been written as though the call
+    would succeed, must never be trusted or surfaced. Proves the
+    deterministic _INVALID_PROPOSAL_FALLBACK_MESSAGE is what the user
+    actually sees instead of the mocked false claim, and that no
+    proposal was created.
+    """
+    from app.modules.actions import service as actions_service
+
+    _ensure_no_pending_proposal(db_session)  # this shared test DB may carry a leftover pending row
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Done — that's all taken care of now.", tool_name=tool_name, arguments=arguments),
+    )
+
+    response = _send(authenticated_client, f"go ahead and do it - 321invalid-{tool_name}")
+    assert response.status_code == 200
+    content = response.json()["assistant_message"]["content"]
+    assert content == chat_service._INVALID_PROPOSAL_FALLBACK_MESSAGE
+    assert "Done" not in content
+    assert "taken care of" not in content
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
+
+
+def test_invalid_proposal_tool_call_arabic_message_gets_arabic_safe_reply(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("تمام، خلصت الموضوع.", tool_name="propose_delete_task", arguments={"task_id": 999999}),
+    )
+
+    response = _send(authenticated_client, "امسح المهمة دي - 321invalidAR")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == chat_service._INVALID_PROPOSAL_FALLBACK_MESSAGE_AR
+
+
+# ---- Checkpoint 3.21: action-aware execution-failure wording ----------------------
+
+
+def test_execution_failure_wording_is_action_aware_for_every_action_type(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.21 — fixes the 3.20-flagged defect: every
+    execution_failed outcome used to say "Something went wrong while
+    creating that task" regardless of actual action_type. Forces a
+    real execution failure (archiving the target via a direct service
+    call between proposal and confirmation, the same established
+    external-race pattern 3.18/3.19 already use) for delete_task and
+    delete_event, and proves the failure wording names the right verb
+    for each — and that the proposal survives, still 'pending'."""
+    from app.modules.actions import service as actions_service
+    from app.modules.calendar import service as calendar_service
+    from app.modules.tasks import service as tasks_service
+
+    task = _create_real_task(authenticated_client, "Execution failure wording target - 321j")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, f"remove the '{task['title']}' task")
+
+    user, space = _get_space_and_user(db_session)
+    tasks_service.delete_task(db_session, space.id, task["id"])  # external race: already gone
+
+    response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == chat_service._EXECUTION_FAILED_MESSAGE_EN_BY_ACTION_TYPE["delete_task"]
+
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"  # rolled back to pending, not a new terminal state
+
+    event = _create_real_event(
+        authenticated_client, "Execution failure wording target - 321j2", "2026-09-28T11:00:00+03:00",
+    )
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_event", arguments={"event_id": event["id"]}),
+    )
+    _send(authenticated_client, f"cancel my meeting '{event['title']}'")
+    calendar_service.delete_calendar_event(db_session, space.id, event["id"])  # external race
+
+    response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+    # delete_task and delete_event intentionally share identical wording
+    # here — the 3.21 brief's own examples group failure wording by
+    # VERB (create/update/delete), not by domain, unlike the rejection-
+    # copy table (3.19), which does vary per exact action_type.
+    assert response.json()["assistant_message"]["content"] == chat_service._EXECUTION_FAILED_MESSAGE_EN_BY_ACTION_TYPE["delete_event"]
+    assert response.json()["assistant_message"]["content"] != chat_service._EXECUTION_FAILED_MESSAGE_EN_BY_ACTION_TYPE["create_task"]
+
+
+# ---- Checkpoint 3.21: normal reads must survive the new guard --------------------
+
+
+def test_ordinary_read_with_no_pending_proposal_is_unaffected(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression E: pending is None -> narrow_answer is always None
+    (see _classify_narrow_yes_no's own call site) -> the 3.21 guard's
+    condition can never be true -> the model's own text passes through
+    exactly as it did before this checkpoint."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Your task list currently has 3 open items."),
+    )
+    response = _send(authenticated_client, "how many open tasks do I have?")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "Your task list currently has 3 open items."
+
+
+def test_pending_proposal_plus_unrelated_question_gets_a_real_answer(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression F: a pending proposal exists, but the interrupting
+    message is an ordinary question, not a narrow yes/no —
+    narrow_answer is None, so the 3.21 guard never fires and the
+    model's real answer is preserved. Uses the exact interruption turn
+    from _propose_interrupt_then_bare_answer's own middle step, made
+    explicit here as its own assertion."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_create_task", arguments={"title": "Read-preserving test - 321f"}),
+    )
+    _send(authenticated_client, "add a task to read-preserving test - 321f")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Your task list currently has 3 open items."),
+    )
+    response = _send(authenticated_client, "how many open tasks do I have?")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "Your task list currently has 3 open items."
+
+
+def test_pending_proposal_plus_weather_question_still_answers_weather(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression G: a pending proposal exists; the user asks about
+    weather instead of answering yes/no. The weather answer must still
+    work normally, and the proposal must remain untouched (neither
+    executed nor rejected) — this is the exact middle step every
+    _propose_interrupt_then_bare_answer-based test already relies on,
+    asserted explicitly and in isolation here."""
+    from app.modules.actions import service as actions_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_create_task", arguments={"title": "Weather-preserving test - 321g"}),
+    )
+    _send(authenticated_client, "add a task to weather-preserving test - 321g")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Tomorrow in Cairo: sunny, 30°C."),
+    )
+    response = _send(authenticated_client, "What's the weather tomorrow in Cairo?")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "Tomorrow in Cairo: sunny, 30°C."
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"
 
 
 # ---- Checkpoint 3.3: propose / confirm / reject a task creation -------------------

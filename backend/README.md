@@ -853,6 +853,88 @@ text-only reliability gap documented since 3.12b, reported honestly
 here rather than hidden; the database itself was never wrong, only
 that one turn's own generated text.
 
+### Checkpoint 3.21
+
+Verified-execution truthfulness guard — fixes the Phase 3 closure blocker
+the 3.20 inspection identified: a model turn could occasionally claim a
+write "completed" with no tool call and no `ProposedAction` behind it.
+Core invariant added: **model text is never execution evidence.**
+
+Three narrow, structural fixes, none of them a keyword blacklist or a
+second model call:
+
+**Stale yes/no truthfulness** (`chat/service.py`'s `send_message`,
+just before the plain-fallthrough persist): when the CURRENT message is
+itself classified by the same deterministic `_classify_narrow_yes_no`
+already used for the adjacent path as a bare yes/no, AND a real
+`ProposedAction` is pending, AND it is no longer conversationally
+adjacent (3.17) — the model is still consulted (cost budget unchanged:
+still 1 LLM call), but if it doesn't produce a fresh tool call, its own
+text is discarded in favor of a fixed, always-true reply ("That change
+wasn't executed. If you still want it, I can prepare it again." / its
+Arabic equivalent) rather than trusted, regardless of what it claims.
+An ordinary read, weather question, or new ambiguous request never
+triggers this — `narrow_answer` is `None` for all of those by
+construction, so normal interruption/read behavior during a pending
+proposal is unaffected (verified directly, both in tests and against
+the real provider).
+
+**Invalid proposal tool call**: a `propose_*` call that fails
+deterministic validation (bad arguments, or a target that doesn't
+resolve) creates no `ProposedAction` and executes nothing — the
+model's own accompanying text (occasionally written as if the call
+would succeed) is no longer preferred over a deterministic fallback,
+applied identically across all 8 proposal handlers via one shared
+`_reply_for_invalid_proposal` helper.
+
+**Execution-failure wording fix** (the small defect 3.20 flagged): the
+single literal "Something went wrong while creating that task" used
+for every failed execution, regardless of actual `action_type`, is now
+keyed on the pending proposal's own `action_type` (captured before
+`confirm_and_execute` runs, no schema change) via the same
+per-action-type-table pattern as 3.19's rejection-copy fix — grouped
+by verb (create/update/delete), not by domain, per the approved
+wording. 0 LLM, no new `ProposedAction` status, rollback-to-pending
+semantics on execution failure are completely unchanged.
+
+**Deliberately NOT fixed — a documented residual gap**: a genuinely
+FRESH write request (no pre-existing pending proposal) that the model
+answers with plain text instead of calling the required `propose_*`
+tool is structurally indistinguishable, at the point the reply is
+persisted, from an ordinary read that also produces plain text with no
+pending proposal in play. Guarding this population would require
+either a lexical completion-word blacklist or a second classifier
+model — both explicitly excluded by this checkpoint's own scope. The
+former adversarial test for this exact case was renamed (not
+weakened) to `test_fresh_write_text_only_miss_is_a_documented_residual_truthfulness_gap`
+to say so plainly rather than reading as though it were fully solved;
+its DB-integrity assertion is unchanged.
+
+Live-verified against the real provider, no mocking: two scenarios
+(`propose_delete_task`, `propose_delete_event`, one via a genuine
+proposal, two via a directly-seeded real `ProposedAction` row to
+isolate the guard from the separate, already-documented propose-step
+miss rate) each produced the exact deterministic guard text on a real,
+unmocked, non-adjacent "yes"/"no" turn, with the underlying row
+provably untouched (`status` still `'pending'`) and the target
+provably unmutated; a real execution-failure race (target archived via
+a direct service call between proposal and confirmation) produced the
+new action-aware wording exactly ("I couldn't remove that just now.
+You can confirm again to retry.") with 0 confirm-turn `AiTrace`, same
+as before this checkpoint; ordinary reads and a pending-proposal-plus-
+weather interruption both worked normally. Three propose-turns in this
+same run naturally missed their tool call (the same pre-existing,
+already-documented-since-3.12b stochastic phenomenon, not a new
+regression — nothing in this checkpoint touches the propose-decision
+path at all) — reported honestly; none of the three produced a false
+completion claim (two declined/asked to proceed honestly in text, one
+asked a clarifying question), consistent with this checkpoint's
+finding that the un-guarded residual population is real but was not
+observed to misfire during this particular live-gate run.
+
+`ProposedAction`'s state machine, the 3.17 advisory lock, and AiTrace
+are all byte-for-byte unchanged — no migration.
+
 ## Run locally (without Docker)
 
 ```bash
