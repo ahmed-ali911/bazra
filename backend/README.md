@@ -999,6 +999,70 @@ disposable data were verified clean afterward.
 No new `ProposedAction` status, no change to the 3.17 advisory lock or the
 confirm/reject/execution-failure paths, no migration.
 
+### Checkpoint 3.25
+
+Closes the final demonstrated Phase 3 truthfulness gap: a fresh write with no
+pending proposal, misrouted by the primary model to `respond_with_text`,
+whose own `text` argument could falsely claim BAZRA already completed a
+mutation. An independent, narrowly-scoped verifier
+(`orchestrator_service.verify_no_mutation_claim`) now sits between every
+`respond_with_text` candidate and the user: a separate, cheap model
+(`claude-haiku-4-5`, resolved via a new small `purpose -> model` override
+table in Model Router — `_MODEL_BY_PURPOSE`, falling back to the existing
+default for every other purpose, no other model selection changed) answers
+exactly one narrow question — "does this candidate reply claim BAZRA already
+completed a state-changing action?" — via a forced, single, strict boolean
+tool call (`certify_claim`). It never sees the user's message, conversation
+history, Context Assembly, Memory, or Space data — only the candidate text
+itself, deliberately minimizing both the classification problem's difficulty
+and its privacy exposure.
+
+**Fail-closed, not merely best-effort**: an explicit `true` certification, a
+provider failure, or any contract violation (zero/multiple tool calls, wrong
+tool name, missing/non-boolean field) all collapse to the exact same
+deterministic reply ("I haven't made that change. If you want, I can prepare
+it for confirmation." / a natural Arabic equivalent) — never to the
+candidate text. The verifier never generates replacement text itself; the
+application owns that, exactly as it already owns every real execution-success
+reply.
+
+**Ordering matters**: the existing 3.21 stale-proposal guard is checked
+*before* the verifier even runs, not after — that guard's own condition
+depends only on already-known DB/message state, never on candidate text, so
+when it fires there is nothing left to extract or verify. This means zero
+extra model calls for that branch, not merely fewer lines of code.
+
+**A real implementation bug was caught and fixed by this checkpoint's own
+live gate, not shipped**: the verifier initially sent the candidate as a bare,
+unattributed `{"role": "user", "content": candidate_text}` message. A live
+run against the exact adversarial set from the prior checkpoint's own
+inspection scored only 21/27 (and a repeat, 5/10 on the unsafe subset alone)
+— reproducibly missing the *same* short, first-person completions
+("Done — I've added it.", "I removed the meeting.") every time, because an
+unattributed user-role message let the verifier read those as the *user*
+reporting their own past action, matching the system prompt's own explicit
+safe-exception clause. Wrapping the candidate as `"Candidate reply:\n{text}"`
+(matching the framing already validated in the prior checkpoint's own
+standalone experiment) resolved it — two independent full re-runs afterward
+both scored 27/27, real Haiku, no mocking.
+
+Live-verified end to end (no mocking): English and Egyptian Arabic
+conversation, an ambiguous-target clarification, factual and interpretive
+weather (verifier never invoked for either, AiTrace deltas unchanged at 1 and
+2), a stale interrupted "yes" (the model re-proposed a fresh, real
+`propose_delete_task` rather than needing the override — an equally safe
+outcome), immediate confirm/reject (0 LLM calls, unaffected), and — the
+scenario this whole checkpoint exists for — a forced misroute to
+`respond_with_text` with a real, unmocked verifier call: the false claim
+never reached the user; the deterministic fail-closed reply did.
+
+**Honest residual, not overclaimed**: a verifier *false negative* (a genuine
+false-completion claim the verifier itself misjudges as safe) remains
+possible in principle — this is the accepted cost of using any probabilistic
+classifier at all, not a structural hole the application could have caught
+and didn't. A dedicated test keeps this residual visible rather than hidden.
+No new `ProposedAction` status, no AiTrace schema change, no migration.
+
 ## Run locally (without Docker)
 
 ```bash

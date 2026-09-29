@@ -34,6 +34,25 @@ _trace_session_factory: sessionmaker = SessionLocal
 # (Checkpoint 3.2) has an actual reason to choose otherwise per-purpose.
 _DEFAULT_MODEL = "claude-sonnet-5"
 
+# Checkpoint 3.25 — the smallest explicit purpose->model override: a
+# plain dict, not a general multi-tier routing system. Every purpose
+# not listed here keeps using _DEFAULT_MODEL, unchanged from before this
+# checkpoint. claim_verification is the one purpose that deliberately
+# wants a cheaper, faster model — see chat_service's own claim verifier,
+# the only caller of this purpose today. Confirmed via a real,
+# disposable call (Checkpoint 3.25 inspection) that the bare alias
+# below resolves server-side to the exact same snapshot already keyed
+# in _COST_PER_MILLION_TOKENS_USD, so cost estimation keeps working
+# with no new table entry needed.
+_MODEL_BY_PURPOSE: dict[str, str] = {
+    "claim_verification": "claude-haiku-4-5",
+}
+
+
+def _resolve_model(purpose: str) -> str:
+    return _MODEL_BY_PURPOSE.get(purpose, _DEFAULT_MODEL)
+
+
 _MAX_TOKENS = 1024
 
 # USD per 1,000,000 tokens — a static, hand-maintained table, never a
@@ -237,6 +256,13 @@ def complete(
 ) -> ModelResponse:
     """The only function other modules call to reach a model provider.
 
+    The model itself is resolved from `purpose` (Checkpoint 3.25) —
+    _resolve_model looks up `_MODEL_BY_PURPOSE`, a small explicit
+    override table, falling back to `_DEFAULT_MODEL` for every purpose
+    not listed there (every purpose that existed before 3.25). Callers
+    never pass a model literal — this keeps model selection a Model
+    Router concern, not something scattered through Chat/Orchestrator.
+
     system is an additive, backward-compatible parameter (Checkpoint
     3.2) — Anthropic's Messages API takes system instructions as their
     own top-level parameter, not a role inside `messages`. Existing
@@ -291,7 +317,7 @@ def complete(
     if purpose not in VALID_PURPOSES:
         raise ValueError(f"Unknown purpose: {purpose!r}")
 
-    model = _DEFAULT_MODEL
+    model = _resolve_model(purpose)
     resolved_correlation_id = correlation_id or secrets.token_hex(16)
     start = time.monotonic()
 

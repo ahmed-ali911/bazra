@@ -756,3 +756,82 @@ def test_serialize_messages_converts_blocks_to_anthropic_dict_shape() -> None:
     assert serialized[3]["content"] == [
         {"type": "tool_result", "tool_use_id": "toolu_1", "content": "boom", "is_error": True}
     ]
+
+
+# ---- Checkpoint 3.25: purpose->model selection ------------------------------------
+
+
+def test_resolve_model_uses_the_override_table_for_claim_verification() -> None:
+    assert model_router_service._resolve_model("claim_verification") == "claude-haiku-4-5"
+
+
+def test_resolve_model_falls_back_to_default_for_every_other_purpose() -> None:
+    for purpose in ("chat_completion", "memory_extraction", "tool_result_reasoning"):
+        assert model_router_service._resolve_model(purpose) == model_router_service._DEFAULT_MODEL
+
+
+def test_complete_uses_the_resolved_model_for_claim_verification(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.25: complete() must actually call _resolve_model,
+    not just have it exist unused — proven by checking the model
+    literal that reaches _call_anthropic for this purpose."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    captured = {}
+
+    def _capture(model, messages, **kwargs):
+        captured["model"] = model
+        return _FakeMessageToolOnly("certify_claim", {"claims_bazra_mutation_completed": False})
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _capture)
+
+    response = model_router_service.complete(
+        purpose="claim_verification",
+        messages=[{"role": "user", "content": "candidate text"}],
+    )
+
+    assert captured["model"] == "claude-haiku-4-5"
+    assert response.model == "claude-haiku-4-5"
+
+
+def test_complete_still_uses_default_model_for_chat_completion(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: adding the purpose->model override must not change
+    model selection for any purpose that predates Checkpoint 3.25."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    captured = {}
+
+    def _capture(model, messages, **kwargs):
+        captured["model"] = model
+        return _FakeMessage("hi", 5, 5)
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _capture)
+
+    model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+
+    assert captured["model"] == "claude-sonnet-5"
+
+
+def test_claim_verification_cost_estimation_uses_the_existing_haiku_rate_table_entry(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The resolved model string ("claude-haiku-4-5") must match the
+    existing _COST_PER_MILLION_TOKENS_USD key exactly, or cost
+    estimation silently degrades to None — confirms no drift between
+    the two tables."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service, "_call_anthropic",
+        lambda model, messages, **kwargs: _FakeMessageToolOnly("certify_claim", {"claims_bazra_mutation_completed": False}),
+    )
+
+    response = model_router_service.complete(
+        purpose="claim_verification", messages=[{"role": "user", "content": "candidate"}],
+    )
+
+    row = db_session.execute(
+        text("SELECT estimated_cost_usd FROM ai_traces WHERE purpose = 'claim_verification' ORDER BY id DESC LIMIT 1")
+    ).mappings().first()
+    assert row is not None
+    assert row["estimated_cost_usd"] is not None

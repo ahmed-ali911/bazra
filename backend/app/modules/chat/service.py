@@ -570,6 +570,17 @@ _STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_EN = (
 )
 _STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_AR = "التغيير ده ما اتنفذش. لو لسه عايزه، أقدر أجهزهولك تاني."
 
+# Checkpoint 3.25 — the deterministic fail-closed reply used when the
+# independent mutation-claim verifier either certifies that a
+# respond_with_text candidate falsely claims a completed BAZRA
+# mutation, or the verification itself could not be trusted (provider
+# failure, malformed contract) — both collapse to this same reply; see
+# _candidate_reply_is_safe_to_show's own docstring.
+_UNVERIFIED_MUTATION_CLAIM_MESSAGE_EN = (
+    "I haven't made that change. If you want, I can prepare it for confirmation."
+)
+_UNVERIFIED_MUTATION_CLAIM_MESSAGE_AR = "أنا ما عملتش التغيير ده. لو عايز، أقدر أجهزهولك عشان تأكده."
+
 _NO_REPLY_FALLBACK_MESSAGE = "Sorry, I don't have a reply for that."
 
 _ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿ]")
@@ -1391,7 +1402,7 @@ def _reply_for_stale_proposal_text(user_message: str) -> str:
     )
 
 
-def _handle_respond_with_text(arguments: dict) -> str:
+def _handle_respond_with_text(arguments: dict) -> str | None:
     """Checkpoint 3.23 — the structural replacement for the old bare-
     text ("no tool call at all") fallthrough, now that tool_choice
     forces every primary chat turn to call exactly one tool (see
@@ -1401,27 +1412,67 @@ def _handle_respond_with_text(arguments: dict) -> str:
     shape (db/space_id/... in, ChatMessage persisted and returned) —
     unlike every one of those, respond_with_text's own reply is not
     unconditionally authoritative: send_message's existing 3.21
-    stale-proposal guard must still be able to override it (see that
-    guard's own docstring, and send_message's call site below) before
+    stale-proposal guard, and (Checkpoint 3.25) the independent
+    mutation-claim verifier, must still be able to override it before
     anything is persisted. Returning a plain candidate string, not a
-    persisted ChatMessage, is what leaves that override possible.
+    persisted ChatMessage, is what leaves both overrides possible.
 
     respond_with_text is UNTRUSTED MODEL PROSE — MODEL TEXT IS NEVER
     EXECUTION EVIDENCE. It creates no ProposedAction, touches no
     domain module, and its own schema (RespondWithTextArguments)
     structurally carries no execution/completion/action_type field at
     all; nothing about calling this tool is ever treated as evidence
-    that anything happened. On invalid arguments (matching every other
-    handler's own "never trust accompanying model text on a validation
-    failure" discipline, fixed in 3.21) this falls back to the plain
-    deterministic _NO_REPLY_FALLBACK_MESSAGE — never to any raw model
-    text, from any source.
+    that anything happened.
+
+    Checkpoint 3.25: returns None (rather than the deterministic
+    _NO_REPLY_FALLBACK_MESSAGE string directly) on invalid arguments —
+    None is send_message's own signal to skip the 3.25 claim verifier
+    entirely for this turn, since _NO_REPLY_FALLBACK_MESSAGE is already
+    a fixed, application-owned constant with nothing to verify (running
+    the verifier on it would be pure wasted cost/latency). Matches
+    every other handler's own "never trust accompanying model text on a
+    validation failure" discipline (fixed in 3.21) — never falls back
+    to any raw model text, from any source, on invalid arguments.
     """
     try:
         validated = RespondWithTextArguments(**arguments)
     except ValidationError:
-        return _NO_REPLY_FALLBACK_MESSAGE
+        return None
     return validated.text
+
+
+def _reply_for_unverified_mutation_claim(user_message: str) -> str:
+    """Checkpoint 3.25 — see _UNVERIFIED_MUTATION_CLAIM_MESSAGE_*'s own
+    comment above. Used identically whether the verifier explicitly
+    certified a false completion claim or the verification itself
+    could not be trusted (provider failure, malformed contract) — see
+    _candidate_reply_is_safe_to_show, the sole caller of this
+    function's sibling check."""
+    return (
+        _UNVERIFIED_MUTATION_CLAIM_MESSAGE_AR if _is_arabic(user_message)
+        else _UNVERIFIED_MUTATION_CLAIM_MESSAGE_EN
+    )
+
+
+def _candidate_reply_is_safe_to_show(candidate_text: str) -> bool:
+    """Checkpoint 3.25 — the fail-closed policy wrapper around
+    orchestrator_service.verify_no_mutation_claim (the independent
+    verifier itself). Returns True (safe to show verbatim) ONLY when
+    the verifier call succeeded, returned a well-formed contract, AND
+    explicitly certified claims_bazra_mutation_completed=False.
+
+    Any other outcome — an explicit True certification, or
+    ClaimVerificationFailed for any reason (provider failure, zero/
+    multiple tool calls, wrong tool, missing/non-boolean field) —
+    returns False here. This is the exact equivalence this checkpoint
+    calls for: a verifier we can't trust is exactly as unsafe as one
+    that flags the candidate true. Never raises; never retries.
+    """
+    try:
+        claims_completed = orchestrator_service.verify_no_mutation_claim(candidate_text)
+    except orchestrator_service.ClaimVerificationFailed:
+        return False
+    return not claims_completed
 
 
 def _reply_for_confirm_result(result: ConfirmResult, action_type: str, user_message: str) -> str:
@@ -1866,16 +1917,23 @@ def send_message(
        `except OrchestratorError` below as any other provider failure.
        A propose_*/get_weather call creates/revises a pending proposal
        or executes a read exactly as before; a respond_with_text call
-       is chat_service's OWN, untrusted, no-action reply — UNLESS
-       (Checkpoint 3.21, unchanged in what it distrusts) the current
-       message was itself a bare yes/no aimed at a real pending
-       proposal that just failed step 3's own adjacency check
-       (narrow_answer is not None, pending is not None, not adjacent)
-       — that specific, narrow population never gets respond_with_text's
-       own text as its reply (MODEL TEXT IS NEVER EXECUTION EVIDENCE),
-       since nothing executed or rejected on this turn regardless of
-       what that text says. See _reply_for_stale_proposal_text's own
-       docstring.
+       is chat_service's OWN, untrusted, no-action reply — checked, in
+       order: (a) (Checkpoint 3.21, unchanged in what it distrusts) if
+       the current message was itself a bare yes/no aimed at a real
+       pending proposal that just failed step 3's own adjacency check
+       (narrow_answer is not None, pending is not None, not adjacent),
+       that population never gets respond_with_text's own text at all
+       — short-circuited BEFORE it is even extracted, since nothing
+       about DB state depends on it; (b) otherwise (Checkpoint 3.25)
+       the candidate text is validated and passed through an
+       independent mutation-claim verifier (orchestrator_service.
+       verify_no_mutation_claim, a separate cheap-model call) that
+       answers only "does this text claim BAZRA already completed a
+       mutation" — never user intent. A certified-unsafe candidate, an
+       invalid one, or a verifier that itself failed all fail closed to
+       the same deterministic reply; MODEL TEXT IS NEVER EXECUTION
+       EVIDENCE either way. See _reply_for_stale_proposal_text's and
+       _candidate_reply_is_safe_to_show's own docstrings.
 
     Checkpoint 3.17: a transaction-scoped conversation advisory lock
     (_acquire_conversation_lock) is held from just before the incoming
@@ -1975,33 +2033,57 @@ def send_message(
         )
         return user_message, assistant_message
 
+    # Checkpoint 3.21 — MODEL TEXT IS NEVER EXECUTION EVIDENCE. Checked
+    # FIRST, before _handle_respond_with_text or the 3.25 claim verifier
+    # even run (Checkpoint 3.25's own deliberate ordering decision):
+    # this condition depends ONLY on already-known DB/message state
+    # (narrow_answer/pending/adjacent), never on the candidate text
+    # itself, so when it holds, NOTHING about whichever tool fired or
+    # what its text says can be authoritative for this turn — there is
+    # nothing left to extract or verify. Short-circuiting here means 0
+    # extra Haiku calls for this branch (see the 3.25 close-out's own
+    # cost accounting), not merely fewer lines of code. If the CURRENT
+    # message was itself a bare yes/no directed at a real, still-
+    # pending proposal that reached here only because it was no longer
+    # conversationally adjacent (3.17), no tool's own text is ever
+    # trusted to honestly report that — it may (and, per the 3.19/3.20
+    # live-gate findings, sometimes did) claim the stale action
+    # completed anyway. narrow_answer is None for every ordinary read,
+    # weather question, or ambiguity-clarification turn, so none of
+    # those ever reach this override (see _classify_narrow_yes_no).
+    if narrow_answer is not None and pending is not None and not adjacent:
+        assistant_message = record_assistant_message(db, space_id, user_id, _reply_for_stale_proposal_text(content))
+        return user_message, assistant_message
+
     # Checkpoint 3.23 — respond_with_text (the structural no-action
     # escape hatch that replaces the old bare-text fallthrough), or
     # defensively, any tool name this dispatch doesn't recognize.
-    # _handle_respond_with_text returns a plain CANDIDATE string, not a
-    # persisted message — see its own docstring for why this handler
-    # alone doesn't follow the "persist and return ChatMessage"
-    # shape every other handler uses.
-    candidate_reply = _handle_respond_with_text(tool_call.arguments if tool_call is not None else {})
+    # _handle_respond_with_text returns a plain CANDIDATE string (or
+    # None on invalid arguments), not a persisted message — see its own
+    # docstring for why this handler alone doesn't follow the "persist
+    # and return ChatMessage" shape every other handler uses.
+    model_candidate = _handle_respond_with_text(tool_call.arguments if tool_call is not None else {})
 
-    # Checkpoint 3.21 — MODEL TEXT IS NEVER EXECUTION EVIDENCE. Still
-    # wins here even though "no tool call at all" is now structurally
-    # impossible (3.23) — nothing executed or was rejected on THIS turn
-    # regardless of which tool fired or what its text says, so the
-    # same narrow, structural override applies unchanged. If the
-    # CURRENT message was itself a bare yes/no directed at a real,
-    # still-pending proposal that reached here only because it was no
-    # longer conversationally adjacent (3.17), respond_with_text's own
-    # candidate text must never be trusted to honestly report that —
-    # it may (and, per the 3.19/3.20 live-gate findings, sometimes
-    # did, in its pre-3.23 bare-text form) claim the stale action
-    # completed anyway. narrow_answer/pending/adjacent are all already
-    # computed above (not re-derived, not a new query) — narrow_answer
-    # is None for every ordinary read, weather question, or
-    # ambiguity-clarification turn, so none of those ever reach this
-    # override (see _classify_narrow_yes_no).
-    if narrow_answer is not None and pending is not None and not adjacent:
-        candidate_reply = _reply_for_stale_proposal_text(content)
+    if model_candidate is None:
+        # Invalid respond_with_text arguments — already the fixed,
+        # application-owned _NO_REPLY_FALLBACK_MESSAGE constant, with
+        # nothing model-authored left to verify (Checkpoint 3.25: the
+        # claim verifier never runs on this branch — see
+        # _handle_respond_with_text's own docstring).
+        candidate_reply = _NO_REPLY_FALLBACK_MESSAGE
+    elif _candidate_reply_is_safe_to_show(model_candidate):
+        candidate_reply = model_candidate
+    else:
+        # Checkpoint 3.25 — the independent mutation-claim verifier
+        # either certified that this candidate falsely claims a
+        # completed BAZRA mutation, or the verification itself could
+        # not be trusted (provider failure, malformed contract) — both
+        # fail closed identically to this same deterministic reply,
+        # never to the candidate text. This is the fix for the
+        # residual the 3.20-3.24 checkpoints tracked as "Population C,
+        # part 2": a fresh write with no pending proposal, misrouted to
+        # respond_with_text, whose own text falsely claims completion.
+        candidate_reply = _reply_for_unverified_mutation_claim(content)
 
     assistant_message = record_assistant_message(db, space_id, user_id, candidate_reply)
     return user_message, assistant_message

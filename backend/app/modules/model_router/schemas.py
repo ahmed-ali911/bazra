@@ -5,10 +5,14 @@ from typing import Literal
 # AiTrace, not a native DB enum, matching Task.status's own precedent
 # (validated at a code boundary, not requiring an ALTER TYPE to extend).
 # Extend this set as real callers are added (Chat in 3.2, Memory
-# extraction in 3.4, tool-result continuation in 3.8) rather than
-# accepting an arbitrary string.
-ModelCallPurpose = Literal["chat_completion", "memory_extraction", "tool_result_reasoning"]
-VALID_PURPOSES: frozenset[str] = frozenset({"chat_completion", "memory_extraction", "tool_result_reasoning"})
+# extraction in 3.4, tool-result continuation in 3.8, the mutation-claim
+# verifier in Checkpoint 3.25) rather than accepting an arbitrary string.
+ModelCallPurpose = Literal[
+    "chat_completion", "memory_extraction", "tool_result_reasoning", "claim_verification",
+]
+VALID_PURPOSES: frozenset[str] = frozenset({
+    "chat_completion", "memory_extraction", "tool_result_reasoning", "claim_verification",
+})
 
 
 @dataclass

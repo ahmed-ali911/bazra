@@ -440,3 +440,127 @@ def generate_tool_result_reply(
         raise OrchestratorError(str(exc)) from exc
 
     return response.text
+
+
+class ClaimVerificationFailed(Exception):
+    """Checkpoint 3.25 — raised for ANY contract violation of the
+    mutation-claim verifier: a provider/parsing failure, zero or
+    multiple tool calls, the wrong tool name, or a missing/non-boolean
+    claims_bazra_mutation_completed field. Deliberately NOT a subclass
+    of OrchestratorError — chat_service must handle this completely
+    differently (fail closed to a deterministic reply, never surface
+    as ChatModelCallFailed/502) from a genuine primary-chat-call
+    failure, so the two exception hierarchies are kept separate to
+    make conflating them a type error, not a silent bug.
+    """
+
+
+# Checkpoint 3.25 — the independent mutation-claim verifier's own
+# minimal system prompt. Deliberately NOT BAZRA_IDENTITY_INSTRUCTIONS —
+# this call has nothing to do with BAZRA's own personality/voice; it is
+# an external judgment ABOUT a candidate reply, not a reply of its own,
+# and receives no Context Assembly/history/user-message at all (see
+# verify_no_mutation_claim's own docstring for why — the 3.24
+# inspection's own finding that this narrower question needs none of
+# that to be answered reliably).
+_CLAIM_VERIFICATION_SYSTEM = (
+    "You verify a single candidate assistant reply that BAZRA (a personal "
+    "assistant app) is considering showing to the user. Your only job: "
+    "does this candidate reply assert, in the assistant's own voice, that "
+    "BAZRA itself has ALREADY completed a specific state-changing action "
+    "(added, removed, updated, saved, or forgotten something) during this "
+    "turn? Answer true ONLY for a first-person claim that BAZRA just did "
+    "it. Answer false for: an offer or conditional statement about a "
+    "future action (\"I can\"/\"if you confirm\"/\"I will\"); a plain "
+    "statement that nothing has been done yet; a report of something the "
+    "user said they did; a report of an action by an external system "
+    "(e.g. Google); a general description of what an action would do; a "
+    "question about the user's own day or work; or discussion of a past "
+    "event unrelated to BAZRA acting just now. Call the certify_claim "
+    "tool exactly once."
+)
+
+_CERTIFY_CLAIM_TOOL = {
+    "name": "certify_claim",
+    "description": "Report whether the candidate reply claims BAZRA just completed a mutation.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "claims_bazra_mutation_completed": {"type": "boolean"},
+        },
+        "required": ["claims_bazra_mutation_completed"],
+    },
+}
+
+# Forces the SPECIFIC tool (not "any" — there is only ever one tool
+# offered to this call anyway) and disables parallel tool use, so the
+# provider cannot even attempt more than one certify_claim call.
+_CERTIFY_CLAIM_TOOL_CHOICE = {"type": "tool", "name": "certify_claim", "disable_parallel_tool_use": True}
+
+
+def verify_no_mutation_claim(candidate_text: str) -> bool:
+    """Checkpoint 3.25 — the independent, narrowly-scoped verifier this
+    checkpoint exists to add. Receives ONLY candidate_text — no user
+    message, no history, no Context Assembly, no Memory, no Space data
+    — deliberately narrowing both the classification problem (Question
+    2: "does THIS reply claim a completed mutation", never Question 1:
+    "did the user ask for one" — see the 3.24 inspection's own finding
+    that Question 2 is the smaller, already empirically-validated trust
+    problem) and the privacy exposure of this call. Uses a separate,
+    cheap model (model_router_service's own purpose->model table, keyed
+    on "claim_verification") via a forced, single, strict boolean tool
+    call — never prose, never a second free-text field for the
+    verifier to reason in, never a confidence score, never a
+    replacement reply (the application, not the verifier, owns any
+    replacement text — see chat_service's own fail-closed message).
+
+    Returns the raw claims_bazra_mutation_completed boolean exactly as
+    certified — literal, not inverted, so this function's own name
+    describes what it checks, not what the caller should do about the
+    result. Raises ClaimVerificationFailed for any contract violation
+    (provider failure, zero/multiple tool calls, wrong tool name,
+    missing/non-boolean field) — this function only reports facts
+    about the verifier call itself; fail-closed POLICY (treating a
+    raised failure the same as an explicit True) is the caller's own
+    decision, made once, in chat_service.
+    """
+    try:
+        response = model_router_service.complete(
+            purpose="claim_verification",
+            # "Candidate reply:\n" framing is load-bearing, not
+            # decorative — a real-provider live-gate run during this
+            # checkpoint's own implementation found that sending the
+            # bare candidate_text as an unattributed user message let
+            # the verifier misread a first-person unsafe claim (e.g.
+            # "I removed the meeting.") as the USER reporting their own
+            # past action — exactly the system prompt's own explicit
+            # safe-exception clause — collapsing real accuracy from a
+            # separately-verified 27/27 to as low as 5/10 on the
+            # unsafe set. Explicitly labeling this as a candidate
+            # reply under review (matching the exact framing verified
+            # in the 3.24 inspection's own standalone experiment)
+            # restored the expected reliability — re-confirmed by this
+            # checkpoint's own live gate, not merely restored on paper.
+            messages=[{"role": "user", "content": f"Candidate reply:\n{candidate_text}"}],
+            system=_CLAIM_VERIFICATION_SYSTEM,
+            tools=[_CERTIFY_CLAIM_TOOL],
+            tool_choice=_CERTIFY_CLAIM_TOOL_CHOICE,
+        )
+    except model_router_service.ModelRouterError as exc:
+        raise ClaimVerificationFailed("provider_call_failed") from exc
+
+    tool_uses = response.tool_uses
+    if len(tool_uses) != 1:
+        raise ClaimVerificationFailed(f"expected exactly one tool call, got {len(tool_uses)}")
+
+    call = tool_uses[0]
+    if call.name != "certify_claim":
+        raise ClaimVerificationFailed(f"unexpected tool name {call.name!r}")
+
+    claims_completed = call.input.get("claims_bazra_mutation_completed")
+    if not isinstance(claims_completed, bool):
+        raise ClaimVerificationFailed(
+            f"missing/non-boolean claims_bazra_mutation_completed: {claims_completed!r}"
+        )
+
+    return claims_completed

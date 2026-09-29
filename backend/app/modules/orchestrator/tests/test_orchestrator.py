@@ -665,6 +665,122 @@ def test_generate_tool_result_reply_wraps_model_router_error(monkeypatch: pytest
         )
 
 
+# ---- Checkpoint 3.25: independent mutation-claim verifier -------------------
+
+
+def test_verify_no_mutation_claim_true(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(
+            tool_uses=[_FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": True})],
+        ),
+    )
+    assert orchestrator_service.verify_no_mutation_claim("Done — I've added it.") is True
+
+
+def test_verify_no_mutation_claim_false(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(
+            tool_uses=[_FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": False})],
+        ),
+    )
+    assert orchestrator_service.verify_no_mutation_claim("I can add it if you want.") is False
+
+
+def test_verify_no_mutation_claim_sends_only_the_candidate_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 3.25 privacy boundary: no user message, no history, no
+    Context Assembly, no Memory, no Space data — just the candidate
+    text, as the sole message content."""
+    captured = {}
+
+    def _fake_complete(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(tool_uses=[_FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": False})])
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    orchestrator_service.verify_no_mutation_claim("Some candidate reply text.")
+
+    assert captured["purpose"] == "claim_verification"
+    # "Candidate reply:\n" framing is load-bearing (see
+    # verify_no_mutation_claim's own comment) — the privacy boundary
+    # this test protects is still "nothing but the candidate text
+    # itself reaches the verifier," just wrapped in an explicit label.
+    assert captured["messages"] == [{"role": "user", "content": "Candidate reply:\nSome candidate reply text."}]
+    assert "Some candidate reply text." in captured["messages"][0]["content"]
+    assert captured["tool_choice"] == {"type": "tool", "name": "certify_claim", "disable_parallel_tool_use": True}
+    assert len(captured["tools"]) == 1
+    assert captured["tools"][0]["name"] == "certify_claim"
+
+
+def test_verify_no_mutation_claim_raises_on_provider_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _raise(**kwargs):
+        raise orchestrator_service.model_router_service.ModelRouterError("provider_error")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
+
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed):
+        orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+
+
+def test_verify_no_mutation_claim_raises_on_zero_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(text="I think that's fine.", tool_uses=[]),
+    )
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed):
+        orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+
+
+def test_verify_no_mutation_claim_raises_on_multiple_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(tool_uses=[
+            _FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": True}),
+            _FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": False}),
+        ]),
+    )
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed):
+        orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+
+
+def test_verify_no_mutation_claim_raises_on_wrong_tool_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(tool_uses=[_FakeToolUse("respond_with_text", {"kind": "answer", "text": "x"})]),
+    )
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed):
+        orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+
+
+def test_verify_no_mutation_claim_raises_on_missing_boolean(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(tool_uses=[_FakeToolUse("certify_claim", {})]),
+    )
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed):
+        orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+
+
+def test_verify_no_mutation_claim_raises_on_non_boolean_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete",
+        lambda **kwargs: _FakeModelResponse(tool_uses=[_FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": "true"})]),
+    )
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed):
+        orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+
+
+def test_claim_verification_failed_is_not_an_orchestrator_error() -> None:
+    """Deliberate: chat_service must handle a verifier contract
+    violation completely differently (fail closed to a deterministic
+    reply) from a genuine primary-chat-call failure (ChatModelCallFailed/
+    502) — keeping the hierarchies separate makes conflating them a
+    type error, not a silent bug."""
+    assert not issubclass(orchestrator_service.ClaimVerificationFailed, orchestrator_service.OrchestratorError)
+
+
 def test_orchestrator_never_imports_a_write_capable_service_function() -> None:
     """A direct check on this module's own namespace: no create_*/
     update_*/delete_* function from any other module is bound here at

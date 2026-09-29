@@ -20,6 +20,14 @@ TOMORROW_START = datetime(2030, 6, 15, 0, 0, tzinfo=timezone.utc)
 WINDOW_END = TOMORROW_START + timedelta(days=7)
 _DEFAULT_TIMEZONE = "Africa/Cairo"
 
+# Checkpoint 3.25 — captured at module import time, BEFORE the
+# per-test _default_safe_claim_verifier autouse fixture ever runs, so
+# a specific test can restore the REAL orchestrator_service.verify_no_mutation_claim
+# (re-monkeypatched back over the fixture's own default lambda) to
+# prove genuine end-to-end wiring rather than only the fixture's
+# simplified stand-in.
+_REAL_VERIFY_NO_MUTATION_CLAIM = orchestrator_service.verify_no_mutation_claim
+
 
 @pytest.fixture(autouse=True)
 def _redirect_model_router_trace_session(test_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -34,6 +42,25 @@ def _redirect_model_router_trace_session(test_engine: Engine, monkeypatch: pytes
     from app.modules.model_router import service as model_router_service
 
     monkeypatch.setattr(model_router_service, "_trace_session_factory", sessionmaker(bind=test_engine))
+
+
+@pytest.fixture(autouse=True)
+def _default_safe_claim_verifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 3.25: every respond_with_text candidate now passes
+    through an independent, REAL-network-calling verifier
+    (orchestrator_service.verify_no_mutation_claim) before being
+    persisted. Defaulting it here to "safe" (claims_bazra_mutation_completed
+    = False) for the WHOLE file keeps every pre-3.25 test's own mocked
+    candidate text flowing through unchanged, with zero real API calls
+    — exactly the same "AiTrace redirect" style autouse convention as
+    the fixture above. Tests that specifically exercise the verifier's
+    blocking behavior re-patch this within their own test body
+    (monkeypatch's own last-patch-wins semantics), never needing this
+    fixture removed or parametrized.
+    """
+    from app.modules.orchestrator import service as orchestrator_service_module
+
+    monkeypatch.setattr(orchestrator_service_module, "verify_no_mutation_claim", lambda candidate_text: False)
 
 
 def _send(client: TestClient, content: str, timezone_name: str = _DEFAULT_TIMEZONE) -> dict:
@@ -234,44 +261,35 @@ def test_clear_write_request_gets_unavailability_message_without_calling_model(
     assert response.json()["assistant_message"]["content"] == chat_service.WRITE_UNAVAILABLE_MESSAGE
 
 
-def test_fresh_write_misrouted_to_respond_with_text_is_a_documented_residual_truthfulness_gap(
-    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+def test_fresh_write_misrouted_to_respond_with_text_is_now_blocked_by_the_claim_verifier(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Checkpoint 3.21 introduced this test (then named
+    """Checkpoint 3.21 introduced this test (as
     test_ambiguous_write_request_reaches_model_and_adversarial_check_still_holds)
-    to demonstrate population C: a fresh, ambiguous-phrasing write
-    request with no pre-existing pending proposal. Checkpoint 3.23
-    changes the MECHANISM but deliberately not the OBSERVABLE OUTCOME:
-    before 3.23, the model could return bare text with no tool call at
-    all (now structurally impossible — tool_choice="any" plus the
-    respond_with_text escape hatch guarantees some tool always fires,
-    see orchestrator_service._PRIMARY_CHAT_TOOL_CHOICE and its own
-    OrchestratorContractViolationError). After 3.23, the SAME failure
-    is only reachable via a MISROUTE: the model calls the always-legal
-    respond_with_text tool (kind="answer") instead of propose_create_task,
-    and that tool's own `text` argument is what falsely claims
-    completion — _mock_reply's own 3.23 default wraps a bare-text mock
-    exactly this way now, so this test still exercises the real,
-    current failure shape without needing its own rewrite.
+    to demonstrate population C. Checkpoint 3.23 renamed it (as
+    test_fresh_write_misrouted_to_respond_with_text_is_a_documented_residual_truthfulness_gap)
+    to show the mechanism had changed (bare text became structurally
+    impossible) but the SAME outcome remained reachable via a misroute
+    to respond_with_text — an explicitly documented, unfixed residual.
 
-    This remains UNGUARDED on purpose: chat_service has no structural
-    signal, when pending is None, distinguishing "the model correctly
-    judged this needs no action" from "the model incorrectly routed a
-    genuine write to respond_with_text" — both produce an identical
-    respond_with_text(kind="answer", ...) call. Guarding this would
-    require either a lexical blacklist or a second classifier model —
-    both explicitly excluded by the 3.21 AND 3.23 briefs. See the 3.23
-    close-out's own explicit residual-gap answer.
+    Checkpoint 3.25 closes that exact residual: the independent
+    mutation-claim verifier (mocked here to certify
+    claims_bazra_mutation_completed=True for this exact false-claim
+    text, exactly as the real Haiku verifier is expected to per the
+    3.24 inspection's own 27/27 empirical result) now intercepts this
+    candidate BEFORE it is ever persisted. This is no longer a residual
+    demonstration — it is a CLOSURE proof for this exact scenario.
 
     Still seeds real Task/CalendarEvent/LifeArea data, sends a phrasing
     detect_clear_write_intent does NOT catch, mocks the model to
-    falsely claim an action was taken via a MISROUTED respond_with_text
-    call, and proves the actual database is byte-for-byte unchanged
-    regardless — that adversarial DB-integrity guarantee is real,
-    structural, and unaffected by either checkpoint. Only the
-    CONVERSATIONAL claim remains unguarded here, honestly left that way
-    per both checkpoints' own "do not overclaim closure" instruction.
+    falsely claim an action was taken via a misrouted respond_with_text
+    call, and proves: (1) the deterministic fail-closed reply is what
+    the user actually sees, NOT the false claim; (2) no ProposedAction
+    was ever created; (3) the database remains byte-for-byte unchanged
+    — the same adversarial DB-integrity guarantee as before, now paired
+    with a truthful conversational claim too.
     """
+    from app.modules.actions import service as actions_service
     from app.modules.chat.write_intent import detect_clear_write_intent
 
     ambiguous_message = "I won't be free for my dentist appointment anymore"
@@ -292,14 +310,17 @@ def test_fresh_write_misrouted_to_respond_with_text_is_a_documented_residual_tru
         orchestrator_service, "generate_reply",
         _mock_reply("I've canceled your dentist appointment for you."),
     )
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", lambda candidate_text: True)
 
     response = _send(authenticated_client, ambiguous_message)
     assert response.status_code == 200
-    # Documented residual gap (population C): with no pending proposal
-    # and no tool call, the model's own text still passes through
-    # verbatim today. This assertion exists to make that fact visible
-    # and tracked, not to endorse it as correct.
-    assert response.json()["assistant_message"]["content"] == "I've canceled your dentist appointment for you."
+    # Closure proof: the false claim is NEVER what the user sees.
+    content = response.json()["assistant_message"]["content"]
+    assert content == chat_service._UNVERIFIED_MUTATION_CLAIM_MESSAGE_EN
+    assert content != "I've canceled your dentist appointment for you."
+
+    user, space = _get_space_and_user(db_session)
+    assert actions_service.get_latest_pending(db_session, space.id, user.id) is None
 
     tasks_after = authenticated_client.get("/api/v1/tasks").json()
     events_after = authenticated_client.get(
@@ -313,6 +334,36 @@ def test_fresh_write_misrouted_to_respond_with_text_is_a_documented_residual_tru
     assert task_before["id"] in [t["id"] for t in tasks_after]
     assert any(e["id"] == event_before["id"] for e in events_after if e["source"] == "event")
     assert life_area_before["id"] in [a["id"] for a in life_areas_after]
+
+
+def test_verifier_false_negative_is_a_documented_narrow_residual(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Checkpoint 3.25's own honest, narrow residual (per its brief:
+    'do not pretend a probabilistic classifier is infallible'): if the
+    independent verifier itself misjudges a genuine false-completion
+    claim as safe (a verifier FALSE NEGATIVE — mocked here, since the
+    real Haiku verifier scored 27/27 on the 3.24 adversarial set and
+    this is not a reproducible real-provider failure, only a
+    structural possibility), the candidate still passes through
+    unchanged. This is the ONLY known residual in this class after
+    3.25 — unlike the pre-3.25 gap, it is not a structural hole the
+    application could have caught and didn't; it is the accepted,
+    disclosed cost of using any probabilistic classifier at all, exactly
+    the realistic closure standard the 3.24 inspection defined (a
+    structural, independent, fail-closed check — not a mathematical
+    zero-probability guarantee).
+    """
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("I've canceled your dentist appointment."),
+    )
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", lambda candidate_text: False)
+
+    response = _send(authenticated_client, "I won't be free for my dentist appointment anymore - 325fn")
+    assert response.status_code == 200
+    # Documented, narrow, probabilistic residual — not a structural gap.
+    assert response.json()["assistant_message"]["content"] == "I've canceled your dentist appointment."
 
 
 # ---- Checkpoint 3.23: mandatory structured turn routing ---------------------------
@@ -532,6 +583,358 @@ def test_stale_yes_arabic_message_gets_arabic_safe_reply(
     )
     assert result["call_count"] == 1
     assert result["content"] == chat_service._STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_AR
+
+
+# ---- Checkpoint 3.25: independent mutation-claim verifier -------------------------
+
+
+def _counting_claim_verifier(default: bool = False):
+    counter = {"n": 0}
+
+    def _fn(candidate_text: str) -> bool:
+        counter["n"] += 1
+        return default
+
+    return _fn, counter
+
+
+class _ClaimVerifierFakeTextBlock:
+    """Stands in for a plain text content block from the raw provider
+    response — used to simulate the verifier's own contract violation
+    "zero tool calls" (text instead of the required certify_claim call)."""
+
+    def __init__(self, text: str):
+        self.type = "text"
+        self.text = text
+
+
+class _ClaimVerifierFakeToolUseBlock:
+    """Stands in for a tool_use content block — reused for both the
+    primary chat call's respond_with_text and the verifier's own
+    certify_claim, distinguished by `name`."""
+
+    def __init__(self, input: dict, name: str = "certify_claim", id: str = "toolu_test"):
+        self.type = "tool_use"
+        self.id = id
+        self.name = name
+        self.input = input
+
+
+def test_claim_verifier_blocks_unsafe_candidate_en(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Done — I've added it."),
+    )
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", lambda candidate_text: True)
+
+    response = _send(authenticated_client, "add milk tomorrow - 325unsafe_en")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == chat_service._UNVERIFIED_MUTATION_CLAIM_MESSAGE_EN
+
+
+def test_claim_verifier_blocks_unsafe_candidate_ar(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("تمام، ضفتها."),
+    )
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", lambda candidate_text: True)
+
+    response = _send(authenticated_client, "ضيف لبن بكرة - 325unsafe_ar")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == chat_service._UNVERIFIED_MUTATION_CLAIM_MESSAGE_AR
+
+
+@pytest.mark.parametrize(
+    "label,reply_text",
+    [
+        ("explanation", "To delete an event, just tell me which one and I'll confirm before removing it."),
+        ("clarification", "You have two meetings with Hussein tomorrow — which one do you mean?"),
+        ("hypothetical", "If you asked me to delete it, I'd need to know which one first."),
+        ("user_past_action", "You said you deleted it yesterday, so there's nothing more for me to do."),
+        ("third_party_action", "The event was deleted by Google, not by BAZRA."),
+        ("egyptian_arabic_natural", "أقدر أضيفها لو تحب، بس لسه مضفتش حاجة."),
+    ],
+)
+def test_claim_verifier_allows_safe_candidates(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch, label: str, reply_text: str,
+) -> None:
+    """Checkpoint 3.25 — the verifier must never block legitimate
+    conversational text: ordinary explanation, clarification,
+    hypothetical, discussion of the user's own past action, discussion
+    of a third-party/external action, and natural Egyptian Arabic
+    conversation. Mocks the verifier to correctly return False (safe)
+    for each — the real Haiku verifier's own reliability on exactly
+    this set was empirically proven (27/27) in the 3.24 inspection."""
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply(reply_text))
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", lambda candidate_text: False)
+
+    response = _send(authenticated_client, f"message for {label} - 325safe")
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == reply_text
+
+
+def test_claim_verifier_provider_failure_fails_closed_end_to_end(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full end-to-end: restores the REAL verify_no_mutation_claim (not
+    the autouse fixture's stand-in) and mocks only
+    model_router_service.complete to raise, proving the whole chain —
+    chat_service -> orchestrator_service.verify_no_mutation_claim ->
+    model_router_service.complete — fails closed without ever
+    surfacing as ChatModelCallFailed/502 to the user (Checkpoint 3.25
+    Part 14's own explicit UX requirement)."""
+    from app.modules.model_router import service as model_router_service
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply("Done — I've removed it."))
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", _REAL_VERIFY_NO_MUTATION_CLAIM)
+
+    def _raise(**kwargs):
+        raise model_router_service.ModelRouterError("simulated provider failure")
+
+    monkeypatch.setattr(model_router_service, "complete", _raise)
+
+    response = _send(authenticated_client, "remove my task - 325providerfail")
+    assert response.status_code == 200  # never a 502 — the primary turn still succeeds
+    assert response.json()["assistant_message"]["content"] == chat_service._UNVERIFIED_MUTATION_CLAIM_MESSAGE_EN
+
+
+@pytest.mark.parametrize(
+    "label,fake_content_factory",
+    [
+        ("zero_tool_calls", lambda: [_ClaimVerifierFakeTextBlock("looks fine to me")]),
+        ("multiple_tool_calls", lambda: [
+            _ClaimVerifierFakeToolUseBlock({"claims_bazra_mutation_completed": True}),
+            _ClaimVerifierFakeToolUseBlock({"claims_bazra_mutation_completed": False}),
+        ]),
+        ("wrong_tool_name", lambda: [_ClaimVerifierFakeToolUseBlock({"claims_bazra_mutation_completed": False}, name="respond_with_text")]),
+        ("missing_boolean", lambda: [_ClaimVerifierFakeToolUseBlock({})]),
+        ("non_boolean_value", lambda: [_ClaimVerifierFakeToolUseBlock({"claims_bazra_mutation_completed": "true"})]),
+    ],
+)
+def test_claim_verifier_contract_violation_fails_closed_end_to_end(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+    label: str, fake_content_factory,
+) -> None:
+    """Full-fidelity end-to-end for every contract-violation shape: the
+    REAL verify_no_mutation_claim and REAL model_router_service.complete
+    both run (only _call_anthropic is mocked), producing a genuine
+    AiTrace row for the verifier's own attempt, and proving the
+    candidate never leaks regardless of exactly how the verifier's
+    contract was violated."""
+    from app.modules.model_router import service as model_router_service
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply("Saved."))
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", _REAL_VERIFY_NO_MUTATION_CLAIM)
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+
+    class _FakeUsage:
+        input_tokens = 5
+        output_tokens = 5
+
+    class _FakeMessage:
+        def __init__(self):
+            self.content = fake_content_factory()
+            self.usage = _FakeUsage()
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage())
+
+    before = _max_ai_trace_id(db_session)
+    response = _send(authenticated_client, f"remember my preference - 325contract-{label}")
+    after = _max_ai_trace_id(db_session)
+
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == chat_service._UNVERIFIED_MUTATION_CLAIM_MESSAGE_EN
+    assert after > before  # the verifier's own (failed) attempt still traces normally
+
+
+def test_claim_verifier_receives_only_the_candidate_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 3.25 privacy boundary, re-confirmed at the chat-service
+    call site (the orchestrator-level test already proves the same
+    thing for verify_no_mutation_claim in isolation): no user message,
+    history, Context Assembly, Memory, or Space data ever reaches the
+    verifier — only whatever chat_service extracted from
+    respond_with_text's own candidate text."""
+    captured = {}
+
+    def _capture(candidate_text: str) -> bool:
+        captured["candidate_text"] = candidate_text
+        return False
+
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", _capture)
+
+    result = chat_service._candidate_reply_is_safe_to_show("Some candidate reply.")
+    assert result is True
+    assert captured["candidate_text"] == "Some candidate reply."
+
+
+def test_stale_proposal_guard_short_circuits_before_the_claim_verifier(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.25's own deliberate ordering decision: the 3.21
+    stale-proposal guard must fire WITHOUT ever invoking the claim
+    verifier — 0 extra Haiku calls for this specific branch. Performs
+    the propose/interrupt/stale-yes sequence manually (rather than via
+    the shared _propose_interrupt_then_bare_answer helper) so the call
+    counter can be installed ONLY around the final, stale-yes turn —
+    the interrupt turn's own ordinary respond_with_text answer
+    legitimately DOES invoke the verifier (proven by the dedicated
+    "allows safe candidates" tests above), so counting across the
+    whole sequence would conflate the two.
+    """
+    task = _create_real_task(authenticated_client, "Stale guard short-circuit target - 325sc")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, f"remove the '{task['title']}' task")
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply("Tomorrow in Cairo: sunny, 30°C."))
+    _send(authenticated_client, "What's the weather tomorrow in Cairo?")
+
+    counting_verifier, counter = _counting_claim_verifier(default=True)  # even if invoked, would say "unsafe"
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", counting_verifier)
+    call_count = {"n": 0}
+
+    def _counted_reply(**kwargs):
+        call_count["n"] += 1
+        return _mock_reply("Done — I've removed that task.")(**kwargs)
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _counted_reply)
+    response = _send(authenticated_client, "yes")
+
+    assert call_count["n"] == 1  # reached the model, not deterministic
+    assert response.json()["assistant_message"]["content"] == chat_service._STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_EN
+    assert counter["n"] == 0  # the claim verifier was never invoked for this branch
+
+
+@pytest.mark.parametrize(
+    "propose_message,tool_name,arguments",
+    [
+        ("add a task to buy milk - 325reg1", "propose_create_task", {"title": "Buy milk - 325reg1"}),
+        ("what's the weather tomorrow in Cairo? - 325reg2", "get_weather",
+         {"location": "Cairo", "horizon": "tomorrow", "response_mode": "factual"}),
+    ],
+)
+def test_claim_verifier_never_invoked_for_real_tool_calls(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+    propose_message: str, tool_name: str, arguments: dict,
+) -> None:
+    """Regression: the verifier must run ONLY for respond_with_text —
+    never for a real propose_*/get_weather dispatch (Checkpoint 3.25
+    Part 2's own explicit exclusion list)."""
+    counting_verifier, counter = _counting_claim_verifier(default=False)
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", counting_verifier)
+    monkeypatch.setattr(orchestrator_service, "generate_reply", _mock_reply("ok", tool_name=tool_name, arguments=arguments))
+
+    response = _send(authenticated_client, propose_message)
+    assert response.status_code == 200
+    assert counter["n"] == 0
+
+
+def test_claim_verifier_never_invoked_for_immediate_confirm_or_reject(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Immediate confirm/reject never reach the Orchestrator at all —
+    the verifier must not be invoked for either."""
+    counting_verifier, counter = _counting_claim_verifier(default=False)
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", counting_verifier)
+
+    task = _create_real_task(authenticated_client, "Immediate path verifier regression - 325reg3")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, f"remove the '{task['title']}' task")
+    assert counter["n"] == 0
+
+    monkeypatch.setattr(orchestrator_service, "generate_reply", lambda **kwargs: (_ for _ in ()).throw(AssertionError("should not be called")))
+    response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+    assert counter["n"] == 0
+
+
+def test_claim_verifier_never_invoked_for_invalid_proposal_or_execution_failure(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verifier is exclusively for respond_with_text — never for
+    the deterministic invalid-proposal or execution-failure paths,
+    both of which already have their own, unrelated, deterministic
+    guards (Checkpoint 3.21, unchanged)."""
+    from app.modules.actions import service as actions_service
+    from app.modules.tasks import service as tasks_service
+
+    counting_verifier, counter = _counting_claim_verifier(default=False)
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", counting_verifier)
+
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("Done — that's taken care of.", tool_name="propose_delete_task", arguments={"task_id": 999999}),
+    )
+    _send(authenticated_client, "remove a nonexistent task - 325reg4")
+    assert counter["n"] == 0
+
+    task = _create_real_task(authenticated_client, "Execution failure verifier regression - 325reg5")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_delete_task", arguments={"task_id": task["id"]}),
+    )
+    _send(authenticated_client, f"remove the '{task['title']}' task")
+    user, space = _get_space_and_user(db_session)
+    tasks_service.delete_task(db_session, space.id, task["id"])  # external race
+    _send(authenticated_client, "yes")
+    assert counter["n"] == 0
+
+
+def test_respond_with_text_normal_path_produces_exactly_two_ai_traces(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 3.25 AiTrace accounting, full-fidelity: only
+    _call_anthropic is mocked, so BOTH the real primary chat call
+    (generate_reply, unmocked) AND the real verifier call
+    (verify_no_mutation_claim, unmocked) run against this sequenced
+    fake, each recording its own genuine AiTrace row via the existing,
+    unmodified infrastructure."""
+    from app.modules.model_router import service as model_router_service
+
+    monkeypatch.setattr(orchestrator_service, "verify_no_mutation_claim", _REAL_VERIFY_NO_MUTATION_CLAIM)
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+
+    class _FakeUsage:
+        input_tokens = 5
+        output_tokens = 5
+
+    primary_block = _ClaimVerifierFakeToolUseBlock(
+        {"kind": "answer", "text": "Sure, here's an explanation."}, name="respond_with_text",
+    )
+    verifier_block = _ClaimVerifierFakeToolUseBlock({"claims_bazra_mutation_completed": False})
+
+    class _FakeMessage:
+        def __init__(self, blocks):
+            self.content = blocks
+            self.usage = _FakeUsage()
+
+    call_count = {"n": 0}
+
+    def _sequenced_call_anthropic(model, messages, **kwargs):
+        call_count["n"] += 1
+        return _FakeMessage([primary_block]) if call_count["n"] == 1 else _FakeMessage([verifier_block])
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _sequenced_call_anthropic)
+
+    before = _max_ai_trace_id(db_session)
+    response = _send(authenticated_client, "explain something - 325aitrace")
+    after = _max_ai_trace_id(db_session)
+
+    assert response.status_code == 200
+    assert response.json()["assistant_message"]["content"] == "Sure, here's an explanation."
+    assert call_count["n"] == 2
+    assert after - before == 2
 
 
 # ---- Checkpoint 3.21: invalid proposal tool call never trusts model_text ----------
