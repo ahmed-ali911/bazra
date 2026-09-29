@@ -1127,6 +1127,60 @@ confirmation; a plain creation with no priority language present resulted
 in `normal` with no invented priority — reported as one observed run, not
 as proof the model can never infer a priority under any phrasing.
 
+### Checkpoint 4.2
+
+Introduced the deterministic **Attention Signal Engine**
+(`app/modules/attention/`) — the read-only foundation the rest of Phase 4
+builds on. A **Signal** is a deterministic fact about current Task /
+CalendarEvent / InboxItem state (e.g. "this task is overdue by N
+seconds"). It is explicitly *not* a message, notification, persisted row,
+priority decision, recommendation, or LLM judgment — this checkpoint makes
+**zero** Model Router / Anthropic calls.
+
+Exactly five v1 signal types are derived, live, on every call — nothing is
+persisted (no Signal table, no migration):
+
+- `TASK_OVERDUE` — open, non-archived task with `due_at` in the past.
+- `TASK_DUE_TODAY` — open task due before the next **local** midnight.
+- `TASK_DUE_SOON` — open task due within the next 4 hours (locked v1 window).
+- `EVENT_UPCOMING` — non-archived event starting within the next 2 hours
+  (locked v1 window).
+- `INBOX_NEEDS_ATTENTION` — unread, non-archived inbox item.
+
+A task due soon *and* due today produces **both** signals — Checkpoint 4.2
+deliberately does not deduplicate across types (or across sources, e.g. an
+overdue task and its own "Completed: ..." inbox item can both appear);
+that ranking/dedup policy belongs to Checkpoint 4.3's scoring engine, not
+this one.
+
+**Timezone authority** (Architecture Contract 4.0b-R1 correction #1):
+`generate_signals(db, space_id, now, timezone_name)` takes the evaluation
+instant as an explicit parameter — nothing in this module calls
+`datetime.now()` itself, so every signal in one pass is guaranteed to be
+judged against the exact same instant. `timezone_name` must be a
+validated IANA zone name; an unresolvable name raises a controlled
+`InvalidTimezoneError`, never a silent UTC fallback. The next local
+midnight (`TASK_DUE_TODAY`'s upper bound) is constructed from the local
+**calendar date** (`datetime.combine(local_date + 1 day, time(0, 0),
+tzinfo=zone)`), never a naive `+timedelta(days=1)` on a UTC instant —
+proven with real `America/New_York` spring-forward (2026-03-08, a
+23-hour local day) and fall-back (2026-11-01, a 25-hour local day) tests
+that assert the exact correct UTC instant on both sides of the boundary.
+
+**Canonical snapshot serialization**: every timestamp embedded in a
+Signal's `snapshot` is normalized to UTC ISO-8601
+(`dt.astimezone(timezone.utc).isoformat()`, e.g.
+`2026-09-30T12:00:00+00:00`) so two equivalent instants that arrived with
+different UTC-offset representations always serialize identically —
+Checkpoint 4.4's dismiss-invalidation comparison will depend on exact
+structural equality here, never fuzzy time comparison.
+
+Signals are returned in a fixed, neutral technical order (grouped by
+`signal_type`, then by `source_id`) — **not** an urgency order; scoring,
+ranking, thresholds, cooldown, snooze, dismiss, `attention_feedback`
+persistence, `ACTED_ON`, `APP_OPENED`, and Daily Brief are all explicitly
+out of scope for this checkpoint and remain unimplemented.
+
 ## Run locally (without Docker)
 
 ```bash
