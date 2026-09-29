@@ -1063,6 +1063,30 @@ classifier at all, not a structural hole the application could have caught
 and didn't. A dedicated test keeps this residual visible rather than hidden.
 No new `ProposedAction` status, no AiTrace schema change, no migration.
 
+**Phase 3 acceptance note (Checkpoint 3.26) — a testing-methodology
+distinction worth preserving**: the acceptance audit's controlled
+verifier-failure scenario injected its failure by intercepting
+`model_router_service.complete` itself for `purpose == "claim_verification"`,
+one layer above the real provider-call error-tracing path inside Model
+Router. That scenario correctly proved the chat-level fail-closed behavior
+(verifier failure → unsafe candidate blocked → deterministic safe reply, no
+false completion shown) but produced zero new `AiTrace` rows for the
+injected failure, since it never reached `complete()`'s own
+`_safe_record_trace(status="error", ...)` call. This must not be read as
+evidence that genuine production provider failures go untraced — a real
+failure at the actual `_call_anthropic`/SDK boundary passes through the
+router's normal, unconditional error tracing exactly as it always has,
+covered separately by Model Router's own tests. The scenario proves
+fail-closed chat behavior under verifier failure; it does not independently
+prove production provider-error tracing.
+
+**Evidence-labeling rule for future closure reports**: runtime claims should
+distinguish ACTUAL CAPTURED VALUE (printed/observed during the real run),
+DATABASE-VERIFIED VALUE (queried from rows the run actually committed),
+CODE-INFERRED BEHAVIOR (deduced from reading the source, not observed at
+runtime), and NOT RETAINED / NOT AVAILABLE. Code-inferred behavior should
+never be presented as captured runtime evidence.
+
 ## Run locally (without Docker)
 
 ```bash
