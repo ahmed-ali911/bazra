@@ -219,3 +219,101 @@ def test_create_task_with_commit_false_defers_to_the_callers_own_commit(db_sessi
         assert row == 1
     finally:
         fresh_session.close()
+
+
+# ---- Checkpoint 4.1: Task priority --------------------------------------------
+
+
+def test_create_without_priority_defaults_to_normal(authenticated_client: TestClient) -> None:
+    response = authenticated_client.post("/api/v1/tasks", json={"title": "No priority given"})
+    assert response.status_code == 201
+    assert response.json()["priority"] == "normal"
+
+
+def test_create_with_low_priority(authenticated_client: TestClient) -> None:
+    response = authenticated_client.post("/api/v1/tasks", json={"title": "Low one", "priority": "low"})
+    assert response.status_code == 201
+    assert response.json()["priority"] == "low"
+
+
+def test_create_with_high_priority(authenticated_client: TestClient) -> None:
+    response = authenticated_client.post("/api/v1/tasks", json={"title": "High one", "priority": "high"})
+    assert response.status_code == 201
+    assert response.json()["priority"] == "high"
+
+
+def test_create_with_invalid_priority_rejected(authenticated_client: TestClient) -> None:
+    response = authenticated_client.post("/api/v1/tasks", json={"title": "Bad one", "priority": "urgent"})
+    assert response.status_code == 422
+
+
+def test_update_priority_normal_to_high(authenticated_client: TestClient) -> None:
+    created = authenticated_client.post("/api/v1/tasks", json={"title": "Promote me"}).json()
+    assert created["priority"] == "normal"
+
+    response = authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"priority": "high"})
+    assert response.status_code == 200
+    assert response.json()["priority"] == "high"
+
+
+def test_update_priority_high_to_low(authenticated_client: TestClient) -> None:
+    created = authenticated_client.post("/api/v1/tasks", json={"title": "Demote me", "priority": "high"}).json()
+
+    response = authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"priority": "low"})
+    assert response.status_code == 200
+    assert response.json()["priority"] == "low"
+
+
+def test_update_priority_high_to_normal_explicit(authenticated_client: TestClient) -> None:
+    created = authenticated_client.post("/api/v1/tasks", json={"title": "Back to normal", "priority": "high"}).json()
+
+    response = authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"priority": "normal"})
+    assert response.status_code == 200
+    assert response.json()["priority"] == "normal"
+
+
+def test_update_omitting_priority_leaves_it_unchanged(authenticated_client: TestClient) -> None:
+    created = authenticated_client.post("/api/v1/tasks", json={"title": "Untouched priority", "priority": "high"}).json()
+
+    response = authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"title": "Renamed only"})
+    assert response.status_code == 200
+    assert response.json()["priority"] == "high"
+    assert response.json()["title"] == "Renamed only"
+
+
+def test_update_with_invalid_priority_rejected(authenticated_client: TestClient) -> None:
+    created = authenticated_client.post("/api/v1/tasks", json={"title": "Reject me"}).json()
+    response = authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"priority": "urgent"})
+    assert response.status_code == 422
+
+
+def test_pre_migration_row_reads_as_normal(db_session: Session) -> None:
+    """Confirms the migration's own server_default, not merely the
+    Pydantic schema default — a row inserted with no priority column
+    value at all (simulating a pre-4.1 row) must read back as 'normal'
+    via the real Postgres column default, independent of any Python-side
+    default."""
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+
+    db_session.execute(
+        text("INSERT INTO tasks (space_id, title, status) VALUES (:space_id, :title, 'open')"),
+        {"space_id": space.id, "title": "Inserted without priority - 4.1"},
+    )
+    db_session.commit()
+
+    row = db_session.execute(
+        text("SELECT priority FROM tasks WHERE title = 'Inserted without priority - 4.1'")
+    ).one()
+    assert row.priority == "normal"
+
+
+def test_task_response_exposes_priority(authenticated_client: TestClient) -> None:
+    created = authenticated_client.post("/api/v1/tasks", json={"title": "Exposed", "priority": "low"}).json()
+    assert "priority" in created
+
+    fetched = authenticated_client.get(f"/api/v1/tasks/{created['id']}").json()
+    assert fetched["priority"] == "low"

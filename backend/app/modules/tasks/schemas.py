@@ -4,6 +4,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, model_validator
 
 TaskStatus = Literal["open", "done"]
+TaskPriority = Literal["low", "normal", "high"]
 
 
 class TaskCreate(BaseModel):
@@ -11,6 +12,11 @@ class TaskCreate(BaseModel):
     description: str | None = None
     due_at: datetime | None = None
     life_area_id: int | None = None
+    # Checkpoint 4.1 — defaults to "normal" at the schema boundary itself,
+    # not merely at the DB column level, so every caller (REST, chat's own
+    # propose_create_task handler) sees the same explicit default whether
+    # or not the column-level server_default would also have applied.
+    priority: TaskPriority = "normal"
 
 
 class TaskUpdate(BaseModel):
@@ -26,6 +32,13 @@ class TaskUpdate(BaseModel):
     status: TaskStatus | None = None
     due_at: datetime | None = None
     life_area_id: int | None = None
+    # Checkpoint 4.1 — omitted (the default None) means "leave unchanged",
+    # exactly like every other optional field here; there is no "clear
+    # priority back to unset" concept the way due_at/life_area_id have,
+    # since priority is never nullable on Task itself — a proposal that
+    # explicitly names priority="normal" is still a real, visible change
+    # (see chat/service.py's own confirmation-rendering distinction).
+    priority: TaskPriority | None = None
 
 
 class ProposedTaskUpdate(TaskUpdate):
@@ -73,6 +86,7 @@ class TaskResponse(BaseModel):
     title: str
     description: str | None
     status: TaskStatus
+    priority: TaskPriority
     due_at: datetime | None
     completed_at: datetime | None
     life_area_id: int | None

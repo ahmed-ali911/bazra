@@ -67,6 +67,17 @@ _PROPOSE_CREATE_TASK_TOOL = {
                     "use an id that actually appears in Current Data below."
                 ),
             },
+            "priority": {
+                "type": "string",
+                "enum": ["low", "normal", "high"],
+                "description": (
+                    "Optional. Only set this when the user's own message actually indicates a "
+                    "priority (e.g. they say 'high priority', 'urgent', 'low priority', 'whenever, "
+                    "no rush'). Omit it entirely otherwise — never guess or infer a priority from "
+                    "wording, due date, life area, or anything else; an omitted priority defaults "
+                    "to normal."
+                ),
+            },
         },
         "required": ["title"],
     },
@@ -102,6 +113,16 @@ _PROPOSE_UPDATE_TASK_TOOL = {
             "life_area_id": {
                 "type": "integer",
                 "description": "New life area id, only if it's changing — must appear in Current Data below.",
+            },
+            "priority": {
+                "type": "string",
+                "enum": ["low", "normal", "high"],
+                "description": (
+                    "New priority, only if the user's own message actually asks to change it (e.g. "
+                    "'make it high priority', 'this isn't urgent anymore') — never guess or infer "
+                    "one. Include this even to explicitly set it back to 'normal' if that's what the "
+                    "user is asking for; omit it entirely if priority isn't part of this change."
+                ),
             },
         },
         "required": ["task_id"],
@@ -959,15 +980,33 @@ def _render_create_task_confirmation(arguments: dict, timezone_name: str, user_m
     due_at = arguments.get("due_at")
     arabic = _is_arabic(user_message)
 
+    # Checkpoint 4.1 — "normal" is the silent, invisible default on
+    # CREATE (deliberately different from UPDATE — see
+    # _render_update_task_confirmation's own comment for why an
+    # explicit-normal UPDATE is NOT silent the same way): arguments.get
+    # returns None when the model omitted priority entirely (exclude_unset
+    # drops it from the stored/validated dict), and "normal" is excluded
+    # here too even if the model explicitly named it, since a fresh
+    # task's own priority defaulting to normal is unremarkable either way.
+    priority = arguments.get("priority")
+    priority_clause_en = ""
+    priority_clause_ar = ""
+    if priority == "high":
+        priority_clause_en = " as high priority"
+        priority_clause_ar = " بأولوية عالية"
+    elif priority == "low":
+        priority_clause_en = " as low priority"
+        priority_clause_ar = " بأولوية منخفضة"
+
     if due_at:
         when = _format_due_at_local(due_at, timezone_name)
         if arabic:
-            return f'هضيف مهمة "{title}" بتاريخ {when}. أأكدها؟'
-        return f'I\'ll add the task "{title}" for {when}. Shall I go ahead?'
+            return f'هضيف مهمة "{title}"{priority_clause_ar} بتاريخ {when}. أأكدها؟'
+        return f'I\'ll add the task "{title}"{priority_clause_en} for {when}. Shall I go ahead?'
 
     if arabic:
-        return f'هضيف مهمة "{title}". أأكدها؟'
-    return f'I\'ll add the task "{title}". Shall I go ahead?'
+        return f'هضيف مهمة "{title}"{priority_clause_ar}. أأكدها؟'
+    return f'I\'ll add the task "{title}"{priority_clause_en}. Shall I go ahead?'
 
 
 def _render_update_task_confirmation(task_title: str, changes: dict, timezone_name: str, user_message: str) -> str:
@@ -999,6 +1038,17 @@ def _render_update_task_confirmation(task_title: str, changes: dict, timezone_na
             when = _format_due_at_local(changes["due_at"], timezone_name)
             fragments_en.append(f"reschedule it to {when}")
             fragments_ar.append(f"أغير ميعادها لـ {when}")
+    if "priority" in changes:
+        # Checkpoint 4.1 — deliberately UNLIKE create's own silent-normal
+        # rule: an UPDATE explicitly naming priority="normal" is still a
+        # real, visible change (e.g. "make it normal priority again"),
+        # since "priority" only ever appears in `changes` at all when the
+        # model explicitly proposed changing it — never merely because a
+        # task happens to already be normal.
+        _priority_labels_en = {"low": "low priority", "normal": "normal priority", "high": "high priority"}
+        _priority_labels_ar = {"low": "أولوية منخفضة", "normal": "أولوية عادية", "high": "أولوية عالية"}
+        fragments_en.append(f"set it to {_priority_labels_en[changes['priority']]}")
+        fragments_ar.append(f"أخليها {_priority_labels_ar[changes['priority']]}")
     if "title" in changes:
         fragments_en.append(f'rename it to "{changes["title"]}"')
         fragments_ar.append(f'أغير اسمها لـ "{changes["title"]}"')

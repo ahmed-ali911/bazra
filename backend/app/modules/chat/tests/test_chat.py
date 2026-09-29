@@ -5346,3 +5346,243 @@ def test_forget_memory_rejection_copy(
     )
     response = _send(authenticated_client, "no")
     assert response.json()["assistant_message"]["content"] == "Okay, I won't forget that."
+
+
+# ---- Checkpoint 4.1: Task priority — conversational propose/confirm --------------
+
+
+def test_propose_create_task_with_high_priority_stores_and_confirms_it(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_task",
+            arguments={"title": "Pay electricity bill - 41a", "priority": "high"},
+        ),
+    )
+    response = _send(authenticated_client, "create a high priority task to pay electricity bill - 41a")
+    assert response.status_code == 200
+    content = response.json()["assistant_message"]["content"]
+    assert "high priority" in content
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.arguments["priority"] == "high"
+
+
+def test_propose_create_task_with_low_priority_stores_and_confirms_it(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_task",
+            arguments={"title": "Read a novel - 41b", "priority": "low"},
+        ),
+    )
+    response = _send(authenticated_client, "add a low priority task to read a novel - 41b")
+    assert response.status_code == 200
+    assert "low priority" in response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending.arguments["priority"] == "low"
+
+
+def test_propose_create_task_without_priority_follows_normal_default_silently(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 4.1: an omitted priority is the silent default on
+    CREATE — no priority wording appears, and the stored arguments carry
+    no priority key at all (exclude_unset drops it), the same "no
+    priority key" shape a pre-4.1 proposal would have had."""
+    from app.modules.actions import service as actions_service
+
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_create_task", arguments={"title": "Buy a book - 41c"}),
+    )
+    response = _send(authenticated_client, "create a task called Buy a book - 41c")
+    assert response.status_code == 200
+    content = response.json()["assistant_message"]["content"]
+    assert "priority" not in content.lower()
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert "priority" not in pending.arguments
+
+
+def test_propose_update_task_priority_high_stores_and_confirms_it(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Electricity task - 41d")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_task",
+            arguments={"task_id": task["id"], "priority": "high"},
+        ),
+    )
+    response = _send(authenticated_client, "make the electricity task high priority - 41d")
+    assert response.status_code == 200
+    assert "high priority" in response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending.arguments["priority"] == "high"
+
+
+def test_propose_update_task_priority_low_stores_and_confirms_it(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Book task - 41e", priority="high")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_task",
+            arguments={"task_id": task["id"], "priority": "low"},
+        ),
+    )
+    response = _send(authenticated_client, "change the book task to low priority - 41e")
+    assert response.status_code == 200
+    assert "low priority" in response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending.arguments["priority"] == "low"
+
+
+def test_propose_update_task_priority_explicit_normal_is_visible_not_silent(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 4.1's own locked distinction: unlike CREATE, an UPDATE
+    that explicitly proposes priority="normal" IS a real, visible change
+    — it only ever appears in `changes` because the model explicitly
+    named it."""
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Was high task - 41f", priority="high")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_update_task",
+            arguments={"task_id": task["id"], "priority": "normal"},
+        ),
+    )
+    response = _send(authenticated_client, "make the was-high task normal priority again - 41f")
+    assert response.status_code == 200
+    assert "normal priority" in response.json()["assistant_message"]["content"]
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending.arguments["priority"] == "normal"
+
+
+# ---- Checkpoint 4.1: Task priority — deterministic execution --------------------
+
+
+def test_confirmed_create_task_with_priority_actually_persists_it(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _ensure_no_pending_proposal(db_session)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "confirm?", tool_name="propose_create_task",
+            arguments={"title": "Persisted high priority - 41g", "priority": "high"},
+        ),
+    )
+    _send(authenticated_client, "create a high priority task - 41g")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    response = _send(authenticated_client, "yes")
+    assert response.status_code == 200
+    assert "Done" in response.json()["assistant_message"]["content"]
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    created = next(t for t in tasks if t["title"] == "Persisted high priority - 41g")
+    assert created["priority"] == "high"
+
+
+def test_confirmed_update_task_priority_actually_changes_it(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _create_real_task(authenticated_client, "Will become low - 41h")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_update_task", arguments={"task_id": task["id"], "priority": "low"}),
+    )
+    _send(authenticated_client, "make it low priority - 41h")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'yes'")),
+    )
+    _send(authenticated_client, "yes")
+
+    updated = authenticated_client.get(f"/api/v1/tasks/{task['id']}").json()
+    assert updated["priority"] == "low"
+
+
+def test_rejected_update_task_priority_changes_nothing(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task = _create_real_task(authenticated_client, "Stays normal - 41i")
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply("confirm?", tool_name="propose_update_task", arguments={"task_id": task["id"], "priority": "high"}),
+    )
+    _send(authenticated_client, "make it high priority - 41i")
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("model should not be called for a bare 'no'")),
+    )
+    _send(authenticated_client, "no")
+
+    unchanged = authenticated_client.get(f"/api/v1/tasks/{task['id']}").json()
+    assert unchanged["priority"] == "normal"
+
+
+def test_stale_non_adjacent_priority_update_cannot_execute(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 4.1 inherits 3.17/3.21 unchanged — a priority-bearing
+    proposal is exactly as vulnerable (and exactly as protected) as any
+    other. Reuses the established interrupt-then-bare-answer pattern."""
+    from app.modules.actions import service as actions_service
+
+    task = _create_real_task(authenticated_client, "Stale priority target - 41j")
+    result = _propose_interrupt_then_bare_answer(
+        authenticated_client, monkeypatch,
+        propose_message="make the stale priority task high priority - 41j",
+        tool_name="propose_update_task", arguments={"task_id": task["id"], "priority": "high"},
+        bare_answer="yes",
+        bare_answer_model_reply="Done — I've made that high priority.",
+    )
+    assert result["call_count"] == 1  # reached the model, not deterministic
+    assert result["content"] == chat_service._STALE_PROPOSAL_NOT_EXECUTED_MESSAGE_EN
+
+    unchanged = authenticated_client.get(f"/api/v1/tasks/{task['id']}").json()
+    assert unchanged["priority"] == "normal"
+
+    user, space = _get_space_and_user(db_session)
+    pending = actions_service.get_latest_pending(db_session, space.id, user.id)
+    assert pending is not None
+    assert pending.status == "pending"

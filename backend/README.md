@@ -1087,6 +1087,46 @@ CODE-INFERRED BEHAVIOR (deduced from reading the source, not observed at
 runtime), and NOT RETAINED / NOT AVAILABLE. Code-inferred behavior should
 never be presented as captured runtime evidence.
 
+## Phase 4 — Attention & Proactivity
+
+### Checkpoint 4.1
+
+Task gained an explicit `priority` field: `low | normal | high`, defaulting
+to `normal` (additive migration, every pre-existing task backfilled to
+`normal`). This is a plain string column, the same code-validated
+convention as `Task.status` — not a native Postgres enum.
+
+Supported everywhere Task fields already are: direct REST create/update,
+and conversationally via `propose_create_task`/`propose_update_task`. Chat
+tool descriptions ask the model to set it *only* when the user's own
+message actually indicates a priority — this is prompt-level product
+guidance, not a deterministic parser; conversational priority remains
+model-interpreted user intent, exactly like every other optional field
+(`due_at`, `life_area_id`) a proposal tool already accepts. Whatever the
+model proposes is always visible in the deterministic `ProposedAction`
+confirmation text before anything executes, and — unchanged from every
+other field — requires explicit adjacent confirmation before any mutation
+occurs. Priority introduces no new write authority: it flows through the
+existing `propose_*` → schema validation → `ProposedAction` → confirmation
+→ `confirm_and_execute` path unmodified (confirmed by inspection: both
+`create_task` and `update_task` already apply their input generically —
+via `Task(**data.model_dump())` and a field-by-field `setattr` loop
+respectively — so the new field required zero execution-path code changes).
+
+Confirmation wording is deliberately asymmetric between create and update:
+a **create** with priority omitted or explicitly `"normal"` stays silent
+about it (normal is the invisible default for a brand-new task); an
+**update** that explicitly proposes `priority="normal"` is still stated
+visibly, since it only ever appears in that proposal because the user
+asked for exactly that change.
+
+Live-verified against the real provider: a high-priority creation and a
+low-priority update both correctly extracted the stated priority, showed
+it in the confirmation, and left the task unchanged until explicit
+confirmation; a plain creation with no priority language present resulted
+in `normal` with no invented priority — reported as one observed run, not
+as proof the model can never infer a priority under any phrasing.
+
 ## Run locally (without Docker)
 
 ```bash

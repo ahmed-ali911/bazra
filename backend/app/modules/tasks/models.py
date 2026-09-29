@@ -18,6 +18,15 @@ class Task(BaseModel, SpaceScopedMixin, LifeAreaScopedMixin):
     completed_at/archived_at are persisted, not derived: the service layer
     sets them as a side effect of a status/delete transition — clients never
     supply them directly.
+
+    priority (Checkpoint 4.1, Phase 4's own first domain prerequisite) is
+    the same plain-string, code-validated convention as status — a
+    server_default so every pre-existing row backfills to "normal" with no
+    separate data migration, and a client-settable field like title/due_at
+    (never server-derived the way completed_at is). Explicit-only by
+    product policy (see chat/service.py's propose_create_task/
+    propose_update_task tool descriptions) — that policy is prompt-level
+    guidance, not something this column enforces or could enforce.
     """
 
     __tablename__ = "tasks"
@@ -25,6 +34,7 @@ class Task(BaseModel, SpaceScopedMixin, LifeAreaScopedMixin):
     title: Mapped[str] = mapped_column(String, nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String, nullable=False, default="open")
+    priority: Mapped[str] = mapped_column(String, nullable=False, default="normal", server_default="normal")
     due_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
