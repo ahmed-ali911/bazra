@@ -1181,6 +1181,85 @@ ranking, thresholds, cooldown, snooze, dismiss, `attention_feedback`
 persistence, `ACTED_ON`, `APP_OPENED`, and Daily Brief are all explicitly
 out of scope for this checkpoint and remain unimplemented.
 
+### Checkpoint 4.3
+
+Added `app/modules/attention/scoring.py` — a pure, deterministic function
+of its own inputs that turns Checkpoint 4.2's raw `Signal`s into scored,
+deduped, suppression-evaluated, ranked `AttentionCandidate`s. Zero
+database queries, zero Model Router/Anthropic calls, zero persistence —
+`attention_feedback` and every mutation API (snooze/dismiss/mark-acted-on)
+remain unimplemented; that is Checkpoint 4.4.
+
+**Locked scoring formula** — base score per signal type
+(`TASK_OVERDUE=50`, `EVENT_UPCOMING=45`, `TASK_DUE_TODAY=40`,
+`TASK_DUE_SOON=25`, `INBOX_NEEDS_ATTENTION=15`), plus:
+
+- Task priority (task signals only): `high=+20`, `normal=0`, `low=-10`.
+- `TASK_OVERDUE`: `min(30, floor(overdue_hours/24) * 5)`.
+- `TASK_DUE_SOON` proximity: `round(20 * (1 - hours_until_due/4))`.
+- `TASK_DUE_TODAY` proximity: `round(15 * max(0, 1 - hours_until_due/12))`.
+- `EVENT_UPCOMING` proximity: `round(25 * (1 - minutes_until_start/120))`.
+- `INBOX_NEEDS_ATTENTION`: `min(10, floor(age_hours/24))`.
+
+Every `round(...)` above uses one explicit, shared **round-half-up** rule
+(`scoring._round_half_up`, computed against an exact `fractions.Fraction`
+value, never a float re-approximation) — deliberately not Python's
+built-in `round()`, which uses banker's-rounding-to-even.
+
+**A genuine contradiction in the original architecture scenario table,
+resolved during this checkpoint**: two of the required worked examples
+land on an exact `.5` proximity tie — a HIGH task due in 2h needs
+`round(12.5)` in its `TASK_DUE_TODAY` score, and a NORMAL task due in 10h
+needs `round(2.5)`. The brief's own numbers required these two ties to
+round in *opposite* directions (12.5→12 alongside 2.5→3), which no single
+rounding rule can satisfy. Flagged back rather than silently forced to
+pass; the resolution was to adopt round-half-up as the one shared rule
+and correct the due-in-2h scenario's expected score from 72 to **73**
+(50→60 base+priority, +13 proximity). The due-in-10h scenario's expected
+43 needed no correction under this rule. See
+`test_round_half_up_on_exact_half_values` and the two
+`test_due_today_proximity_hits_*_exact_half_tie*` tests for the explicit
+proof.
+
+**Same-source dedup** (`(source_type, source_id)` identity): only the
+highest-scoring candidate per identity survives — e.g. a task due soon
+and due today today both score independently, but only one is retained,
+never summed or merged. An exact-score tie is broken by a fixed
+signal-category order (`TASK_OVERDUE > EVENT_UPCOMING > TASK_DUE_TODAY >
+TASK_DUE_SOON > INBOX_NEEDS_ATTENTION`) — the SAME order also used as the
+second key in the final ranking tie-break, never two independently
+drifting orderings. Different sources (e.g. an overdue task and its own
+"Completed: ..." inbox item) are never deduped against each other.
+
+**Final ranking** sorts by: score descending → signal-category order →
+earliest `relevant_timestamp` (missing timestamps sort last) → lowest
+`source_id` — never by input/list order (proven by dedicated
+shuffled-input determinism tests).
+
+**Threshold policy** is selected per consumer surface, not hard-wired:
+`app_opened` requires `score >= 45`; `daily_brief` requires `score >=
+20`. Neither surface's own endpoint exists yet.
+
+**Suppression** evaluates three feedback-based gates against a caller-
+supplied `SuppressionState` (surfaced_at/snoozed_until/dismissed_at/
+dismissed_snapshot/acted_on_at) — a narrow, storage-agnostic read-model
+input Checkpoint 4.4 will construct from its own `attention_feedback`
+table, never the reverse. Locked precedence, first match wins:
+1. **`SNOOZED`** — `snoozed_until` is set and `now < snoozed_until`
+   (exactly `now == snoozed_until` is no longer suppressed).
+2. **`DISMISSED_UNCHANGED`** — `dismissed_at` is set and the stored
+   snapshot structurally equals the Signal's *current* snapshot (never a
+   bare `updated_at` or fuzzy time comparison — an edit that changes the
+   snapshot make the old dismissal stop suppressing).
+3. **`COOLDOWN`** — `surfaced_at` is set and `now < surfaced_at + 12h`
+   (exactly `surfaced_at + 12h` is eligible again).
+4. **`BELOW_THRESHOLD`** — applied only by `rank_for_surface`, after the
+   three gates above, using the selected surface's own threshold.
+
+`acted_on_at` is accepted in `SuppressionState` but deliberately never
+consulted by the gates — a historical acted-on exposure never itself
+suppresses a new, current Signal (only snooze/dismiss/cooldown do).
+
 ## Run locally (without Docker)
 
 ```bash
