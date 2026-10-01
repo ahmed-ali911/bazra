@@ -1,17 +1,25 @@
-"""Checkpoint 4.4a — Attention exposure persistence.
+"""Checkpoint 4.4a/4.4b — Attention exposure persistence and feedback.
 
 The one place Attention state becomes durable. Signal (4.2) and
 AttentionCandidate (4.3) both remain fully live-derived and
 unpersisted; this module only ever records that a candidate was
-ACTUALLY DELIVERED (record_exposure) and reconstructs 4.3's
-SuppressionState read model from that durable history
-(load_suppression_states).
+ACTUALLY DELIVERED (record_exposure), records explicit user feedback
+against one specific delivered exposure (record_snooze,
+record_dismiss), and reconstructs 4.3's SuppressionState read model
+from that durable history (load_suppression_states).
 
 Deliberately NOT implemented here (later checkpoints own these):
-- snooze/dismiss mutation APIs (4.4b)
-- the deterministic ACTED_ON evaluator (4.4c)
+- the deterministic ACTED_ON evaluator, mutation hooks, predicate
+  extraction (4.4c) — acted_on_at is declared but never written here.
 - any surfacing consumer (APP_OPENED / Daily Brief delivery) that
   would actually call record_exposure in production.
+- natural-language snooze-phrase parsing — every timestamp this module
+  receives is already resolved by the caller.
+- any append-only log of every individual re-snooze instruction: this
+  table stores the LATEST snooze state per exposure, not a full
+  transition history. If a future BAZRA Evolution System genuinely
+  needs every historical re-snooze instruction, a separate append-only
+  feedback-event table may be introduced then — not built now.
 
 No Model Router/Anthropic/Orchestrator call, no ProposedAction
 interaction, no proactive ChatMessage — this module is as
@@ -23,7 +31,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app.modules.attention import scoring
@@ -70,7 +78,31 @@ class AttentionOwnershipError(AttentionExposureError):
     user, or the referenced Task/CalendarEvent/InboxItem does not exist
     in this space. Never trust a caller-provided source id merely
     because it exists somewhere — always re-verify through this
-    source's own scoped getter."""
+    source's own scoped getter.
+
+    record_snooze/record_dismiss also raise this for an exposure_id
+    that does not exist, or does not belong to the supplied
+    (space_id, user_id) — the same "nonexistent and wrong-tenant look
+    identical" discipline, applied to feedback targeting."""
+
+
+class InvalidSnoozeInstantError(Exception):
+    """Raised when snoozed_until is not strictly greater than the
+    caller-supplied authoritative `now` — a snoozed_until <= now could
+    never actually suppress anything under Checkpoint 4.3's own locked
+    SNOOZED gate (`now < snoozed_until`), so persisting it anyway would
+    be silently-ineffective, misleading history. Raised BEFORE any
+    database write; purely a mechanical comparison, never natural-
+    language interpretation (out of scope here — see this module's own
+    docstring)."""
+
+    def __init__(self, snoozed_until: datetime, now: datetime):
+        self.snoozed_until = snoozed_until
+        self.now = now
+        super().__init__(
+            f"snoozed_until ({snoozed_until.isoformat()}) must be strictly after "
+            f"now ({now.isoformat()})"
+        )
 
 
 def _require_space_owned_by_user(db: Session, space_id: int, user_id: int) -> None:
@@ -176,6 +208,139 @@ def record_exposure(
     else:
         db.flush()
     return exposure
+
+
+def _get_owned_exposure(db: Session, space_id: int, user_id: int, exposure_id: int) -> AttentionExposure | None:
+    """A nonexistent exposure_id and one that exists but belongs to a
+    different space/user are indistinguishable from the caller's point
+    of view — both simply return None here, exactly matching
+    core/space_scoping.py's own established discipline."""
+    return db.execute(
+        select(AttentionExposure).where(
+            AttentionExposure.id == exposure_id,
+            AttentionExposure.space_id == space_id,
+            AttentionExposure.user_id == user_id,
+        )
+    ).scalar_one_or_none()
+
+
+def record_dismiss(
+    db: Session, space_id: int, user_id: int, exposure_id: int, now: datetime, commit: bool = True
+) -> AttentionExposure:
+    """First accepted dismiss wins — a conditional UPDATE guarded on
+    `dismissed_at IS NULL` takes a real Postgres row lock the instant it
+    matches (the same confirm_and_execute/reject replay-guard
+    convention actions_service already established), so a second,
+    concurrent dismiss attempt against the SAME row blocks until this
+    one resolves, then itself matches nothing (dismissed_at is no
+    longer NULL) and falls through to the true-no-op path below.
+
+    A duplicate dismiss changes NOTHING: dismissed_at is never
+    rewritten, updated_at is never bumped, and no other column is
+    touched — the existing row is read back and returned exactly as
+    the FIRST accepted dismiss left it.
+
+    Never mutates any of the immutable exposure-core columns (space_id/
+    user_id/task_id/event_id/inbox_item_id/signal_type/surface/
+    policy_version/score/reason_codes/exposure_snapshot/surfaced_at) —
+    the UPDATE's own SET clause touches dismissed_at only.
+
+    Raises AttentionOwnershipError if exposure_id does not exist, or
+    exists but does not belong to (space_id, user_id) — never
+    distinguishing the two cases to the caller.
+    """
+    stmt = (
+        update(AttentionExposure)
+        .where(
+            AttentionExposure.id == exposure_id,
+            AttentionExposure.space_id == space_id,
+            AttentionExposure.user_id == user_id,
+            AttentionExposure.dismissed_at.is_(None),
+        )
+        .values(dismissed_at=now)
+        .returning(AttentionExposure)
+    )
+    exposure = db.execute(stmt).scalars().first()
+    if exposure is not None:
+        if commit:
+            db.commit()
+        return exposure
+
+    existing = _get_owned_exposure(db, space_id, user_id, exposure_id)
+    if existing is None:
+        raise AttentionOwnershipError(
+            f"No exposure with id={exposure_id} exists in space_id={space_id} for user_id={user_id}"
+        )
+    # Already dismissed — a true no-op; return it completely untouched,
+    # never re-issuing the same write.
+    return existing
+
+
+def record_snooze(
+    db: Session,
+    space_id: int,
+    user_id: int,
+    exposure_id: int,
+    snoozed_until: datetime,
+    now: datetime,
+    commit: bool = True,
+) -> AttentionExposure:
+    """Unlike dismiss, a later snooze CAN be a genuine new instruction
+    (re-snooze) — so this is NOT first-write-wins. The single
+    conditional UPDATE below uses `snoozed_until IS DISTINCT FROM
+    :requested` (NULL-safe inequality) as its guard, which correctly
+    covers all three real cases in ONE atomic statement:
+      - existing snoozed_until IS NULL (first snooze) -> DISTINCT FROM
+        is true -> matches -> sets the requested value.
+      - existing snoozed_until differs from the requested value
+        (intentional re-snooze, earlier OR later, both legitimate
+        explicit instructions) -> matches -> overwrites.
+      - existing snoozed_until EQUALS the requested value (exact
+        duplicate request) -> DISTINCT FROM is false -> does NOT match
+        -> zero rows touched -> falls through to the true-no-op path
+        below, exactly like record_dismiss's own duplicate handling:
+        no rewrite, no updated_at bump.
+
+    Validates snoozed_until > now BEFORE touching the database at all
+    (InvalidSnoozeInstantError, zero mutation) — mechanical comparison
+    only, using the caller's own explicit `now`, never a hidden
+    datetime.now().
+
+    Never clears dismissed_at — snooze and dismiss coexist by design;
+    Checkpoint 4.3's own already-locked gate precedence (SNOOZED before
+    DISMISSED_UNCHANGED) alone decides which currently applies.
+
+    Raises AttentionOwnershipError on a nonexistent or not-owned
+    exposure_id, identically to record_dismiss.
+    """
+    if snoozed_until <= now:
+        raise InvalidSnoozeInstantError(snoozed_until, now)
+
+    stmt = (
+        update(AttentionExposure)
+        .where(
+            AttentionExposure.id == exposure_id,
+            AttentionExposure.space_id == space_id,
+            AttentionExposure.user_id == user_id,
+            AttentionExposure.snoozed_until.is_distinct_from(snoozed_until),
+        )
+        .values(snoozed_until=snoozed_until)
+        .returning(AttentionExposure)
+    )
+    exposure = db.execute(stmt).scalars().first()
+    if exposure is not None:
+        if commit:
+            db.commit()
+        return exposure
+
+    existing = _get_owned_exposure(db, space_id, user_id, exposure_id)
+    if existing is None:
+        raise AttentionOwnershipError(
+            f"No exposure with id={exposure_id} exists in space_id={space_id} for user_id={user_id}"
+        )
+    # Exact-duplicate requested value — a true no-op; return it
+    # completely untouched, never manufacturing a meaningless write.
+    return existing
 
 
 def load_suppression_states(

@@ -498,8 +498,9 @@ def test_record_exposure_never_sets_acted_on_at(db_session: Session) -> None:
     assert exposure.dismissed_at is None
 
 
-def test_no_snooze_or_dismiss_or_acted_on_mutation_functions_exist() -> None:
-    assert not hasattr(history, "record_snooze")
-    assert not hasattr(history, "record_dismiss")
+def test_no_acted_on_mutation_functions_exist_yet() -> None:
+    """record_snooze/record_dismiss are now implemented (Checkpoint
+    4.4b) — this guard narrows to just the still-deferred ACTED_ON
+    evaluator (Checkpoint 4.4c)."""
     assert not hasattr(history, "evaluate_and_record_acted_on")
     assert not hasattr(history, "mark_acted_on")

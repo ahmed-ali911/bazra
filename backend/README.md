@@ -1339,6 +1339,91 @@ A future BAZRA Evolution System may eventually consume this durable
 exposure history as factual evaluation evidence, but no learning,
 preference-inference, or policy-comparison exists anywhere in 4.4a.
 
+### Checkpoint 4.4b
+
+Added `record_dismiss` and `record_snooze` to `history.py` — explicit
+user feedback against one specific, already-delivered
+`AttentionExposure`, targeted by its own `exposure_id` (never "the
+latest exposure for this source" — the caller always knows exactly
+which delivered exposure it's responding to). No migration — both
+columns (`dismissed_at`, `snoozed_until`) already existed, declared but
+unwritten, since 4.4a.
+
+**Dismiss is first-write-wins.** `record_dismiss(db, space_id,
+user_id, exposure_id, now)` uses a single conditional `UPDATE ... WHERE
+id=... AND space_id=... AND user_id=... AND dismissed_at IS NULL ...
+RETURNING *` — the same real-row-lock replay-guard convention
+`actions_service.confirm_and_execute`/`reject` already established. A
+duplicate dismiss is a **true no-op**: `dismissed_at` is never
+rewritten and `updated_at` is never bumped, because the conditional
+UPDATE touches zero rows once `dismissed_at` is already set — proven
+with a real two-thread Postgres concurrency test (same pattern as
+`test_actions_concurrency.py`).
+
+**Snooze is not idempotent the same way — a later snooze can be a
+genuine new instruction (re-snooze).** `record_snooze(db, space_id,
+user_id, exposure_id, snoozed_until, now)` validates `snoozed_until >
+now` *before* touching the database (`InvalidSnoozeInstantError`,
+zero mutation, otherwise) — a `snoozed_until` at or before `now` could
+never actually suppress anything under 4.3's own locked `now <
+snoozed_until` gate. The write itself is one conditional UPDATE guarded
+by `snoozed_until IS DISTINCT FROM :requested` (NULL-safe inequality) —
+a single statement that correctly covers all three cases: first snooze
+(existing `NULL`, always distinct → write), a genuine re-snooze
+(existing value differs, earlier or later, both legitimate → write),
+and an **exact-duplicate** request (existing value already equals the
+requested one → excluded from the `WHERE` → zero rows touched → true
+no-op, `updated_at` untouched, exactly mirroring dismiss's own
+duplicate handling).
+
+**Snooze and dismiss coexist — neither write clears the other.** Both
+are preserved as independent, equally-true historical facts; 4.3's
+already-locked gate precedence (`SNOOZED` → `DISMISSED_UNCHANGED` →
+`COOLDOWN` → `BELOW_THRESHOLD`) alone decides which currently applies —
+no new precedence logic lives in `history.py`. Concretely: snooze until
+11:00 then dismiss at 09:10 means `SNOOZED` governs until 11:00, after
+which — if the signal's snapshot is still unchanged — `DISMISSED_UNCHANGED`
+takes back over automatically.
+
+**Stale feedback is historical truth, never current suppression
+authority.** `load_suppression_states` (4.4a) only ever reads the
+single *latest* exposure row per source (`surfaced_at DESC, id DESC`).
+A delayed dismiss/snooze call against an older, superseded exposure is
+still accepted and persisted on that historical row — it is a true,
+worth-keeping fact — but it is structurally invisible to any future
+suppression evaluation once a newer exposure exists for that source,
+with zero extra "is this still current" check needed anywhere.
+
+**Immutable exposure core, enforced by construction, not by convention
+alone**: both functions' own `UPDATE` statements have a `SET` clause
+touching only `dismissed_at`/`snoozed_until` respectively — `space_id`,
+`user_id`, every source FK, `signal_type`, `surface`, `policy_version`,
+`score`, `reason_codes`, `exposure_snapshot`, and `surfaced_at` are
+structurally untouched by either, proven by dedicated before/after
+field-equality tests. `updated_at` remains ordinary bookkeeping only —
+it legitimately bumps on a genuine feedback write (never on a true
+no-op) but is never itself read as attention evidence, a user-action
+signal, dismissal-invalidation evidence, or learning evidence; `acted_on_at`
+remains completely untouched by any 4.4b function.
+
+**Known, accepted limitation for v1**: `attention_exposures` stores
+the *latest* snooze/dismiss state per exposure, not an append-only log
+of every individual re-snooze instruction a user ever issued. If a
+future BAZRA Evolution System genuinely needs every historical
+re-snooze transition as evaluation evidence, a separate append-only
+feedback-event table may be introduced then — deliberately not built
+now. Concurrency for v1 is deliberately minimal: no version counters,
+no optimistic-concurrency framework, no distributed locks — ordinary
+Postgres row-level write semantics (last-committed-wins for concurrent
+differing re-snoozes; the proven conditional-UPDATE row lock for
+duplicate dismisses) are sufficient and are all that's implemented.
+
+Still not implemented: the ACTED_ON evaluator, any mutation-time
+hooks into Task/CalendarEvent/InboxItem, and natural-language
+snooze-phrase parsing (every timestamp `record_snooze` receives is
+already fully resolved by its caller) — all deferred to Checkpoint 4.4c
+or later.
+
 ## Run locally (without Docker)
 
 ```bash
