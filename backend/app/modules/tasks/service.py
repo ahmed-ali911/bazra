@@ -170,7 +170,16 @@ def create_task(db: Session, space_id: int, data: TaskCreate, commit: bool = Tru
     return task
 
 
-def update_task(db: Session, space_id: int, task_id: int, data: TaskUpdate) -> Task | None:
+def update_task(db: Session, space_id: int, task_id: int, data: TaskUpdate, commit: bool = True) -> Task | None:
+    """commit=True by default so this remains directly callable/committing
+    on its own (the direct REST path). Checkpoint 3.H2 — a caller that
+    needs this update as part of its OWN atomic write (actions_service.
+    confirm_and_execute, so a ProposedAction can never end up durably
+    'executed' with no corresponding Task mutation, or vice versa, and
+    never durably stuck at 'confirmed' with the mutation already real)
+    passes commit=False and performs the single covering db.commit()
+    itself — the exact same escape hatch create_task already established.
+    """
     task = get_task(db, space_id, task_id)
     if task is None:
         return None
@@ -236,14 +245,30 @@ def update_task(db: Session, space_id: int, task_id: int, data: TaskUpdate) -> T
             now,
         )
 
-    db.commit()
-    db.refresh(task)
+    if commit:
+        db.commit()
+        db.refresh(task)
+    else:
+        # The caller's own authoritative transaction needs every
+        # server-generated/derived value (e.g. completed_at) available on
+        # this object before its own eventual commit — flush evaluates
+        # constraints and populates them without ending the transaction,
+        # unlike commit (Checkpoint 3.H1's own real-Postgres experiment
+        # proved flush alone is sufficient; refresh is deliberately not
+        # called here).
+        db.flush()
     return task
 
 
-def delete_task(db: Session, space_id: int, task_id: int) -> bool:
+def delete_task(db: Session, space_id: int, task_id: int, commit: bool = True) -> bool:
     """Soft delete: sets archived_at rather than removing the row, so a
-    future Inbox item referencing this task never dangles."""
+    future Inbox item referencing this task never dangles.
+
+    commit=True by default (direct REST). Checkpoint 3.H2 —
+    commit=False lets confirm_and_execute fold this into its own single
+    authoritative transaction, the same escape hatch update_task above
+    now also has.
+    """
     task = get_task(db, space_id, task_id)
     if task is None:
         return False
@@ -260,5 +285,8 @@ def delete_task(db: Session, space_id: int, task_id: int) -> bool:
         now,
     )
 
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return True

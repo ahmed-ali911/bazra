@@ -1,9 +1,10 @@
+import threading
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from app.modules.actions import service as actions_service
 from app.modules.actions.models import ProposedAction
@@ -1295,3 +1296,654 @@ def test_forced_attribution_failure_during_confirmed_update_event_still_executes
         text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure.id}
     ).scalar_one()
     assert acted_on is None
+
+
+# ==================================================
+# Checkpoint 3.H2 — single authoritative commit
+# ==================================================
+
+
+def _fresh_session(db_session: Session) -> Session:
+    return sessionmaker(bind=db_session.get_bind())()
+
+
+def _raise_on_commit(monkeypatch, db_session: Session) -> None:
+    monkeypatch.setattr(
+        db_session, "commit", lambda: (_ for _ in ()).throw(RuntimeError("forced authoritative commit failure"))
+    )
+
+
+# ---- Five formerly-two-commit branches: forced final-commit failure rolls back fully ----
+
+
+def test_forced_final_commit_failure_during_update_task_rolls_back_fully(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service_module.create_task(
+        db_session, space.id, TaskCreate(title="3H2 original - update_task")
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task",
+        {"task_id": task.id, "title": "3H2 changed - update_task"},
+    )
+    proposal_id = proposal.id
+
+    _raise_on_commit(monkeypatch, db_session)
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    assert result.outcome == "execution_failed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "pending"
+        title = fresh.execute(text("SELECT title FROM tasks WHERE id = :id"), {"id": task.id}).scalar_one()
+        assert title == "3H2 original - update_task"
+    finally:
+        fresh.close()
+
+
+def test_forced_final_commit_failure_during_delete_task_rolls_back_fully(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service_module.create_task(db_session, space.id, TaskCreate(title="3H2 - delete_task"))
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_task", {"task_id": task.id},
+    )
+    proposal_id = proposal.id
+
+    _raise_on_commit(monkeypatch, db_session)
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    assert result.outcome == "execution_failed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "pending"
+        archived_at = fresh.execute(
+            text("SELECT archived_at FROM tasks WHERE id = :id"), {"id": task.id}
+        ).scalar_one()
+        assert archived_at is None
+    finally:
+        fresh.close()
+
+
+def test_forced_final_commit_failure_during_create_event_rolls_back_fully(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_event",
+        {"title": "3H2 event - create_event", "starts_at": "2030-01-01T10:00:00+00:00"},
+    )
+    proposal_id = proposal.id
+
+    _raise_on_commit(monkeypatch, db_session)
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    assert result.outcome == "execution_failed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "pending"
+        count = fresh.execute(
+            text("SELECT count(*) FROM calendar_events WHERE title = '3H2 event - create_event'")
+        ).scalar_one()
+        assert count == 0
+    finally:
+        fresh.close()
+
+
+def test_forced_final_commit_failure_during_update_event_rolls_back_fully(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    from app.modules.calendar import service as calendar_service_module
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    original_starts_at = datetime(2030, 1, 1, 10, 0, tzinfo=timezone.utc)
+    event = calendar_service_module.create_calendar_event(
+        db_session, space.id, CalendarEventCreate(title="3H2 - update_event", starts_at=original_starts_at),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "starts_at": "2030-01-02T10:00:00+00:00"},
+    )
+    proposal_id = proposal.id
+
+    _raise_on_commit(monkeypatch, db_session)
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    assert result.outcome == "execution_failed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "pending"
+        starts_at = fresh.execute(
+            text("SELECT starts_at FROM calendar_events WHERE id = :id"), {"id": event.id}
+        ).scalar_one()
+        assert starts_at == original_starts_at
+    finally:
+        fresh.close()
+
+
+def test_forced_final_commit_failure_during_delete_event_rolls_back_fully(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    from app.modules.calendar import service as calendar_service_module
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service_module.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="3H2 - delete_event", starts_at=datetime(2030, 1, 1, 10, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_event", {"event_id": event.id},
+    )
+    proposal_id = proposal.id
+
+    _raise_on_commit(monkeypatch, db_session)
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    assert result.outcome == "execution_failed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "pending"
+        archived_at = fresh.execute(
+            text("SELECT archived_at FROM calendar_events WHERE id = :id"), {"id": event.id}
+        ).scalar_one()
+        assert archived_at is None
+    finally:
+        fresh.close()
+
+
+# ---- ACTED_ON cross-layer atomicity: Task update ----
+
+
+def test_acted_on_domain_mutation_and_proposal_all_durable_together_for_update_task(
+    db_session: Session, owner
+) -> None:
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    task = tasks_service_module.create_task(
+        db_session, space.id, TaskCreate(title="3H2 acted_on success - update_task", due_at=past_due),
+    )
+    signal = Signal(
+        signal_type="TASK_OVERDUE", source_type="task", source_id=task.id, title=task.title,
+        relevant_timestamp=past_due, priority="normal", measurement_seconds=3600,
+        snapshot={"due_at": "x", "status": "open"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space.id, user.id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "done"},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "executed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        task_status = fresh.execute(text("SELECT status FROM tasks WHERE id = :id"), {"id": task.id}).scalar_one()
+        assert task_status == "done"
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE source_chat_message_id = :id"), {"id": source_id}
+        ).scalar_one()
+        assert proposal_status == "executed"
+        acted_on = fresh.execute(
+            text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure.id}
+        ).scalar_one()
+        assert acted_on is not None
+    finally:
+        fresh.close()
+
+
+def test_acted_on_forced_rollback_leaves_none_of_the_three_truths_durable_for_update_task(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    task = tasks_service_module.create_task(
+        db_session, space.id, TaskCreate(title="3H2 acted_on rollback - update_task", due_at=past_due),
+    )
+    signal = Signal(
+        signal_type="TASK_OVERDUE", source_type="task", source_id=task.id, title=task.title,
+        relevant_timestamp=past_due, priority="normal", measurement_seconds=3600,
+        snapshot={"due_at": "x", "status": "open"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space.id, user.id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "done"},
+    )
+    proposal_id = proposal.id
+
+    _raise_on_commit(monkeypatch, db_session)
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    assert result.outcome == "execution_failed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        task_status = fresh.execute(text("SELECT status FROM tasks WHERE id = :id"), {"id": task.id}).scalar_one()
+        assert task_status == "open"  # unchanged
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "pending"
+        acted_on = fresh.execute(
+            text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure.id}
+        ).scalar_one()
+        assert acted_on is None
+    finally:
+        fresh.close()
+
+
+# ---- ACTED_ON cross-layer atomicity: Event update ----
+
+
+def test_acted_on_domain_mutation_and_proposal_all_durable_together_for_update_event(
+    db_session: Session, owner
+) -> None:
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+    from app.modules.calendar import service as calendar_service_module
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = calendar_service_module.create_calendar_event(
+        db_session, space.id, CalendarEventCreate(title="3H2 acted_on success - update_event", starts_at=soon),
+    )
+    signal = Signal(
+        signal_type="EVENT_UPCOMING", source_type="calendar_event", source_id=event.id, title=event.title,
+        relevant_timestamp=soon, priority=None, measurement_seconds=1800, snapshot={"starts_at": "x"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space.id, user.id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    far_future = datetime.now(timezone.utc) + timedelta(hours=4)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "starts_at": far_future.isoformat()},
+    )
+
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    assert result.outcome == "executed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        starts_at = fresh.execute(
+            text("SELECT starts_at FROM calendar_events WHERE id = :id"), {"id": event.id}
+        ).scalar_one()
+        assert starts_at == far_future
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE source_chat_message_id = :id"), {"id": source_id}
+        ).scalar_one()
+        assert proposal_status == "executed"
+        acted_on = fresh.execute(
+            text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure.id}
+        ).scalar_one()
+        assert acted_on is not None
+    finally:
+        fresh.close()
+
+
+def test_acted_on_forced_rollback_leaves_none_of_the_three_truths_durable_for_update_event(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+    from app.modules.calendar import service as calendar_service_module
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = calendar_service_module.create_calendar_event(
+        db_session, space.id, CalendarEventCreate(title="3H2 acted_on rollback - update_event", starts_at=soon),
+    )
+    signal = Signal(
+        signal_type="EVENT_UPCOMING", source_type="calendar_event", source_id=event.id, title=event.title,
+        relevant_timestamp=soon, priority=None, measurement_seconds=1800, snapshot={"starts_at": "x"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space.id, user.id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    far_future = datetime.now(timezone.utc) + timedelta(hours=4)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "starts_at": far_future.isoformat()},
+    )
+    proposal_id = proposal.id
+
+    _raise_on_commit(monkeypatch, db_session)
+    result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    assert result.outcome == "execution_failed"
+
+    fresh = _fresh_session(db_session)
+    try:
+        starts_at = fresh.execute(
+            text("SELECT starts_at FROM calendar_events WHERE id = :id"), {"id": event.id}
+        ).scalar_one()
+        assert starts_at == soon  # unchanged
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "pending"
+        acted_on = fresh.execute(
+            text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure.id}
+        ).scalar_one()
+        assert acted_on is None
+    finally:
+        fresh.close()
+
+
+# ---- Post-commit presentation failure cannot redefine execution truth ----
+
+
+def test_post_commit_result_construction_failure_cannot_report_execution_failed(
+    db_session: Session, owner, monkeypatch
+) -> None:
+    """Forces a failure in the LAST step after the authoritative commit
+    has already succeeded (building the final ConfirmResult itself) —
+    proves this can never be caught by the authoritative except block
+    and misreported as execution_failed: it propagates as a raw
+    exception instead, and the mutation is independently verified
+    durable regardless."""
+    from app.modules.actions import schemas as actions_schemas
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service_module.create_task(
+        db_session, space.id, TaskCreate(title="3H2 post-commit - update_task"),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    proposal = actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task",
+        {"task_id": task.id, "status": "done"},
+    )
+    proposal_id = proposal.id
+
+    real_confirm_result = actions_schemas.ConfirmResult
+    call_count = {"n": 0}
+
+    def _flaky_confirm_result(*args, **kwargs):
+        call_count["n"] += 1
+        if kwargs.get("outcome") == "executed":
+            raise RuntimeError("forced post-commit presentation failure")
+        return real_confirm_result(*args, **kwargs)
+
+    monkeypatch.setattr(actions_service, "ConfirmResult", _flaky_confirm_result)
+    with pytest.raises(RuntimeError, match="forced post-commit presentation failure"):
+        actions_service.confirm_and_execute(db_session, space.id, user.id)
+    monkeypatch.undo()
+
+    # The exception propagated RAW (never caught/converted to
+    # execution_failed) -- and the mutation is independently durable.
+    fresh = _fresh_session(db_session)
+    try:
+        proposal_status = fresh.execute(
+            text("SELECT status FROM proposed_actions WHERE id = :id"), {"id": proposal_id}
+        ).scalar_one()
+        assert proposal_status == "executed"
+        task_status = fresh.execute(text("SELECT status FROM tasks WHERE id = :id"), {"id": task.id}).scalar_one()
+        assert task_status == "done"
+    finally:
+        fresh.close()
+
+
+# ---- Structural proof: exactly one commit, zero domain-service commits ----
+
+
+def _assert_single_commit(db_session: Session, monkeypatch, space_id: int, user_id: int) -> None:
+    count = {"n": 0}
+    real_commit = db_session.commit
+
+    def _counting_commit():
+        count["n"] += 1
+        return real_commit()
+
+    monkeypatch.setattr(db_session, "commit", _counting_commit)
+    result = actions_service.confirm_and_execute(db_session, space_id, user_id)
+    monkeypatch.undo()
+    assert result.outcome == "executed", result
+    assert count["n"] == 1
+
+
+def test_exactly_one_commit_for_create_task(db_session: Session, owner, monkeypatch) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_task", {"title": "3H2 single-commit - create_task"},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+def test_exactly_one_commit_for_update_task(db_session: Session, owner, monkeypatch) -> None:
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service_module.create_task(db_session, space.id, TaskCreate(title="3H2 single-commit - update_task"))
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "done"},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+def test_exactly_one_commit_for_delete_task(db_session: Session, owner, monkeypatch) -> None:
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service_module.create_task(db_session, space.id, TaskCreate(title="3H2 single-commit - delete_task"))
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_task", {"task_id": task.id},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+def test_exactly_one_commit_for_create_event(db_session: Session, owner, monkeypatch) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "create_event",
+        {"title": "3H2 single-commit - create_event", "starts_at": "2030-01-01T10:00:00+00:00"},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+def test_exactly_one_commit_for_update_event(db_session: Session, owner, monkeypatch) -> None:
+    from app.modules.calendar import service as calendar_service_module
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service_module.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="3H2 single-commit - update_event", starts_at=datetime(2030, 1, 1, 10, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "starts_at": "2030-01-02T10:00:00+00:00"},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+def test_exactly_one_commit_for_delete_event(db_session: Session, owner, monkeypatch) -> None:
+    from app.modules.calendar import service as calendar_service_module
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    event = calendar_service_module.create_calendar_event(
+        db_session, space.id,
+        CalendarEventCreate(title="3H2 single-commit - delete_event", starts_at=datetime(2030, 1, 1, 10, 0, tzinfo=timezone.utc)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "delete_event", {"event_id": event.id},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+def test_exactly_one_commit_for_save_memory(db_session: Session, owner, monkeypatch) -> None:
+    user, space = owner
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "save_memory",
+        {"type": "FACT", "content": "3H2 single-commit - save_memory"},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+def test_exactly_one_commit_for_forget_memory(db_session: Session, owner, monkeypatch) -> None:
+    from app.modules.memory import service as memory_service_module
+    from app.modules.memory.schemas import MemoryCreate
+
+    user, space = owner
+    memory = memory_service_module.create_memory(
+        db_session, space.id, user.id, _seed_source_message(db_session, space.id, user.id),
+        MemoryCreate(type="FACT", content="3H2 single-commit - forget_memory"),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "forget_memory", {"memory_id": memory.id},
+    )
+    _assert_single_commit(db_session, monkeypatch, space.id, user.id)
+
+
+# ---- Advisory lock: no premature release before the final commit/rollback ----
+
+
+def test_advisory_lock_held_until_final_commit_not_released_mid_transaction(
+    db_session: Session, owner
+) -> None:
+    """Real two-connection Postgres proof: while confirm_and_execute is
+    still inside its own authoritative transaction (specifically, from
+    INSIDE the Attention attribution hook that runs partway through the
+    domain mutation -- exactly the point the OLD two-commit design would
+    already have released the lock at), a second, independent
+    connection attempting pg_try_advisory_xact_lock for the SAME
+    (space_id, user_id) key must fail. Only this session's own eventual
+    commit may release it."""
+    import app.modules.attention.history as attention_history_module
+    from app.modules.tasks import service as tasks_service_module
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    task = tasks_service_module.create_task(
+        db_session, space.id, TaskCreate(title="3H2 advisory lock - update_task", due_at=datetime.now(timezone.utc) - timedelta(hours=1)),
+    )
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "done"},
+    )
+
+    lock_key = f"{space.id}:{user.id}"
+    # Simulate chat_service's own _acquire_conversation_lock, held for
+    # this session's current transaction -- the exact same primitive.
+    db_session.execute(text("SELECT pg_advisory_xact_lock(hashtext(:k))"), {"k": lock_key})
+
+    probe_results: dict = {}
+    original = attention_history_module.attempt_acted_on_attribution
+
+    def _probe_mid_transaction(*args, **kwargs):
+        outcome = original(*args, **kwargs)
+        probe = _fresh_session(db_session)
+        try:
+            probe_results["acquired_mid_transaction"] = probe.execute(
+                text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"), {"k": lock_key}
+            ).scalar_one()
+        finally:
+            probe.rollback()
+            probe.close()
+        return outcome
+
+    with patch.object(attention_history_module, "attempt_acted_on_attribution", _probe_mid_transaction):
+        result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert probe_results.get("acquired_mid_transaction") is False, (
+        "a second connection acquired the advisory lock while confirm_and_execute's own "
+        "authoritative transaction was still open -- premature release regression"
+    )
+
+    db_session.commit()  # releases our own advisory lock
+
+    probe_after = _fresh_session(db_session)
+    try:
+        acquired_after = probe_after.execute(
+            text("SELECT pg_try_advisory_xact_lock(hashtext(:k))"), {"k": lock_key}
+        ).scalar_one()
+        assert acquired_after is True
+    finally:
+        probe_after.rollback()
+        probe_after.close()

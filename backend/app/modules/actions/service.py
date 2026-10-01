@@ -223,18 +223,52 @@ def reject(db: Session, space_id: int, user_id: int) -> bool:
 
 
 def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResult:
-    """Single transaction, covering both the confirm-claim and the real
-    execution — either everything commits together (the domain effect
-    for this row's action_type happens, proposal 'executed', the
+    """Single authoritative transaction, covering the confirm-claim, the
+    real domain execution, and the final executed-state transition —
+    either everything commits together in ONE db.commit() (the domain
+    effect for this row's action_type happens, proposal 'executed', the
     matching executed_task_id/executed_memory_id set) or everything
-    rolls back and the proposal is left exactly as it was.
+    rolls back and the proposal is left exactly as it was: genuinely
+    'pending', never durably stuck at 'confirmed'.
+
+    Checkpoint 3.H2 — this used to call several domain service functions
+    with no way to defer their OWN internal commit, producing two
+    separate durable commit boundaries per call (one inside the domain
+    service, one here) for update_task/delete_task/create_event/
+    update_event/delete_event. A real-Postgres inspection proved that
+    created a narrow, genuinely reachable window: if THIS function's own
+    second commit failed after the domain service's own first commit had
+    already succeeded, the database would durably show the domain
+    mutation as real while the ProposedAction was wedged at 'confirmed'
+    forever — not 'pending' (so the normal "say yes again" retry could
+    never reach it), not 'executed'. Every domain service called below
+    now accepts commit=False (the exact same escape hatch
+    tasks_service.create_task/memory_service.create_memory already
+    established) and performs ONLY a db.flush() — this function is the
+    ONLY place that ever commits the authoritative part of this
+    transaction, exactly once, below.
+
+    'confirmed' (the status this row holds throughout everything below)
+    is therefore transient, in-transaction-only, by design — never
+    observed durably outside this function except in the window between
+    the claim UPDATE below and this function's own single commit/
+    rollback. No external code, schema, test, or API response reads or
+    exposes a durable 'confirmed' value (confirmed by repository-wide
+    search during the 3.H1 inspection).
 
     The conditional UPDATE below (WHERE status='pending') is the replay
     guard: it takes a real Postgres row-level lock the moment it
     matches, so a concurrent second confirmation attempt against the
     same row BLOCKS until this transaction resolves, then re-evaluates
     against the now-committed state — 'executed' (matches nothing,
-    can't re-execute) or 'pending' again on failure (see below).
+    can't re-execute) or 'pending' again on failure (see below). That
+    lock, and the per-(space_id, user_id) Postgres advisory lock
+    chat_service already holds for the whole turn, are now both held for
+    this function's ENTIRE duration — the single-commit change also
+    closes a previously-real gap where the advisory lock was released
+    partway through a single logical confirmation (at the domain
+    service's own old internal commit), before this function's own
+    second commit had even run.
 
     Deliberately no 'failed' terminal status: on an execution exception,
     this transaction rolls back in full, INCLUDING the confirmed
@@ -253,6 +287,17 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
     proposal and confirmation (memory_service returns False) is treated
     exactly like any other execution failure: raised, caught below,
     rolled back to 'pending' — no bespoke handling needed for that race.
+
+    Checkpoint 3.H2 — response-model construction (TaskResponse.
+    model_validate and its siblings) is deliberately performed AFTER
+    this function's own try/except has already exited successfully, not
+    inside the return statement of a branch above the commit (which is
+    where it used to live) — so a hypothetical presentation-layer
+    exception can never be caught by the authoritative except block
+    below and misreported as outcome="execution_failed" for an action
+    that is, by that point, already durably executed. Nothing about the
+    authoritative transaction's own success/failure depends on whether
+    this later step succeeds.
     """
     stmt = (
         update(ProposedAction)
@@ -270,16 +315,21 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
     if proposal is None:
         return ConfirmResult(outcome="nothing_pending")
 
+    task = None
+    event = None
+    memory = None
+    task_action = None
+    event_action = None
+
     try:
         if proposal.action_type == "create_task":
             task_data = TaskCreate(**proposal.arguments)
             task = tasks_service.create_task(db, space_id, task_data, commit=False)
             proposal.status = "executed"
             proposal.executed_task_id = task.id
-            db.commit()
-            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="created")
+            task_action = "created"
 
-        if proposal.action_type == "update_task":
+        elif proposal.action_type == "update_task":
             # ProposedTaskUpdate(**proposal.arguments) reconstructs
             # model_fields_set correctly from the sparse (exclude_unset)
             # stored dict — only fields the model actually named are
@@ -291,15 +341,14 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             # exact same server-side-only rule the direct REST path uses.
             update_data = ProposedTaskUpdate(**proposal.arguments)
             task_update = TaskUpdate(**update_data.model_dump(exclude={"task_id"}, exclude_unset=True))
-            task = tasks_service.update_task(db, space_id, update_data.task_id, task_update)
+            task = tasks_service.update_task(db, space_id, update_data.task_id, task_update, commit=False)
             if task is None:
                 raise RuntimeError(f"task_id {update_data.task_id} no longer exists")
             proposal.status = "executed"
             proposal.executed_task_id = task.id
-            db.commit()
-            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="updated")
+            task_action = "updated"
 
-        if proposal.action_type == "delete_task":
+        elif proposal.action_type == "delete_task":
             # Fetched BEFORE delete_task runs, deliberately: delete_task
             # sets archived_at and its own internal get_task lookup
             # filters archived_at IS NULL, so a task_id fetched AFTER
@@ -313,13 +362,12 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             task = tasks_service.get_task(db, space_id, delete_data.task_id)
             if task is None:
                 raise RuntimeError(f"task_id {delete_data.task_id} no longer exists")
-            tasks_service.delete_task(db, space_id, delete_data.task_id)
+            tasks_service.delete_task(db, space_id, delete_data.task_id, commit=False)
             proposal.status = "executed"
             proposal.executed_task_id = task.id
-            db.commit()
-            return ConfirmResult(outcome="executed", task=TaskResponse.model_validate(task), task_action="deleted")
+            task_action = "deleted"
 
-        if proposal.action_type == "create_event":
+        elif proposal.action_type == "create_event":
             # Re-parsed through the SAME ProposedCalendarEventCreate
             # schema used at proposal time (not the plain
             # CalendarEventCreate) — timezone-awareness and range are
@@ -334,18 +382,15 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             if event_data.life_area_id is not None:
                 if life_areas_service.get_life_area(db, event_data.life_area_id) is None:
                     raise RuntimeError(f"life_area_id {event_data.life_area_id} no longer exists")
-            event = calendar_service.create_calendar_event(db, space_id, event_data)
+            event = calendar_service.create_calendar_event(db, space_id, event_data, commit=False)
             proposal.status = "executed"
             # No executed_event_id column exists on ProposedAction (adding
             # one would be a migration, out of this checkpoint's scope) —
-            # ConfirmResult.event below is the only record of which
-            # CalendarEvent this proposal produced.
-            db.commit()
-            return ConfirmResult(
-                outcome="executed", event=CalendarEventResponse.model_validate(event), event_action="created",
-            )
+            # the response's own event field below is the only record of
+            # which CalendarEvent this proposal produced.
+            event_action = "created"
 
-        if proposal.action_type == "update_event":
+        elif proposal.action_type == "update_event":
             # Checkpoint 3.18 — same "re-parse, don't just trust"
             # discipline as update_task: ProposedCalendarEventUpdate
             # reconstructs model_fields_set correctly from the sparse
@@ -368,16 +413,15 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
                 if life_areas_service.get_life_area(db, update_data.life_area_id) is None:
                     raise RuntimeError(f"life_area_id {update_data.life_area_id} no longer exists")
             event_update = CalendarEventUpdate(**update_data.model_dump(exclude={"event_id"}, exclude_unset=True))
-            event = calendar_service.update_calendar_event(db, space_id, update_data.event_id, event_update)
+            event = calendar_service.update_calendar_event(
+                db, space_id, update_data.event_id, event_update, commit=False
+            )
             if event is None:
                 raise RuntimeError(f"event_id {update_data.event_id} no longer exists")
             proposal.status = "executed"
-            db.commit()
-            return ConfirmResult(
-                outcome="executed", event=CalendarEventResponse.model_validate(event), event_action="updated",
-            )
+            event_action = "updated"
 
-        if proposal.action_type == "delete_event":
+        elif proposal.action_type == "delete_event":
             # Fetched BEFORE delete_calendar_event runs, deliberately —
             # the exact same "fetch doubles as execution-time
             # revalidation" pattern as delete_task's own branch above:
@@ -395,14 +439,11 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
             event = calendar_service.get_calendar_event(db, space_id, delete_data.event_id)
             if event is None:
                 raise RuntimeError(f"event_id {delete_data.event_id} no longer exists")
-            calendar_service.delete_calendar_event(db, space_id, delete_data.event_id)
+            calendar_service.delete_calendar_event(db, space_id, delete_data.event_id, commit=False)
             proposal.status = "executed"
-            db.commit()
-            return ConfirmResult(
-                outcome="executed", event=CalendarEventResponse.model_validate(event), event_action="deleted",
-            )
+            event_action = "deleted"
 
-        if proposal.action_type == "save_memory":
+        elif proposal.action_type == "save_memory":
             memory_data = MemoryCreate(**proposal.arguments)
             memory = memory_service.create_memory(
                 db, space_id, user_id, proposal.source_chat_message_id, memory_data, commit=False
@@ -417,20 +458,54 @@ def confirm_and_execute(db: Session, space_id: int, user_id: int) -> ConfirmResu
                     )
             proposal.status = "executed"
             proposal.executed_memory_id = memory.id
-            db.commit()
-            return ConfirmResult(outcome="executed", memory=MemoryResponse.model_validate(memory))
 
-        if proposal.action_type == "forget_memory":
+        elif proposal.action_type == "forget_memory":
             forget_data = MemoryForget(**proposal.arguments)
             forgotten_memory = memory_service.forget_memory(db, space_id, user_id, forget_data.memory_id)
             if forgotten_memory is None:
                 raise RuntimeError(f"memory_id {forget_data.memory_id} is no longer active")
             proposal.status = "executed"
             proposal.executed_memory_id = forgotten_memory.id
-            db.commit()
-            return ConfirmResult(outcome="executed", memory=MemoryResponse.model_validate(forgotten_memory))
+            memory = forgotten_memory
 
-        raise RuntimeError(f"unknown action_type {proposal.action_type!r}")
+        else:
+            raise RuntimeError(f"unknown action_type {proposal.action_type!r}")
+
+        # Checkpoint 3.H2 — response-model validation happens HERE,
+        # deliberately still inside the try block, strictly BEFORE the
+        # single authoritative commit below: it is pure/deterministic
+        # (ConfigDict(from_attributes=True) reading already-flushed
+        # Python attributes, no I/O, no further DB mutation), so
+        # performing it now means a genuine validation problem is
+        # honestly treated as part of the authoritative failure (full
+        # rollback, correctly reported as execution_failed — nothing
+        # was durably committed, so nothing is misreported), rather than
+        # deferred to after a commit it could then falsely contradict.
+        # This leaves NOTHING fallible between the commit below and the
+        # function returning.
+        result_task = TaskResponse.model_validate(task) if task is not None else None
+        result_event = CalendarEventResponse.model_validate(event) if event is not None else None
+        result_memory = MemoryResponse.model_validate(memory) if memory is not None else None
+
+        # The ONE shared authoritative commit — covers the confirmed
+        # claim, the domain mutation (flushed, never yet committed, by
+        # every branch above), any Attention attribution (already
+        # isolated in its own SAVEPOINT inside the domain call), and the
+        # executed-state transition, all atomically.
+        db.commit()
     except Exception:
         db.rollback()
         return ConfirmResult(outcome="execution_failed")
+
+    # Nothing below can affect the authoritative truth established
+    # above: the commit already succeeded, unconditionally, by the time
+    # execution reaches here. A hypothetical failure constructing the
+    # final ConfirmResult itself would propagate as a raw exception,
+    # never be caught by the except block above, and never be
+    # misreported as execution_failed for an action that is, by this
+    # point, already durably executed.
+    if result_task is not None:
+        return ConfirmResult(outcome="executed", task=result_task, task_action=task_action)
+    if result_event is not None:
+        return ConfirmResult(outcome="executed", event=result_event, event_action=event_action)
+    return ConfirmResult(outcome="executed", memory=result_memory)

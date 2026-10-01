@@ -29,15 +29,30 @@ def get_calendar_event(db: Session, space_id: int, event_id: int) -> CalendarEve
     return db.execute(query).scalar_one_or_none()
 
 
-def create_calendar_event(db: Session, space_id: int, data: CalendarEventCreate) -> CalendarEvent:
+def create_calendar_event(db: Session, space_id: int, data: CalendarEventCreate, commit: bool = True) -> CalendarEvent:
+    """commit=True by default (direct REST). Checkpoint 3.H2 — commit=False
+    lets actions_service.confirm_and_execute create this event as part of
+    its own single authoritative transaction, the same escape hatch
+    tasks_service.create_task already established."""
     event = CalendarEvent(space_id=space_id, **data.model_dump())
     db.add(event)
-    db.commit()
-    db.refresh(event)
+    if commit:
+        db.commit()
+        db.refresh(event)
+    else:
+        # Flush assigns the PK and every server-generated column without
+        # ending the transaction — proven sufficient (Checkpoint 3.H1's
+        # real-Postgres experiment); refresh is deliberately not called.
+        db.flush()
     return event
 
 
-def update_calendar_event(db: Session, space_id: int, event_id: int, data: CalendarEventUpdate) -> CalendarEvent | None:
+def update_calendar_event(
+    db: Session, space_id: int, event_id: int, data: CalendarEventUpdate, commit: bool = True
+) -> CalendarEvent | None:
+    """commit=True by default (direct REST). Checkpoint 3.H2 —
+    commit=False folds this into confirm_and_execute's own single
+    authoritative transaction."""
     event = get_calendar_event(db, space_id, event_id)
     if event is None:
         return None
@@ -66,14 +81,21 @@ def update_calendar_event(db: Session, space_id: int, event_id: int, data: Calen
             now,
         )
 
-    db.commit()
-    db.refresh(event)
+    if commit:
+        db.commit()
+        db.refresh(event)
+    else:
+        db.flush()
     return event
 
 
-def delete_calendar_event(db: Session, space_id: int, event_id: int) -> bool:
+def delete_calendar_event(db: Session, space_id: int, event_id: int, commit: bool = True) -> bool:
     """Soft delete: sets archived_at, same reasoning as Task.delete_task —
-    protects a future Inbox reference from dangling."""
+    protects a future Inbox reference from dangling.
+
+    commit=True by default (direct REST). Checkpoint 3.H2 — commit=False
+    folds this into confirm_and_execute's own single authoritative
+    transaction."""
     event = get_calendar_event(db, space_id, event_id)
     if event is None:
         return False
@@ -90,7 +112,10 @@ def delete_calendar_event(db: Session, space_id: int, event_id: int) -> bool:
         now,
     )
 
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     return True
 
 

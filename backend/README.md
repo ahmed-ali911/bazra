@@ -1647,9 +1647,103 @@ transaction semantics and requires a separate, future hardening
 checkpoint before any autonomous/proactive action capability expands
 on top of `confirm_and_execute`.
 
+> **Resolved by Checkpoint 3.H2, below.** This paragraph is kept as the
+> historical record of the debt, not erased — see 3.H2 for the fix.
+
 **Evolution interpretation, unchanged from 4.4c-2**: `acted_on_at` is
 temporal/state association evidence only — never a success score,
 never causal credit, never a signal of user preference.
+
+## Phase 3 — Transaction Hardening
+
+### Checkpoint 3.H1
+
+Inspection-only checkpoint (no code changes) that re-verified, against
+the real dev Postgres rather than by assumption, exactly which of
+`confirm_and_execute`'s eight action branches had the two-commit debt
+noted above. Finding: only five did (`update_task`, `delete_task`,
+`create_event`, `update_event`, `delete_event`) — `create_task` and both
+memory branches (`save_memory`, `forget_memory`) were already
+single-commit, and already proved the fix pattern
+(`commit: bool = True` on the domain service, `commit=False` from
+`confirm_and_execute`) works correctly in production. Also confirmed,
+empirically: `db.flush()` alone (no `db.commit()`, no `db.refresh()`)
+is fully sufficient to populate a brand-new row's generated `id` and
+server-default `created_at`/`updated_at` before an eventual outer
+commit — proven directly against a real Postgres connection, visible
+only to the same session until that outer commit. Also discovered: the
+`pg_advisory_xact_lock` `chat_service` holds for an entire chat turn was
+being **prematurely released** partway through a single logical
+`confirm_and_execute` call, at whichever domain service's own old
+internal commit happened to run first.
+
+### Checkpoint 3.H2
+
+Implemented the 3.H1 recommendation. **`confirm_and_execute` now
+performs exactly one authoritative `db.commit()` per confirmed action**
+— covering the `pending`→`confirmed` claim, the domain mutation, any
+Attention attribution, and the `confirmed`→`executed` transition,
+atomically. The previous two-commit debt is **resolved**.
+
+- `tasks_service.update_task`/`delete_task` and
+  `calendar_service.create_calendar_event`/`update_calendar_event`/
+  `delete_calendar_event` all gained `commit: bool = True`, mirroring
+  `create_task`'s/`create_memory`'s own already-established shape
+  exactly: `commit=True` (the default) preserves direct-REST behavior
+  byte-for-byte; `commit=False` performs the authoritative mutation and
+  a `db.flush()` only, deferring the actual commit to the caller.
+  Direct REST callers pass no `commit` argument at all, so their
+  behavior is unaffected by construction, not by a special case.
+- **`confirmed` remains an in-transaction-only claim state** — never
+  added to any API response, never given a new durable lifecycle
+  meaning, never observed by any external code (confirmed by a
+  repository-wide search in 3.H1: nothing outside
+  `actions/service.py`'s own claim statement and the `ProposedActionStatus`
+  type definition ever references the literal value). If the
+  authoritative transaction rolls back, the database-visible
+  `ProposedAction` is `pending` again — never stuck at `confirmed`.
+- **Generated IDs come from `db.flush()`**, never an intermediate
+  commit — proven in 3.H1 and unchanged in behavior here; no
+  `db.refresh()` was added anywhere a flush already suffices.
+  `create_task`/`create_event`/`save_memory`'s own object identity
+  (`task.id`/`event.id`/`memory.id`) is available immediately after
+  their own `commit=False` call returns.
+- **Task-completion Inbox creation remains atomic** with the Task
+  mutation — `inbox_service.create_item(..., commit=False)` was already
+  flush-only and already shared whichever transaction was open; nothing
+  about it needed to change, and it now naturally extends across the
+  entire `confirm_and_execute` transaction instead of just `update_task`'s
+  own (formerly separate) one.
+- **Attention attribution is unchanged and still fully fail-open** —
+  `attempt_acted_on_attribution`'s own `SAVEPOINT` (`Session.begin_nested()`)
+  isolation, pre-savepoint `db.flush()`, and log-and-swallow exception
+  handling are untouched. A successful `acted_on_at` write now commits
+  together with the *entire* authoritative action (domain mutation +
+  `executed` transition), not just the domain mutation alone as before.
+- **Response-model construction happens before the single commit, not
+  after** — deliberately, since it's pure/deterministic
+  (`ConfigDict(from_attributes=True)` reading already-flushed Python
+  attributes, no I/O). A genuine validation problem there is honestly
+  treated as part of the authoritative failure (full rollback, correctly
+  reported `execution_failed` — nothing was durably committed, so
+  nothing is misreported). Nothing fallible remains between the commit
+  and the function returning; a forced failure constructing the final
+  `ConfirmResult` itself (after a successful commit) was proven to
+  propagate as a raw exception rather than ever being caught and
+  reported as `execution_failed` for an action that is, by that point,
+  already durably executed.
+- **The premature advisory-lock release is resolved** — proven directly
+  with a real two-connection Postgres test: while `confirm_and_execute`
+  is still inside its own authoritative transaction (probed from inside
+  the Attention hook, exactly the point the old design would already
+  have released the lock at), a second connection's
+  `pg_try_advisory_xact_lock` for the same `(space_id, user_id)` key
+  fails; it only succeeds after this session's own commit.
+- **No schema change** — `confirmed` was not removed from
+  `ProposedActionStatus`, no column changed, no migration exists.
+- **No Attention semantic change, no new execution path, no LLM/provider
+  dependency** — this checkpoint touches only transaction boundaries in
+  five domain service functions and `confirm_and_execute` itself.
 
 ## Run locally (without Docker)
 
