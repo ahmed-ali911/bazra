@@ -257,3 +257,135 @@ def test_agenda_rejects_to_less_equal_from(authenticated_client: TestClient) -> 
         "/api/v1/calendar/agenda", params={"from": _iso(FROM), "to": _iso(FROM)}
     )
     assert equal_response.status_code == 400
+
+
+# ---- Checkpoint 4.4c-3: ACTED_ON wiring ----
+
+
+def _space_and_user(db_session: Session):
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+    return space.id, user.id
+
+
+def _upcoming_exposure_for_event(db_session: Session, space_id: int, user_id: int, event_id: int) -> int:
+    from datetime import datetime, timezone
+
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+
+    signal = Signal(
+        signal_type="EVENT_UPCOMING", source_type="calendar_event", source_id=event_id, title="e",
+        relevant_timestamp=None, priority=None, measurement_seconds=1800,
+        snapshot={"starts_at": "x"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space_id, user_id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+    return exposure.id
+
+
+def test_starts_at_actual_change_qualifies_for_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = _create_event(authenticated_client, "Starts-at change qualifies", soon)
+    exposure_id = _upcoming_exposure_for_event(db_session, space_id, user_id, event["id"])
+
+    far_future = datetime.now(timezone.utc) + timedelta(hours=4)
+    authenticated_client.patch(f"/api/v1/calendar/events/{event['id']}", json={"starts_at": _iso(far_future)})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is not None
+
+
+def test_same_starts_at_does_not_invoke_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = _create_event(authenticated_client, "Same starts_at no-op", soon)
+    exposure_id = _upcoming_exposure_for_event(db_session, space_id, user_id, event["id"])
+
+    authenticated_client.patch(f"/api/v1/calendar/events/{event['id']}", json={"starts_at": _iso(soon)})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is None
+
+
+def test_description_title_only_change_does_not_invoke_attribution(
+    authenticated_client: TestClient, db_session: Session
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = _create_event(authenticated_client, "Title-only no-op", soon)
+    exposure_id = _upcoming_exposure_for_event(db_session, space_id, user_id, event["id"])
+
+    authenticated_client.patch(
+        f"/api/v1/calendar/events/{event['id']}",
+        json={"title": "Renamed", "description": "unrelated change"},
+    )
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is None
+
+
+def test_event_archive_qualifies_for_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = _create_event(authenticated_client, "Archive qualifies", soon)
+    exposure_id = _upcoming_exposure_for_event(db_session, space_id, user_id, event["id"])
+
+    authenticated_client.delete(f"/api/v1/calendar/events/{event['id']}")
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is not None
+
+
+def test_forced_attribution_exception_during_event_update_still_commits_mutation(
+    authenticated_client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from app.modules.attention import resolution as attention_resolution
+
+    space_id, user_id = _space_and_user(db_session)
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = _create_event(authenticated_client, "Forced failure still commits", soon)
+    exposure_id = _upcoming_exposure_for_event(db_session, space_id, user_id, event["id"])
+
+    monkeypatch.setattr(
+        attention_resolution, "evaluate_acted_on", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    far_future = datetime.now(timezone.utc) + timedelta(hours=4)
+    response = authenticated_client.patch(
+        f"/api/v1/calendar/events/{event['id']}", json={"starts_at": _iso(far_future)}
+    )
+    monkeypatch.undo()
+
+    assert response.status_code == 200
+    assert datetime.fromisoformat(response.json()["starts_at"].replace("Z", "+00:00")) == far_future
+
+    acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert acted_on is None

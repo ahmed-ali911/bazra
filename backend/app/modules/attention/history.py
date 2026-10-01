@@ -1,16 +1,30 @@
-"""Checkpoint 4.4a/4.4b — Attention exposure persistence and feedback.
+"""Checkpoint 4.4a/4.4b/4.4c-3 — Attention exposure persistence,
+feedback, and ACTED_ON attribution.
 
 The one place Attention state becomes durable. Signal (4.2) and
 AttentionCandidate (4.3) both remain fully live-derived and
 unpersisted; this module only ever records that a candidate was
 ACTUALLY DELIVERED (record_exposure), records explicit user feedback
 against one specific delivered exposure (record_snooze,
-record_dismiss), and reconstructs 4.3's SuppressionState read model
-from that durable history (load_suppression_states).
+record_dismiss), reconstructs 4.3's SuppressionState read model from
+that durable history (load_suppression_states), and — the one function
+a domain service actually calls, attempt_acted_on_attribution — records
+that a qualifying source mutation resolved the latest surfaced concern.
 
-Deliberately NOT implemented here (later checkpoints own these):
-- the deterministic ACTED_ON evaluator, mutation hooks, predicate
-  extraction (4.4c) — acted_on_at is declared but never written here.
+attempt_acted_on_attribution is deliberately FAIL-OPEN relative to the
+domain mutation that calls it: DOMAIN TRUTH > ATTENTION ATTRIBUTION.
+It isolates its own work in a Postgres SAVEPOINT (Session.begin_nested())
+and swallows (logs, never re-raises) any exception from that work —
+proven empirically (disposable, since-deleted experiment scripts run
+against the real dev DB, not assumed from general SQLAlchemy
+knowledge) that begin_nested() autoflushes pending outer changes
+before establishing the savepoint, that a nested rollback leaves both
+the Session and the outer object's already-flushed state fully intact,
+and that the outer caller's own later db.commit() succeeds normally
+afterward. It never wraps or swallows the caller's own final commit —
+a genuine core DB/session failure there still propagates normally.
+
+Deliberately NOT implemented here (a later checkpoint owns these):
 - any surfacing consumer (APP_OPENED / Daily Brief delivery) that
   would actually call record_exposure in production.
 - natural-language snooze-phrase parsing — every timestamp this module
@@ -27,6 +41,7 @@ deterministic and persistence-boundary-local as actions_service's own
 create_pending_action.
 """
 
+import logging
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime
@@ -35,20 +50,25 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from app.modules.attention import scoring
+from app.modules.attention import resolution, scoring
 from app.modules.attention.models import AttentionExposure
 from app.modules.attention.schemas import (
     SIGNAL_TYPE_ORDER,
     AttentionCandidate,
     AttentionSurface,
+    EventMutationState,
+    InboxMutationState,
     InvalidTimezoneError,
     SourceType,
     SuppressionState,
+    TaskMutationState,
 )
 from app.modules.calendar import service as calendar_service
 from app.modules.inbox import service as inbox_service
 from app.modules.spaces.models import Space
 from app.modules.tasks import service as tasks_service
+
+logger = logging.getLogger(__name__)
 
 _VALID_SURFACES: frozenset[str] = frozenset(("app_opened", "daily_brief"))
 
@@ -422,3 +442,110 @@ def load_suppression_states(
                 acted_on_at=row.acted_on_at,
             )
     return states
+
+
+def _get_latest_exposure(
+    db: Session, space_id: int, source_type: SourceType, source_id: int
+) -> AttentionExposure | None:
+    """The single-identity counterpart to load_suppression_states' own
+    batched query — same ordering (surfaced_at DESC, id DESC), same
+    "across all surfaces" scope. Returns the real AttentionExposure row
+    directly (never a SuppressionState proxy): attribution needs
+    signal_type, timezone_name, and acted_on_at, none of which
+    SuppressionState carries. The latest exposure is authoritative for
+    attribution eligibility regardless of its own current
+    snoozed/dismissed state — ACTED_ON is historical attribution, never
+    a suppression gate (never select an older exposure merely because
+    the newest one happens to be snoozed/dismissed/already acted_on).
+    """
+    column = _SOURCE_COLUMN_BY_TYPE[source_type]
+    return db.execute(
+        select(AttentionExposure)
+        .where(AttentionExposure.space_id == space_id, column == source_id)
+        .order_by(AttentionExposure.surfaced_at.desc(), AttentionExposure.id.desc())
+        .limit(1)
+    ).scalars().first()
+
+
+def attempt_acted_on_attribution(
+    db: Session,
+    space_id: int,
+    source_type: SourceType,
+    source_id: int,
+    state: TaskMutationState | EventMutationState | InboxMutationState,
+    now: datetime,
+) -> None:
+    """Checkpoint 4.4c-3 — the one function a domain service calls,
+    immediately before its OWN existing db.commit(), after applying a
+    QUALIFYING semantic mutation (the caller is responsible for only
+    calling this when a qualifying field's VALUE actually changed —
+    see tasks_service.update_task/delete_task,
+    calendar_service.update_calendar_event/delete_calendar_event,
+    inbox_service.mark_read/dismiss_item for where this is invoked).
+
+    FAIL-OPEN BY DESIGN: DOMAIN TRUTH > ATTENTION ATTRIBUTION. This
+    function NEVER raises. All of its own work — the latest-exposure
+    lookup, the (already-pure, already-tested) resolution.evaluate_acted_on
+    call, and the conditional acted_on_at write — runs inside a single
+    Postgres SAVEPOINT (Session.begin_nested()). Any exception from
+    that work rolls back ONLY the savepoint (proven, via real
+    disposable experiments against the real dev DB — not assumed —
+    to leave both the Session and the caller's own already-flushed
+    domain-mutation state fully intact) and is logged, never re-raised.
+    This function never wraps or touches the caller's own final
+    db.commit() — a genuine core DB/session failure there still
+    propagates normally, exactly as before this function existed.
+
+    Normal, expected outcomes that are NOT failures and involve no
+    exception/rollback at all: no exposure exists for this source; the
+    latest exposure already has acted_on_at set; the evaluator returns
+    NOT_RESOLVED or UNKNOWN. All four are plain early returns from
+    inside the nested block, which still commits (releases) the
+    savepoint normally — there is nothing to roll back for a correct,
+    uneventful "nothing to attribute" outcome.
+
+    Only the LATEST exposure for (space_id, source_type, source_id) is
+    ever eligible — never an older one, and never influenced by the
+    latest one's own snoozed/dismissed state (ACTED_ON is historical
+    attribution, not a suppression gate).
+
+    The acted_on_at write is first-write-wins
+    (WHERE id=... AND acted_on_at IS NULL), the same idempotent
+    conditional-UPDATE convention record_dismiss already established.
+
+    IMPORTANT — flushes explicitly BEFORE opening the SAVEPOINT, outside
+    this function's own try/except: begin_nested() autoflushes any
+    pending changes anyway (proven empirically), and if some UNRELATED
+    pending write elsewhere in the SAME transaction (made by the
+    caller, or by something the caller itself already called) is
+    invalid, that flush failure is a genuine CORE DOMAIN failure, not
+    an Attention failure — it must propagate normally, never be
+    miscategorized and swallowed by the except block below. Flushing
+    explicitly first, outside the try, is exactly what keeps that
+    failure outside this function's own fail-open boundary.
+    """
+    db.flush()
+    try:
+        with db.begin_nested():
+            exposure = _get_latest_exposure(db, space_id, source_type, source_id)
+            if exposure is None:
+                return
+            if exposure.acted_on_at is not None:
+                return
+
+            result = resolution.evaluate_acted_on(
+                exposure.signal_type, state, now, exposure.timezone_name
+            )
+            if result != "RESOLVED":
+                return
+
+            db.execute(
+                update(AttentionExposure)
+                .where(AttentionExposure.id == exposure.id, AttentionExposure.acted_on_at.is_(None))
+                .values(acted_on_at=now)
+            )
+    except Exception:
+        logger.exception(
+            "attention: acted_on attribution failed (space_id=%s, source_type=%s, source_id=%s)",
+            space_id, source_type, source_id,
+        )

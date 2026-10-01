@@ -4,6 +4,8 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
+from app.modules.attention import history as attention_history
+from app.modules.attention.schemas import EventMutationState
 from app.modules.calendar.models import CalendarEvent
 from app.modules.calendar.schemas import AgendaItem, CalendarEventCreate, CalendarEventUpdate
 from app.modules.tasks import service as tasks_service
@@ -40,6 +42,9 @@ def update_calendar_event(db: Session, space_id: int, event_id: int, data: Calen
     if event is None:
         return None
 
+    now = datetime.now(timezone.utc)
+    previous_starts_at = event.starts_at
+
     updates = data.model_dump(exclude_unset=True)
     for field, value in updates.items():
         setattr(event, field, value)
@@ -48,6 +53,18 @@ def update_calendar_event(db: Session, space_id: int, event_id: int, data: Calen
     # update may only include one of starts_at/ends_at.
     if event.ends_at is not None and event.ends_at < event.starts_at:
         raise ValueError("ends_at must be >= starts_at")
+
+    # Checkpoint 4.4c-3 — attempted ONLY when starts_at's VALUE actually
+    # changed (never merely because it was present in the payload), and
+    # only after the validation above has already passed (a request
+    # that's about to raise and never commit must never attribute).
+    if event.starts_at != previous_starts_at:
+        attention_history.attempt_acted_on_attribution(
+            db, space_id, "calendar_event",
+            event.id,
+            EventMutationState(starts_at=event.starts_at, archived_at=event.archived_at),
+            now,
+        )
 
     db.commit()
     db.refresh(event)
@@ -60,7 +77,19 @@ def delete_calendar_event(db: Session, space_id: int, event_id: int) -> bool:
     event = get_calendar_event(db, space_id, event_id)
     if event is None:
         return False
-    event.archived_at = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    event.archived_at = now
+
+    # Checkpoint 4.4c-3 — archive is always a qualifying, real mutation
+    # here (get_calendar_event's own archived_at IS NULL filter above
+    # guarantees this is a genuine first-time archive).
+    attention_history.attempt_acted_on_attribution(
+        db, space_id, "calendar_event",
+        event.id,
+        EventMutationState(starts_at=event.starts_at, archived_at=event.archived_at),
+        now,
+    )
+
     db.commit()
     return True
 

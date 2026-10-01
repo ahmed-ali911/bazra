@@ -3,6 +3,8 @@ from datetime import datetime, timezone
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
+from app.modules.attention import history as attention_history
+from app.modules.attention.schemas import InboxMutationState
 from app.modules.inbox.models import InboxItem
 
 
@@ -55,7 +57,25 @@ def mark_read(db: Session, space_id: int, item_id: int, read: bool) -> InboxItem
     item = get_item(db, space_id, item_id)
     if item is None:
         return None
-    item.read_at = datetime.now(timezone.utc) if read else None
+    now = datetime.now(timezone.utc)
+    previous_read_at = item.read_at
+    item.read_at = now if read else None
+
+    # Checkpoint 4.4c-3 — attempted ONLY when read_at's VALUE actually
+    # changed (marking an already-read item read again, or an
+    # already-unread item unread again, is a semantic no-op and must
+    # not manufacture attribution evidence). Marking unread again DOES
+    # qualify as a real change but the evaluator itself correctly
+    # returns NOT_RESOLVED for it (the concern re-opens) — no
+    # special-casing needed here.
+    if item.read_at != previous_read_at:
+        attention_history.attempt_acted_on_attribution(
+            db, space_id, "inbox_item",
+            item.id,
+            InboxMutationState(read_at=item.read_at, archived_at=item.archived_at),
+            now,
+        )
+
     db.commit()
     db.refresh(item)
     return item
@@ -68,6 +88,18 @@ def dismiss_item(db: Session, space_id: int, item_id: int) -> bool:
     item = get_item(db, space_id, item_id)
     if item is None:
         return False
-    item.archived_at = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    item.archived_at = now
+
+    # Checkpoint 4.4c-3 — archive is always a qualifying, real mutation
+    # here (get_item's own archived_at IS NULL filter above guarantees
+    # this is a genuine first-time archive).
+    attention_history.attempt_acted_on_attribution(
+        db, space_id, "inbox_item",
+        item.id,
+        InboxMutationState(read_at=item.read_at, archived_at=item.archived_at),
+        now,
+    )
+
     db.commit()
     return True

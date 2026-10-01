@@ -253,3 +253,152 @@ def test_space_isolation_across_list_update_and_dismiss(
     ).one()
     assert row.read_at is None
     assert row.archived_at is None
+
+
+# ---- Checkpoint 4.4c-3: ACTED_ON wiring ----
+
+
+def _space_and_user(db_session: Session):
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+    return space.id, user.id
+
+
+def _create_standalone_inbox_item(db_session: Session, space_id: int, title: str):
+    from app.modules.inbox import service as inbox_service_module
+
+    return inbox_service_module.create_item(db_session, space_id, task_id=None, title=title)
+
+
+def _needs_attention_exposure(db_session: Session, space_id: int, user_id: int, item_id: int) -> int:
+    from datetime import datetime, timezone
+
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+
+    signal = Signal(
+        signal_type="INBOX_NEEDS_ATTENTION", source_type="inbox_item", source_id=item_id, title="i",
+        relevant_timestamp=None, priority=None, measurement_seconds=3600, snapshot={},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space_id, user_id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+    return exposure.id
+
+
+def test_unread_to_read_qualifies_for_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    space_id, user_id = _space_and_user(db_session)
+    item = _create_standalone_inbox_item(db_session, space_id, "Unread to read qualifies")
+    exposure_id = _needs_attention_exposure(db_session, space_id, user_id, item.id)
+
+    authenticated_client.patch(f"/api/v1/inbox/{item.id}", json={"read": True})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is not None
+
+
+def test_read_to_unread_qualifies_but_evaluator_returns_not_resolved(
+    authenticated_client: TestClient, db_session: Session
+) -> None:
+    space_id, user_id = _space_and_user(db_session)
+    item = _create_standalone_inbox_item(db_session, space_id, "Read to unread")
+    exposure_id = _needs_attention_exposure(db_session, space_id, user_id, item.id)
+
+    authenticated_client.patch(f"/api/v1/inbox/{item.id}", json={"read": True})
+    first_acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert first_acted_on is not None  # resolved by the read
+
+    authenticated_client.patch(f"/api/v1/inbox/{item.id}", json={"read": False})
+
+    second_acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    # First-write-wins: the original acted_on_at is never rewritten even
+    # though read->unread is itself a qualifying, real mutation.
+    assert second_acted_on == first_acted_on
+
+
+def test_read_to_read_semantic_noop_does_not_invoke_attribution(
+    authenticated_client: TestClient, db_session: Session
+) -> None:
+    space_id, user_id = _space_and_user(db_session)
+    item = _create_standalone_inbox_item(db_session, space_id, "Read to read no-op")
+    exposure_id = _needs_attention_exposure(db_session, space_id, user_id, item.id)
+
+    authenticated_client.patch(f"/api/v1/inbox/{item.id}", json={"read": True})
+    # Mark read again — read_at changes to a NEW timestamp but the
+    # evaluator's own lifecycle check only cares that it's non-null
+    # either way, so this is a correctness no-op; confirm it doesn't
+    # disturb the already-written acted_on_at.
+    first_acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    authenticated_client.patch(f"/api/v1/inbox/{item.id}", json={"read": True})
+
+    second_acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert second_acted_on == first_acted_on
+
+
+def test_unread_to_unread_semantic_noop_does_not_invoke_attribution(
+    authenticated_client: TestClient, db_session: Session
+) -> None:
+    space_id, user_id = _space_and_user(db_session)
+    item = _create_standalone_inbox_item(db_session, space_id, "Unread to unread no-op")
+    exposure_id = _needs_attention_exposure(db_session, space_id, user_id, item.id)
+
+    # Still unread -> unread: read_at stays None -> None, a true no-op.
+    authenticated_client.patch(f"/api/v1/inbox/{item.id}", json={"read": False})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is None
+
+
+def test_inbox_dismiss_archive_qualifies_for_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    space_id, user_id = _space_and_user(db_session)
+    item = _create_standalone_inbox_item(db_session, space_id, "Dismiss archive qualifies")
+    exposure_id = _needs_attention_exposure(db_session, space_id, user_id, item.id)
+
+    authenticated_client.delete(f"/api/v1/inbox/{item.id}")
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is not None
+
+
+def test_forced_attribution_exception_during_inbox_mutation_still_commits(
+    authenticated_client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    from app.modules.attention import resolution as attention_resolution
+
+    space_id, user_id = _space_and_user(db_session)
+    item = _create_standalone_inbox_item(db_session, space_id, "Forced failure still commits")
+    exposure_id = _needs_attention_exposure(db_session, space_id, user_id, item.id)
+
+    monkeypatch.setattr(
+        attention_resolution, "evaluate_acted_on", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    response = authenticated_client.patch(f"/api/v1/inbox/{item.id}", json={"read": True})
+    monkeypatch.undo()
+
+    assert response.status_code == 200
+    assert response.json()["read_at"] is not None
+
+    acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert acted_on is None

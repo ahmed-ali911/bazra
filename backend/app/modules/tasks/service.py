@@ -4,6 +4,8 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.space_scoping import scoped_query
+from app.modules.attention import history as attention_history
+from app.modules.attention.schemas import TaskMutationState
 from app.modules.inbox import service as inbox_service
 from app.modules.tasks.models import Task
 from app.modules.tasks.schemas import TaskCreate, TaskUpdate
@@ -173,8 +175,15 @@ def update_task(db: Session, space_id: int, task_id: int, data: TaskUpdate) -> T
     if task is None:
         return None
 
+    # Checkpoint 4.4c-3: ONE mutation-time instant, computed once and
+    # reused for every timestamp this call needs (completed_at below,
+    # and the Attention attribution hook's own `now`) — never a second,
+    # separately-called datetime.now() for Attention.
+    now = datetime.now(timezone.utc)
+
     updates = data.model_dump(exclude_unset=True)
     previous_status = task.status
+    previous_due_at = task.due_at
 
     # completed_at is derived from a status transition, never client-supplied
     # directly — set it as a side effect here, in the one place status
@@ -183,7 +192,7 @@ def update_task(db: Session, space_id: int, task_id: int, data: TaskUpdate) -> T
     if "status" in updates:
         new_status = updates["status"]
         if new_status == "done" and previous_status != "done":
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at = now
             just_completed = True
         elif new_status != "done" and previous_status == "done":
             task.completed_at = None
@@ -211,6 +220,22 @@ def update_task(db: Session, space_id: int, task_id: int, data: TaskUpdate) -> T
             db, space_id, task_id=task.id, title=f"Completed: {task.title}", commit=False
         )
 
+    # Checkpoint 4.4c-3 — ACTED_ON attribution, attempted ONLY when a
+    # qualifying field's VALUE actually changed (never merely because it
+    # was present in the PATCH payload — a due_at=17:00 PATCH against an
+    # already-17:00 task must not manufacture attribution evidence).
+    # Fail-open: attempt_acted_on_attribution never raises, and this
+    # call sits strictly BEFORE this function's own db.commit() below,
+    # inside that same not-yet-committed transaction.
+    qualifying_change = task.status != previous_status or task.due_at != previous_due_at
+    if qualifying_change:
+        attention_history.attempt_acted_on_attribution(
+            db, space_id, "task",
+            task.id,
+            TaskMutationState(status=task.status, due_at=task.due_at, archived_at=task.archived_at),
+            now,
+        )
+
     db.commit()
     db.refresh(task)
     return task
@@ -222,6 +247,18 @@ def delete_task(db: Session, space_id: int, task_id: int) -> bool:
     task = get_task(db, space_id, task_id)
     if task is None:
         return False
-    task.archived_at = datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
+    task.archived_at = now
+
+    # Checkpoint 4.4c-3 — archive is always a qualifying, real mutation
+    # here (get_task's own archived_at IS NULL filter above guarantees
+    # this is a genuine first-time archive, never a no-op re-archive).
+    attention_history.attempt_acted_on_attribution(
+        db, space_id, "task",
+        task.id,
+        TaskMutationState(status=task.status, due_at=task.due_at, archived_at=task.archived_at),
+        now,
+    )
+
     db.commit()
     return True

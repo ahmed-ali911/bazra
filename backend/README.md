@@ -1555,6 +1555,102 @@ mutation's own instant — never that the mutation *caused* the
 resolution, and it is invoked only when Checkpoint 4.4c-3 decides a
 qualifying mutation actually occurred.
 
+### Checkpoint 4.4c-3
+
+Wired the pure 4.4c-2 evaluator into all six real mutation boundaries:
+`tasks_service.update_task`/`delete_task`,
+`calendar_service.update_calendar_event`/`delete_calendar_event`,
+`inbox_service.mark_read`/`dismiss_item`.
+
+**What `acted_on_at` means**: a qualifying semantic source mutation
+occurred, and the post-mutation state resolved the *latest* surfaced
+concern for that source at that mutation's own instant. It does **not**
+prove causation — not that BAZRA's own reminder caused Ahmed to act,
+only temporal/state association at a known instant.
+
+**Domain truth outranks Attention attribution, enforced structurally,
+not just by convention.** `history.attempt_acted_on_attribution` —
+the one shared helper every one of the six call sites invokes,
+immediately before its own existing `db.commit()` — isolates its own
+work (the latest-exposure lookup, the evaluator call, the conditional
+write) inside a single Postgres `SAVEPOINT` (`Session.begin_nested()`).
+Any exception from that work rolls back *only* the savepoint, is
+logged (`logger.exception`, no payload content — never title,
+description, or snapshot contents), and is swallowed — the function
+never raises. This was proven, not assumed: disposable experiment
+scripts run against the real dev Postgres (since deleted) confirmed
+`begin_nested()` autoflushes pending outer changes before establishing
+the savepoint, that a nested rollback leaves both the Session and the
+outer object's already-flushed state fully intact, and that the
+caller's own subsequent commit succeeds normally.
+
+**A real, subtle bug this same empirical approach caught before it
+shipped**: `begin_nested()`'s own autoflush can flush *unrelated*
+pending writes made earlier in the same transaction — if one of those
+is invalid, that is a genuine **core domain failure**, not an Attention
+failure, and must never be miscategorized and swallowed. The fix:
+`attempt_acted_on_attribution` calls `db.flush()` explicitly *before*
+entering its own try/except, so a pre-existing bad write surfaces
+honestly outside Attention's fail-open boundary, never inside it.
+
+**Normal, expected no-attribution outcomes are not failures and
+involve no exception or rollback at all**: no exposure exists for the
+source; the latest exposure already has `acted_on_at` set; the
+evaluator returns `NOT_RESOLVED` or `UNKNOWN`. All four are plain early
+returns from inside the (still normally-committing) savepoint.
+
+**Only the single latest exposure for a source is ever eligible** —
+queried directly (`ORDER BY surfaced_at DESC, id DESC`, across all
+surfaces), never derived from `SuppressionState`, and never excluded
+merely because it happens to be currently snoozed, dismissed, or
+within cooldown — ACTED_ON is historical attribution, not a
+suppression gate. The write itself is first-write-wins
+(`WHERE id=... AND acted_on_at IS NULL`), the same idempotent
+conditional-UPDATE convention `record_dismiss` already established.
+
+**No semantic value change, no attribution attempt** — now a
+correctness requirement, not merely an optimization. Each of the six
+functions captures the qualifying field(s)' pre-mutation value(s) and
+only calls the hook when at least one actually changed (`due_at`
+re-PATCHed to its own existing value, or a title/description/
+life_area_id-only edit, never attempts attribution). For the three
+delete functions this check is unconditional — the scoped getters they
+call already guarantee `archived_at` was `NULL` beforehand, so every
+reachable archive is a genuine first-time transition.
+
+**One mutation-time `now` per call**: each of the six functions now
+computes `datetime.now(timezone.utc)` exactly once, at the top, and
+reuses that same instant for every timestamp it sets — `completed_at`,
+`archived_at`, and the Attention hook's own `now` — never a second,
+independently-called `datetime.now()` for Attention.
+
+**Phase 3 remains fully isolated from Attention's own fate.** Because
+the hook lives inside the same six functions `confirm_and_execute`
+already calls, a confirmed Task/Event mutation automatically carries
+attribution with zero Phase-3-specific code — and a contained
+Attention failure during a confirmed mutation still results in
+`ConfirmResult.outcome == "executed"`, the domain mutation durable, and
+`acted_on_at` left `NULL` (proven directly, including through the
+confirmed-ProposedAction path, not just the direct-REST path).
+
+**Known, pre-existing transactional debt, surfaced by this checkpoint's
+own empirical inspection (not introduced by it, and deliberately not
+fixed here)**: `confirm_and_execute`'s `update_task`/`update_event`
+branches call a domain service function that commits *internally*,
+before `confirm_and_execute`'s own later `status="executed"` commit —
+a real two-commit boundary, confirmed directly against the dev DB. A
+failure strictly between those two commits (independent of Attention
+entirely) can leave a `ProposedAction` stuck at `status="confirmed"`
+forever, even though the domain mutation itself succeeded. This
+predates Attention; fixing it would expand scope into Phase 3's own
+transaction semantics and requires a separate, future hardening
+checkpoint before any autonomous/proactive action capability expands
+on top of `confirm_and_execute`.
+
+**Evolution interpretation, unchanged from 4.4c-2**: `acted_on_at` is
+temporal/state association evidence only — never a success score,
+never causal credit, never a signal of user preference.
+
 ## Run locally (without Docker)
 
 ```bash

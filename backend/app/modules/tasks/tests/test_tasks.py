@@ -317,3 +317,198 @@ def test_task_response_exposes_priority(authenticated_client: TestClient) -> Non
 
     fetched = authenticated_client.get(f"/api/v1/tasks/{created['id']}").json()
     assert fetched["priority"] == "low"
+
+
+# ---- Checkpoint 4.4c-3: ACTED_ON wiring ----
+
+
+def _space_and_user(db_session: Session):
+    from app.modules.auth import service as auth_service
+    from app.modules.spaces import service as spaces_service
+
+    user = auth_service.get_the_user(db_session)
+    space = spaces_service.get_default_space_for_user(db_session, user.id)
+    return space.id, user.id
+
+
+def _overdue_exposure_for_task(db_session: Session, space_id: int, user_id: int, task_id: int, due_at) -> int:
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+
+    signal = Signal(
+        signal_type="TASK_OVERDUE", source_type="task", source_id=task_id, title="t",
+        relevant_timestamp=due_at, priority="normal", measurement_seconds=3600,
+        snapshot={"due_at": "x", "status": "open"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    from datetime import datetime, timezone
+
+    exposure = attention_history.record_exposure(
+        db_session, space_id, user_id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+    return exposure.id
+
+
+def test_status_open_to_done_qualifies_for_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Done qualifies", "due_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"status": "done"})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is not None
+
+
+def test_due_at_actual_change_qualifies_for_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Due change qualifies", "due_at": past_due.isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    future_due = datetime.now(timezone.utc) + timedelta(days=1)
+    authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"due_at": future_due.isoformat()})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is not None
+
+
+def test_same_due_at_value_does_not_invoke_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Same due_at no-op", "due_at": past_due.isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    # Re-send the EXACT same due_at value — a semantic no-op.
+    authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"due_at": created["due_at"]})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is None
+
+
+def test_title_only_change_does_not_invoke_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Title-only no-op", "due_at": past_due.isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"title": "Renamed, nothing else"})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is None
+
+
+def test_life_area_only_change_does_not_invoke_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Life-area-only no-op", "due_at": past_due.isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    area = authenticated_client.post("/api/v1/life-areas", json={"name": "Acted-on wiring test area"}).json()
+    authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"life_area_id": area["id"]})
+
+    row = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert row is None
+
+
+def test_task_archive_qualifies_for_attribution(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Archive qualifies", "due_at": past_due.isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    authenticated_client.delete(f"/api/v1/tasks/{created['id']}")
+
+    row = db_session.execute(
+        text("SELECT acted_on_at, archived_at FROM attention_exposures ae "
+             "JOIN tasks t ON t.id = ae.task_id WHERE ae.id = :id"),
+        {"id": exposure_id},
+    ).mappings().one()
+    assert row["acted_on_at"] is not None
+
+
+def test_task_archive_acted_on_uses_same_now_as_archived_at(authenticated_client: TestClient, db_session: Session) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    space_id, user_id = _space_and_user(db_session)
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Same now proof", "due_at": past_due.isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    authenticated_client.delete(f"/api/v1/tasks/{created['id']}")
+
+    row = db_session.execute(
+        text(
+            "SELECT ae.acted_on_at, t.archived_at FROM attention_exposures ae "
+            "JOIN tasks t ON t.id = ae.task_id WHERE ae.id = :id"
+        ),
+        {"id": exposure_id},
+    ).mappings().one()
+    assert row["acted_on_at"] == row["archived_at"]
+
+
+def test_forced_attribution_exception_during_task_update_still_commits_mutation(
+    authenticated_client: TestClient, db_session: Session, monkeypatch
+) -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from app.modules.attention import resolution as attention_resolution
+
+    space_id, user_id = _space_and_user(db_session)
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    created = authenticated_client.post(
+        "/api/v1/tasks", json={"title": "Forced failure still commits", "due_at": past_due.isoformat()}
+    ).json()
+    exposure_id = _overdue_exposure_for_task(db_session, space_id, user_id, created["id"], created["due_at"])
+
+    monkeypatch.setattr(
+        attention_resolution, "evaluate_acted_on", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+
+    response = authenticated_client.patch(f"/api/v1/tasks/{created['id']}", json={"status": "done"})
+    monkeypatch.undo()
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "done"
+
+    acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure_id}
+    ).scalar_one()
+    assert acted_on is None

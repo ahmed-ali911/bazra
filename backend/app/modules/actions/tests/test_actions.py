@@ -1,6 +1,8 @@
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.modules.actions import service as actions_service
@@ -1196,3 +1198,100 @@ def test_reject_delete_event_proposal_leaves_event_active(db_session: Session, o
     db_session.refresh(event)
     assert event.archived_at is None
     assert calendar_service.get_calendar_event(db_session, space.id, event.id) is not None
+
+
+# ---- Checkpoint 4.4c-3: ACTED_ON fail-open during Phase 3 confirmation --------------
+
+
+def test_forced_attribution_failure_during_confirmed_update_task_still_executes(db_session: Session, owner) -> None:
+    """A contained Attention-attribution failure during a Phase-3-confirmed
+    Task mutation must never turn a successful domain execution back into
+    pending, and must never prevent ConfirmResult from reporting
+    outcome="executed" — domain truth outranks derived attention evidence."""
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import resolution as attention_resolution
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+    from app.modules.tasks import service as tasks_service
+    from app.modules.tasks.schemas import TaskCreate
+
+    user, space = owner
+    past_due = datetime.now(timezone.utc) - timedelta(hours=1)
+    task = tasks_service.create_task(
+        db_session, space.id, TaskCreate(title="Phase 3 fail-open - actions44c3", due_at=past_due),
+    )
+    signal = Signal(
+        signal_type="TASK_OVERDUE", source_type="task", source_id=task.id, title=task.title,
+        relevant_timestamp=past_due, priority="normal", measurement_seconds=3600,
+        snapshot={"due_at": "x", "status": "open"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space.id, user.id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_task", {"task_id": task.id, "status": "done"},
+    )
+
+    with patch.object(
+        attention_resolution, "evaluate_acted_on", side_effect=RuntimeError("forced attribution failure")
+    ):
+        result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+    assert result.task.status == "done"
+
+    db_session.refresh(task)
+    assert task.status == "done"  # the domain mutation is durable
+
+    acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure.id}
+    ).scalar_one()
+    assert acted_on is None  # the contained failure left no attribution
+
+
+def test_forced_attribution_failure_during_confirmed_update_event_still_executes(db_session: Session, owner) -> None:
+    from app.modules.attention import history as attention_history
+    from app.modules.attention import resolution as attention_resolution
+    from app.modules.attention import scoring as attention_scoring
+    from app.modules.attention.schemas import Signal
+    from app.modules.calendar import service as calendar_service
+    from app.modules.calendar.schemas import CalendarEventCreate
+
+    user, space = owner
+    soon = datetime.now(timezone.utc) + timedelta(minutes=30)
+    event = calendar_service.create_calendar_event(
+        db_session, space.id, CalendarEventCreate(title="Phase 3 fail-open event - actions44c3", starts_at=soon),
+    )
+    signal = Signal(
+        signal_type="EVENT_UPCOMING", source_type="calendar_event", source_id=event.id, title=event.title,
+        relevant_timestamp=soon, priority=None, measurement_seconds=1800, snapshot={"starts_at": "x"},
+    )
+    candidate = attention_scoring.score_signal(signal)
+    exposure = attention_history.record_exposure(
+        db_session, space.id, user.id, candidate, "app_opened", datetime.now(timezone.utc), "Africa/Cairo"
+    )
+
+    source_id = _seed_source_message(db_session, space.id, user.id)
+    far_future = datetime.now(timezone.utc) + timedelta(hours=4)
+    actions_service.create_pending_action(
+        db_session, space.id, user.id, source_id, "update_event",
+        {"event_id": event.id, "starts_at": far_future.isoformat()},
+    )
+
+    with patch.object(
+        attention_resolution, "evaluate_acted_on", side_effect=RuntimeError("forced attribution failure")
+    ):
+        result = actions_service.confirm_and_execute(db_session, space.id, user.id)
+
+    assert result.outcome == "executed"
+
+    db_session.refresh(event)
+    assert event.starts_at == far_future  # the domain mutation is durable
+
+    acted_on = db_session.execute(
+        text("SELECT acted_on_at FROM attention_exposures WHERE id = :id"), {"id": exposure.id}
+    ).scalar_one()
+    assert acted_on is None
