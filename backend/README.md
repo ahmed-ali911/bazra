@@ -1477,6 +1477,84 @@ transaction) so an Attention-attribution failure can roll back only the
 derived Attention write while the authoritative domain mutation still
 succeeds. Not implemented in this slice.
 
+### Checkpoint 4.4c-2
+
+Added `app/modules/attention/resolution.py` — a pure, **100% DB-free**
+deterministic evaluator answering one narrow question: *given an
+exposure's original `signal_type`, and the source's own state
+immediately after a qualifying mutation, does the concern that signal
+represented still hold at the mutation's own instant?* It is not wired
+into any production mutation path yet (that's Checkpoint 4.4c-3) and
+has no Session, no SQL, no ORM objects, and never writes `acted_on_at`
+— all structurally proven by dedicated tests.
+
+**Tri-state result, never a bool**: `RESOLVED` / `NOT_RESOLVED` /
+`UNKNOWN`. `UNKNOWN` means *insufficient trustworthy evidence* (e.g. a
+`TASK_DUE_TODAY` exposure with a missing or unresolvable
+`timezone_name`) — categorically different from `NOT_RESOLVED`, which
+means the evidence says the concern still holds. The evaluator never
+collapses the two, and never guesses a timezone to avoid returning
+`UNKNOWN`.
+
+**Inputs**: a small, immutable, DB-free post-mutation state dataclass
+per source type — `TaskMutationState` (`status`, `due_at`,
+`archived_at`), `EventMutationState` (`starts_at`, `archived_at`),
+`InboxMutationState` (`read_at`, `archived_at`) — plus the mutation's
+own authoritative `now` (always caller-supplied; the module never
+calls `datetime.now()` itself) and, only for `TASK_DUE_TODAY`, the
+exposure's own `timezone_name`.
+
+**Source-type safety without a redundant parameter**: there is no
+separate `source_type` string argument to independently get wrong —
+`evaluate_acted_on`'s own `isinstance` check against the required
+dataclass type for the given `signal_type` makes "Event state handed
+to a Task signal" structurally impossible to pass silently. Any
+mismatch (or an unsupported `signal_type`) raises
+`ActedOnResolutionError` — a caller bug, never an evidentiary gap, and
+it can never produce `RESOLVED` by accident.
+
+**Per-signal semantics** (all against the mutation's own `now`, never
+a later re-evaluation instant):
+- `TASK_OVERDUE`: resolved by completion, archive, or `due_at` moving
+  to now/the future, or `due_at` becoming null. Moving `due_at` later
+  but still in the past is **not** resolved — "less overdue" is not
+  resolution.
+- `TASK_DUE_TODAY`: resolved by completion, archive, `due_at` null, or
+  `due_at` moving to tomorrow-or-later (using the exact same
+  calendar-day/DST-safe `_next_local_midnight` helper Checkpoint 4.2
+  already established — reused directly, never reimplemented).
+  **Concern-continuity protection**: if the mutation leaves `due_at <
+  now`, this is **not** resolved — that's a transition into the more
+  severe `TASK_OVERDUE` concern, not an improvement, exactly as the
+  architecture review's own locked rule requires.
+- `TASK_DUE_SOON`: same shape as `TASK_DUE_TODAY` (resolved by
+  completion/archive/null due_at/moving outside the 4h window; moving
+  `due_at` into the past is concern-continuity `NOT_RESOLVED`, not
+  success).
+- `EVENT_UPCOMING`: resolved by archive or `starts_at` moving outside
+  the 2h window. `starts_at` moving into the past is **conservatively
+  not resolved** — there is no `EVENT_OVERDUE` concept, and a backward
+  move is treated as suspicious, never automatic success.
+- `INBOX_NEEDS_ATTENTION`: resolved by marking read or archiving;
+  marking **unread again** is a real mutation but re-opens the concern
+  — correctly `NOT_RESOLVED` with zero special-casing, since it's
+  simply a direct re-check of the same two fields.
+
+**Timezone/DST proof**: dedicated tests prove the exact Kuwait (no-DST)
+boundary, and both the real `America/New_York` 2026 spring-forward
+(23-hour local day) and fall-back (25-hour local day) transitions,
+using the same independently-derived exact UTC instants Checkpoint
+4.2's own DST tests use — never "roughly 24 hours."
+
+**Not implemented in this slice** (structurally proven): any hook into
+`tasks_service`/`calendar_service`/`inbox_service`/`actions_service`
+(no import of any of them exists in `resolution.py` at all), any
+`SAVEPOINT`/nested-transaction logic, and any write of `acted_on_at`
+anywhere. This evaluator proves only state association at the
+mutation's own instant — never that the mutation *caused* the
+resolution, and it is invoked only when Checkpoint 4.4c-3 decides a
+qualifying mutation actually occurred.
+
 ## Run locally (without Docker)
 
 ```bash

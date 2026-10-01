@@ -180,3 +180,69 @@ class AttentionCandidate:
     score: int
     reason_codes: tuple[ScoreComponent, ...]
     suppression: GateResult | None = None
+
+
+# ==================================================
+# Checkpoint 4.4c-2 — Pure deterministic ACTED_ON resolution evaluator
+# ==================================================
+
+#: Tri-state, deliberately never a bool (the architecture review's own
+#: locked distinction): UNKNOWN means "insufficient trustworthy
+#: evidence to decide" (e.g. a TASK_DUE_TODAY exposure with no/invalid
+#: timezone_name) — categorically different from NOT_RESOLVED, which
+#: means "evidence says the concern still holds". resolution.py never
+#: collapses the two.
+ActedOnResolution = Literal["RESOLVED", "NOT_RESOLVED", "UNKNOWN"]
+
+
+class ActedOnResolutionError(Exception):
+    """Raised when resolution.evaluate_acted_on is asked to evaluate a
+    signal_type against a structurally incompatible state object (e.g.
+    an EventMutationState for a TASK_OVERDUE signal) or an unsupported
+    signal_type — a CALLER bug (the wrong post-mutation state was
+    supplied for this exposure), never an evidentiary gap. This is
+    deliberately a hard raise, never UNKNOWN: UNKNOWN is reserved for
+    "right inputs, insufficient evidence" (timezone missing/invalid);
+    a mismatched source/signal pairing is reserved for "wrong inputs
+    entirely" and must never silently produce RESOLVED (or any other
+    tri-state value) by accident.
+    """
+
+
+@dataclass(frozen=True)
+class TaskMutationState:
+    """The smallest immutable, DB-free snapshot of a Task's own
+    predicate-relevant fields AFTER a mutation — never an ORM object
+    (resolution.py has no Session/query dependency at all). Covers
+    TASK_OVERDUE/TASK_DUE_TODAY/TASK_DUE_SOON, all three of which share
+    the identical lifecycle predicate and differ only in their due_at
+    window check.
+    """
+
+    status: str
+    due_at: datetime | None
+    archived_at: datetime | None
+
+
+@dataclass(frozen=True)
+class EventMutationState:
+    """The smallest immutable, DB-free snapshot of a CalendarEvent's own
+    predicate-relevant fields AFTER a mutation — covers EVENT_UPCOMING.
+    """
+
+    starts_at: datetime
+    archived_at: datetime | None
+
+
+@dataclass(frozen=True)
+class InboxMutationState:
+    """The smallest immutable, DB-free snapshot of an InboxItem's own
+    predicate-relevant fields AFTER a mutation — covers
+    INBOX_NEEDS_ATTENTION. No timezone, no snapshot comparison needed:
+    the original signal's own eligibility already guaranteed both
+    fields were NULL at surfacing time, so a direct check of the
+    CURRENT values is sufficient (see resolution.py's own docstring).
+    """
+
+    read_at: datetime | None
+    archived_at: datetime | None
