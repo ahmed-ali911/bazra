@@ -36,6 +36,17 @@ from app.modules.attention.schemas import (
 
 # ---- Locked v1 policy constants (Architecture Contract 4.0b) ----
 
+#: Checkpoint 4.4a — the smallest explicit provenance mechanism the
+#: architecture review asked for: a bare, manually-bumped string, never
+#: a registry/dynamic policy engine. Persisted verbatim on every
+#: AttentionExposure row (history.py) so a historical row's score stays
+#: attributable to the policy that actually produced it. Bump this
+#: string by hand whenever ANY locked constant in this module changes
+#: (base scores, priority deltas, proximity formulas, thresholds,
+#: cooldown, dedup/tie-break rules) — never silently recompute a past
+#: exposure's score under a newer policy and present it as original.
+POLICY_VERSION = "4.3"
+
 _BASE_SCORES: dict[SignalType, int] = {
     "TASK_OVERDUE": 50,
     "EVENT_UPCOMING": 45,

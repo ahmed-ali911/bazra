@@ -1260,6 +1260,85 @@ table, never the reverse. Locked precedence, first match wins:
 consulted by the gates — a historical acted-on exposure never itself
 suppresses a new, current Signal (only snooze/dismiss/cooldown do).
 
+### Checkpoint 4.4a
+
+Added `app/modules/attention/models.py` (`AttentionExposure`, a new,
+additive `attention_exposures` table) and `app/modules/attention/
+history.py` (`record_exposure`, `load_suppression_states`) — the first
+piece of **durable** Attention state. The distinction this checkpoint
+exists to make precise:
+
+- **`Signal`** (4.2): derived live, never persisted.
+- **`AttentionCandidate`** (4.3): derived/scored live, never persisted.
+  **Selection/ranking is NOT delivery** — scoring and ranking a
+  candidate creates no durable row at all.
+- **`AttentionExposure`** (4.4a): durable evidence that a candidate was
+  **actually delivered** to a real surface. Only a future surfacing
+  consumer, after it genuinely shows something to the user, may call
+  `record_exposure` — nothing in this checkpoint calls it on its own
+  initiative, and no such consumer exists yet.
+
+**Table shape** — one table, by design (see the accepted architecture
+inspection for the full reasoning): an IMMUTABLE core written once at
+insert (`task_id`/`event_id`/`inbox_item_id` — exactly one non-null,
+`CHECK`-enforced; `signal_type`, `surface`, `policy_version`, `score`,
+`reason_codes`, `exposure_snapshot`, `surfaced_at`), plus three nullable
+feedback columns declared now as part of the accepted shape but **never
+written by 4.4a**: `snoozed_until` (4.4b), `dismissed_at` (4.4b),
+`acted_on_at` (4.4c). Typed nullable FKs, never a generic
+`(source_type, source_id)` pair — the same concrete-FK convention
+`ProposedAction.executed_task_id`/`executed_memory_id` already
+established.
+
+**`updated_at` (inherited from `BaseModel`) is ordinary bookkeeping
+only** — it bumps on every feedback write like any other table, but is
+**never** consulted as attention evidence, a user-action signal,
+dismissal-invalidation evidence, or future learning evidence. Only the
+four explicit semantic columns above carry those meanings;
+`load_suppression_states` never reads `updated_at` at all (proven by a
+dedicated structural test).
+
+**Policy provenance**: `scoring.POLICY_VERSION` (currently `"4.3"`) — a
+bare, manually-bumped string, no registry. Persisted verbatim on every
+row; a historical row's score is never recomputed under a newer policy
+and presented as original evidence.
+
+**`record_exposure(db, space_id, user_id, candidate, surface,
+surfaced_at, commit=True)`**: `surfaced_at` is an explicit, caller-
+supplied delivery instant — never substituted with the candidate's own
+scoring-time `now`, since the caller is the only party that knows the
+real delivery moment. Validates, before writing anything: `surface`/
+`signal_type` are members of the locked value sets; the space is
+actually owned by `user_id` (`Space.user_id` match); and the Signal's
+own source genuinely exists in that space, re-verified through that
+source's own scoped getter (`tasks_service.get_task`/
+`calendar_service.get_calendar_event`/`inbox_service.get_item`) — never
+trusted merely because an id was present on the Signal. `reason_codes`/
+`exposure_snapshot`/`score` are taken entirely from the already-scored
+`AttentionCandidate`, never from any separately-supplied client JSON.
+
+**`load_suppression_states(db, space_id, identities)`**: batch-
+constructs 4.3's `SuppressionState` for many `(source_type, source_id)`
+identities in at most 3 queries total (one `DISTINCT ON` query per
+distinct source type present, never one per identity). For each
+identity, uses the single latest exposure row — `ORDER BY surfaced_at
+DESC, id DESC` — **across all surfaces**: cooldown is global, not
+per-surface, which falls directly out of 4.3's own already-shipped
+`SuppressionState` having exactly one `surfaced_at` field. Repeated
+real deliveries (e.g. the same source surfaced again after cooldown
+expires) each create their own distinct row — proven directly, along
+with the persisted-`surfaced_at`-drives-cooldown integration (11h59m
+suppressed, exactly 12h eligible, both against real persisted rows,
+not synthetic `SuppressionState` objects).
+
+**Not implemented in 4.4a** (structurally proven by dedicated tests —
+no such functions exist in `history.py`): snooze/dismiss mutation APIs
+(4.4b), the deterministic ACTED_ON evaluator (4.4c). `acted_on_at`
+remains a declared, nullable column that `record_exposure` never sets.
+A future BAZRA Evolution System may eventually consume this durable
+exposure history as factual evaluation evidence, but no learning,
+preference-inference, or policy-comparison exists anywhere in 4.4a.
+
 ## Run locally (without Docker)
 
 ```bash
