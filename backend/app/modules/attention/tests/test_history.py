@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from app.modules.attention import history, scoring
 from app.modules.attention.history import AttentionExposureError, AttentionOwnershipError
 from app.modules.attention.models import AttentionExposure
-from app.modules.attention.schemas import Signal
+from app.modules.attention.schemas import InvalidTimezoneError, Signal, SuppressionState
 from app.modules.auth import service as auth_service
 from app.modules.calendar import service as calendar_service
 from app.modules.calendar.schemas import CalendarEventCreate
@@ -159,7 +159,7 @@ def test_valid_task_exposure_persistence(db_session: Session) -> None:
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="Overdue task", due_at=_NOW, priority="high"))
     candidate = scoring.score_signal(_task_signal(task, priority="high"))
 
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
     assert exposure.task_id == task.id
     assert exposure.event_id is None
@@ -173,7 +173,7 @@ def test_valid_event_exposure_persistence(db_session: Session) -> None:
     )
     candidate = scoring.score_signal(_event_signal(event))
 
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "daily_brief", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "daily_brief", _NOW, "Africa/Cairo")
 
     assert exposure.event_id == event.id
     assert exposure.task_id is None
@@ -185,7 +185,7 @@ def test_valid_inbox_exposure_persistence(db_session: Session) -> None:
     item = inbox_service.create_item(db_session, space.id, task_id=None, title="Unread item")
     candidate = scoring.score_signal(_inbox_signal(item))
 
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "daily_brief", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "daily_brief", _NOW, "Africa/Cairo")
 
     assert exposure.inbox_item_id == item.id
     assert exposure.task_id is None
@@ -203,7 +203,7 @@ def test_cross_space_source_cannot_be_recorded(db_session: Session) -> None:
     candidate = scoring.score_signal(_task_signal(task_in_b))
 
     with pytest.raises(AttentionOwnershipError):
-        history.record_exposure(db_session, space_a.id, owner.id, candidate, "app_opened", _NOW)
+        history.record_exposure(db_session, space_a.id, owner.id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
 
 def test_cross_user_ownership_mismatch_cannot_be_recorded(db_session: Session) -> None:
@@ -219,7 +219,7 @@ def test_cross_user_ownership_mismatch_cannot_be_recorded(db_session: Session) -
     db_session.refresh(impostor)
 
     with pytest.raises(AttentionOwnershipError):
-        history.record_exposure(db_session, space.id, impostor.id, candidate, "app_opened", _NOW)
+        history.record_exposure(db_session, space.id, impostor.id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
 
 def test_unsupported_surface_rejected(db_session: Session) -> None:
@@ -228,7 +228,7 @@ def test_unsupported_surface_rejected(db_session: Session) -> None:
     candidate = scoring.score_signal(_task_signal(task))
 
     with pytest.raises(AttentionExposureError):
-        history.record_exposure(db_session, space.id, space.user_id, candidate, "push_notification", _NOW)  # type: ignore[arg-type]
+        history.record_exposure(db_session, space.id, space.user_id, candidate, "push_notification", _NOW, "Africa/Cairo")  # type: ignore[arg-type]
 
 
 # ---- 8-13: exact field preservation ----
@@ -240,7 +240,7 @@ def test_candidate_score_and_provenance_preserved_exactly(db_session: Session) -
     signal = _task_signal(task, priority="high", measurement_seconds=5 * 24 * 3600)
     candidate = scoring.score_signal(signal)
 
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
     assert exposure.score == candidate.score == 95  # 50 base + 20 high-priority + 25 overdue (5 days, capped at 30)
     expected_reason_codes = [
@@ -261,8 +261,7 @@ def test_surfaced_at_is_exactly_the_caller_supplied_instant_not_now(db_session: 
     explicit_delivery_instant = _NOW - timedelta(hours=3)
 
     exposure = history.record_exposure(
-        db_session, space.id, space.user_id, candidate, "app_opened", explicit_delivery_instant
-    )
+        db_session, space.id, space.user_id, candidate, "app_opened", explicit_delivery_instant, "Africa/Cairo")
 
     assert exposure.surfaced_at == explicit_delivery_instant
     assert exposure.surfaced_at != _NOW
@@ -276,10 +275,9 @@ def test_repeated_real_deliveries_create_distinct_rows(db_session: Session) -> N
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     candidate = scoring.score_signal(_task_signal(task))
 
-    first = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    first = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
     second = history.record_exposure(
-        db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12)
-    )
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12), "Africa/Cairo")
 
     assert first.id != second.id
     count = db_session.execute(
@@ -313,8 +311,8 @@ def test_load_suppression_states_chooses_latest_by_surfaced_at_then_id(db_sessio
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     candidate = scoring.score_signal(_task_signal(task))
 
-    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=20))
-    latest = history.record_exposure(db_session, space.id, space.user_id, candidate, "daily_brief", _NOW - timedelta(hours=1))
+    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=20), "Africa/Cairo")
+    latest = history.record_exposure(db_session, space.id, space.user_id, candidate, "daily_brief", _NOW - timedelta(hours=1), "Africa/Cairo")
 
     states = history.load_suppression_states(db_session, space.id, [("task", task.id)])
     assert states[("task", task.id)].surfaced_at == latest.surfaced_at
@@ -325,7 +323,7 @@ def test_suppression_state_is_global_across_surfaces(db_session: Session) -> Non
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     candidate = scoring.score_signal(_task_signal(task))
 
-    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=2))
+    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=2), "Africa/Cairo")
 
     states = history.load_suppression_states(db_session, space.id, [("task", task.id)])
     assert states[("task", task.id)].surfaced_at == _NOW - timedelta(hours=2)
@@ -336,7 +334,7 @@ def test_load_suppression_states_batches_without_n_plus_one(db_session: Session)
     tasks = [tasks_service.create_task(db_session, space.id, TaskCreate(title=f"t{i}", due_at=_NOW)) for i in range(5)]
     for task in tasks:
         candidate = scoring.score_signal(_task_signal(task))
-        history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=1))
+        history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=1), "Africa/Cairo")
 
     identities = [("task", t.id) for t in tasks]
     states = history.load_suppression_states(db_session, space.id, identities)
@@ -360,8 +358,7 @@ def test_persisted_surfaced_at_drives_cooldown_11h59_suppressed(db_session: Sess
     signal = _task_signal(task, priority="normal", measurement_seconds=5 * 24 * 3600)  # score 75
     candidate = scoring.score_signal(signal)
     history.record_exposure(
-        db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=11, minutes=59)
-    )
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=11, minutes=59), "Africa/Cairo")
 
     states = history.load_suppression_states(db_session, space.id, [("task", task.id)])
     ranked = scoring.rank_for_surface([signal], _NOW, "app_opened", states)
@@ -374,7 +371,7 @@ def test_persisted_surfaced_at_drives_cooldown_exactly_12h_eligible(db_session: 
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW, priority="normal"))
     signal = _task_signal(task, priority="normal", measurement_seconds=5 * 24 * 3600)  # score 75
     candidate = scoring.score_signal(signal)
-    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=12))
+    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=12), "Africa/Cairo")
 
     states = history.load_suppression_states(db_session, space.id, [("task", task.id)])
     ranked = scoring.rank_for_surface([signal], _NOW, "app_opened", states)
@@ -388,7 +385,7 @@ def test_snoozed_until_populated_in_fixture_maps_into_suppression_state(db_sessi
     space = _space(db_session)
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     candidate = scoring.score_signal(_task_signal(task))
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
     exposure.snoozed_until = _NOW + timedelta(hours=2)
     db_session.commit()
@@ -402,7 +399,7 @@ def test_dismissed_at_populated_in_fixture_maps_dismissed_snapshot_from_exposure
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     signal = _task_signal(task)
     candidate = scoring.score_signal(signal)
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
     exposure.dismissed_at = _NOW + timedelta(minutes=5)
     db_session.commit()
@@ -418,7 +415,7 @@ def test_acted_on_at_populated_in_fixture_maps_into_suppression_state(db_session
     space = _space(db_session)
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     candidate = scoring.score_signal(_task_signal(task))
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
     exposure.acted_on_at = _NOW + timedelta(minutes=10)
     db_session.commit()
@@ -434,7 +431,7 @@ def test_updated_at_is_not_consulted_by_suppression_state_construction(db_sessio
     space = _space(db_session)
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     candidate = scoring.score_signal(_task_signal(task))
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
     # Bump updated_at via an UNRELATED touch (not any of the 4 semantic
     # feedback fields) and confirm suppression state is unaffected.
@@ -491,7 +488,7 @@ def test_record_exposure_never_sets_acted_on_at(db_session: Session) -> None:
     task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
     candidate = scoring.score_signal(_task_signal(task))
 
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
 
     assert exposure.acted_on_at is None
     assert exposure.snoozed_until is None
@@ -504,3 +501,138 @@ def test_no_acted_on_mutation_functions_exist_yet() -> None:
     evaluator (Checkpoint 4.4c)."""
     assert not hasattr(history, "evaluate_and_record_acted_on")
     assert not hasattr(history, "mark_acted_on")
+
+
+# ==================================================
+# Checkpoint 4.4c-1: timezone_name provenance
+# ==================================================
+
+
+def test_migration_added_nullable_timezone_name_column(db_session: Session) -> None:
+    row = db_session.execute(
+        text(
+            "SELECT is_nullable FROM information_schema.columns "
+            "WHERE table_name = 'attention_exposures' AND column_name = 'timezone_name'"
+        )
+    ).scalar_one()
+    assert row == "YES"
+
+
+def test_pre_existing_row_without_timezone_name_reads_as_null(db_session: Session) -> None:
+    """Simulates a 4.4a/4.4b-era row (inserted before this column had any
+    writer) via a raw INSERT that never names timezone_name at all —
+    never backfilled, never guessed."""
+    space = _space(db_session)
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
+    db_session.execute(
+        text(
+            "INSERT INTO attention_exposures "
+            "(space_id, user_id, task_id, signal_type, surface, policy_version, score, "
+            "reason_codes, exposure_snapshot, surfaced_at) "
+            "VALUES (:space_id, :user_id, :task_id, 'TASK_OVERDUE', 'app_opened', 'test', 50, "
+            "'[]'::jsonb, '{}'::jsonb, :surfaced_at)"
+        ),
+        {"space_id": space.id, "user_id": space.user_id, "task_id": task.id, "surfaced_at": _NOW},
+    )
+    db_session.commit()
+
+    row = db_session.execute(
+        text("SELECT timezone_name FROM attention_exposures WHERE task_id = :id"), {"id": task.id}
+    ).scalar_one()
+    assert row is None
+
+
+def test_valid_iana_timezone_persists_exactly(db_session: Session) -> None:
+    space = _space(db_session)
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
+    candidate = scoring.score_signal(_task_signal(task))
+
+    exposure = history.record_exposure(
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Europe/London"
+    )
+
+    assert exposure.timezone_name == "Europe/London"
+
+
+def test_asia_kuwait_persists_exactly(db_session: Session) -> None:
+    space = _space(db_session)
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
+    candidate = scoring.score_signal(_task_signal(task))
+
+    exposure = history.record_exposure(
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Asia/Kuwait"
+    )
+
+    assert exposure.timezone_name == "Asia/Kuwait"
+
+
+def test_america_new_york_persists_exactly(db_session: Session) -> None:
+    space = _space(db_session)
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
+    candidate = scoring.score_signal(_task_signal(task))
+
+    exposure = history.record_exposure(
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "America/New_York"
+    )
+
+    assert exposure.timezone_name == "America/New_York"
+
+
+def test_invalid_timezone_rejected_before_persistence(db_session: Session) -> None:
+    space = _space(db_session)
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
+    candidate = scoring.score_signal(_task_signal(task))
+
+    with pytest.raises(InvalidTimezoneError):
+        history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Not/AZone")
+
+    count = db_session.execute(
+        text("SELECT count(*) FROM attention_exposures WHERE task_id = :id"), {"id": task.id}
+    ).scalar_one()
+    assert count == 0
+
+
+def test_record_exposure_has_no_default_for_timezone_name() -> None:
+    """Structural proof against a silently-defaulted timezone: the
+    parameter has no default value at all, so omitting it is a
+    TypeError, not a server-timezone/guessed fallback."""
+    signature = inspect.signature(history.record_exposure)
+    assert signature.parameters["timezone_name"].default is inspect.Parameter.empty
+
+
+def test_two_exposures_for_same_source_may_retain_different_timezone_provenance(db_session: Session) -> None:
+    space = _space(db_session)
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
+    candidate = scoring.score_signal(_task_signal(task))
+
+    first = history.record_exposure(
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo"
+    )
+    second = history.record_exposure(
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12), "America/New_York"
+    )
+
+    assert first.timezone_name == "Africa/Cairo"
+    assert second.timezone_name == "America/New_York"
+
+
+def test_suppression_state_schema_has_no_timezone_field() -> None:
+    """load_suppression_states' own output contract (SuppressionState)
+    is untouched by this checkpoint — timezone_name is exposure
+    provenance, never a suppression-relevant fact."""
+    assert "timezone_name" not in SuppressionState.__dataclass_fields__
+
+
+def test_load_suppression_states_behavior_unchanged_by_timezone_column(db_session: Session) -> None:
+    space = _space(db_session)
+    task = tasks_service.create_task(db_session, space.id, TaskCreate(title="t", due_at=_NOW))
+    candidate = scoring.score_signal(_task_signal(task))
+    history.record_exposure(
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW - timedelta(hours=1), "Asia/Kuwait"
+    )
+
+    states = history.load_suppression_states(db_session, space.id, [("task", task.id)])
+    state = states[("task", task.id)]
+    assert state.surfaced_at == _NOW - timedelta(hours=1)
+    assert state.snoozed_until is None
+    assert state.dismissed_at is None

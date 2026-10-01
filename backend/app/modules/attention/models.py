@@ -32,7 +32,7 @@ class AttentionExposure(BaseModel, SpaceScopedMixin):
     fact — never rewritten by anything in this checkpoint):
       task_id / event_id / inbox_item_id, signal_type, surface,
       policy_version, score, reason_codes, exposure_snapshot,
-      surfaced_at.
+      surfaced_at, timezone_name (Checkpoint 4.4c-1).
 
     MUTABLE feedback (nullable; Checkpoint 4.4a declares these columns
     as part of the accepted table shape but NEVER writes them — no
@@ -76,6 +76,20 @@ class AttentionExposure(BaseModel, SpaceScopedMixin):
     exposure_snapshot: Mapped[dict] = mapped_column(JSONB, nullable=False)
 
     surfaced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Checkpoint 4.4c-1 — the validated IANA timezone context that gave
+    # TASK_DUE_TODAY (and, in principle, any future local-calendar-day
+    # signal) its temporal meaning AT THIS EXPOSURE — exposure-time
+    # provenance, never a permanent user preference, never Ahmed's
+    # "current location". Nullable because every pre-existing 4.4a/4.4b
+    # row has no such provenance at all and is NEVER backfilled with a
+    # guessed value — NULL means "historical timezone provenance
+    # unavailable", which a future ACTED_ON evaluator must treat as
+    # unknown/skip, never a reason to guess. Two exposures for the SAME
+    # source may legitimately carry DIFFERENT timezone_name values (the
+    # user's own request context at each exposure's own time), so this
+    # is deliberately per-row, never looked up from Space/User.
+    timezone_name: Mapped[str | None] = mapped_column(String, nullable=True)
 
     # Declared now (accepted table shape), deliberately never written by
     # 4.4a — see this class's own docstring and history.py's module

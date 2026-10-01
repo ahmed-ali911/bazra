@@ -49,7 +49,7 @@ def _exposure(db_session: Session, space: Space, due_at=_NOW, measurement_second
         snapshot={"due_at": "2026-05-30T12:00:00+00:00", "status": "open"},
     )
     candidate = scoring.score_signal(signal)
-    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW)
+    exposure = history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW, "Africa/Cairo")
     return task, signal, exposure
 
 
@@ -348,8 +348,7 @@ def test_feedback_on_older_exposure_persists_on_that_historical_row(db_session: 
     task, signal, exposure_a = _exposure(db_session, space)
     candidate = scoring.score_signal(signal)
     exposure_b = history.record_exposure(
-        db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12)
-    )
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12), "Africa/Cairo")
 
     # Delayed feedback arrives for the OLDER exposure A.
     result = history.record_dismiss(db_session, space.id, space.user_id, exposure_a.id, _NOW + timedelta(hours=20))
@@ -362,8 +361,7 @@ def test_newer_exposure_remains_current_suppression_authority(db_session: Sessio
     task, signal, exposure_a = _exposure(db_session, space)
     candidate = scoring.score_signal(signal)
     exposure_b = history.record_exposure(
-        db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12)
-    )
+        db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12), "Africa/Cairo")
 
     states = history.load_suppression_states(db_session, space.id, [("task", task.id)])
     assert states[("task", task.id)].surfaced_at == exposure_b.surfaced_at
@@ -375,7 +373,7 @@ def test_old_feedback_cannot_suppress_through_load_suppression_states_when_newer
     space = _space(db_session)
     task, signal, exposure_a = _exposure(db_session, space)
     candidate = scoring.score_signal(signal)
-    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12))
+    history.record_exposure(db_session, space.id, space.user_id, candidate, "app_opened", _NOW + timedelta(hours=12), "Africa/Cairo")
 
     # Dismiss the OLDER exposure A after B already exists.
     history.record_dismiss(db_session, space.id, space.user_id, exposure_a.id, _NOW + timedelta(hours=20))

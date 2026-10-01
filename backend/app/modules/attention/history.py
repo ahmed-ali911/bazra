@@ -30,6 +30,7 @@ create_pending_action.
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
@@ -40,6 +41,7 @@ from app.modules.attention.schemas import (
     SIGNAL_TYPE_ORDER,
     AttentionCandidate,
     AttentionSurface,
+    InvalidTimezoneError,
     SourceType,
     SuppressionState,
 )
@@ -135,6 +137,18 @@ def _require_source_exists_in_space(db: Session, space_id: int, source_type: Sou
         )
 
 
+def _require_valid_timezone(timezone_name: str) -> None:
+    """The same ZoneInfo/IANA validation discipline service.py's own
+    _resolve_zone already established for Signal generation (§4.2) —
+    reused here, never re-implemented differently, since this
+    timezone_name must be the SAME validated context that produced the
+    signals being surfaced, not a separately-trusted string."""
+    try:
+        ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise InvalidTimezoneError(timezone_name) from exc
+
+
 def record_exposure(
     db: Session,
     space_id: int,
@@ -142,6 +156,7 @@ def record_exposure(
     candidate: AttentionCandidate,
     surface: AttentionSurface,
     surfaced_at: datetime,
+    timezone_name: str,
     commit: bool = True,
 ) -> AttentionExposure:
     """Creates exactly ONE durable exposure row for a candidate that was
@@ -159,8 +174,22 @@ def record_exposure(
     earlier moment, which is not the same fact and must never be
     conflated with it.
 
+    timezone_name (Checkpoint 4.4c-1) is REQUIRED — the exact validated
+    IANA timezone context that gave the surfaced Signal its temporal
+    meaning (e.g. what made a TASK_DUE_TODAY signal mean "today"). This
+    is exposure-time provenance, never a permanent user preference —
+    two exposures for the same source may legitimately carry different
+    values. Never defaulted, never silently substituted with a server
+    timezone, the current request's unrelated location, or
+    datetime.now().astimezone() — the caller must supply the SAME
+    timezone context used to generate the signals being surfaced.
+    Validated via the same ZoneInfo/IANA discipline as Checkpoint 4.2's
+    own signal generation; an invalid name raises InvalidTimezoneError
+    BEFORE anything is persisted.
+
     Validates, before writing anything:
     - surface and signal_type are members of the locked value sets.
+    - timezone_name resolves via zoneinfo.
     - space_id is actually owned by user_id (Space.user_id match).
     - the Signal's own source (Task/CalendarEvent/InboxItem) actually
       exists in THIS space, via that source's own scoped getter — never
@@ -181,6 +210,7 @@ def record_exposure(
     if signal.source_type not in _SOURCE_COLUMN_BY_TYPE:
         raise AttentionExposureError(f"Unsupported source_type: {signal.source_type!r}")
 
+    _require_valid_timezone(timezone_name)
     _require_space_owned_by_user(db, space_id, user_id)
     _require_source_exists_in_space(db, space_id, signal.source_type, signal.source_id)
 
@@ -192,6 +222,7 @@ def record_exposure(
         inbox_item_id=signal.source_id if signal.source_type == "inbox_item" else None,
         signal_type=signal.signal_type,
         surface=surface,
+        timezone_name=timezone_name,
         policy_version=scoring.POLICY_VERSION,
         score=candidate.score,
         reason_codes=[

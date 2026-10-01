@@ -1424,6 +1424,59 @@ snooze-phrase parsing (every timestamp `record_snooze` receives is
 already fully resolved by its caller) — all deferred to Checkpoint 4.4c
 or later.
 
+### Checkpoint 4.4c-1
+
+Added `AttentionExposure.timezone_name` (nullable `String`, additive
+migration) and made it a **required** parameter of `record_exposure`.
+
+**What it records**: the validated IANA timezone context that gave the
+surfaced Signal its temporal meaning at exposure time — concretely,
+what made a `TASK_DUE_TODAY` signal mean "today". This is
+**exposure-time provenance, not a user preference**: it is NOT Ahmed's
+permanent timezone, NOT his current location, and NOT something future
+Attention evaluation should assume still applies — two exposures for
+the exact same source may legitimately carry different `timezone_name`
+values if the surfacing context differed between them (proven by a
+dedicated test). This app has no stored per-user timezone preference
+anywhere; timezone is always supplied fresh, per request, matching
+every other place in this codebase that needs one (chat's own request
+parameter, Home's client-computed day boundaries) — `timezone_name`
+here is captured the same way, at the moment of surfacing, never
+assumed from anywhere else.
+
+**Why nullable**: every pre-existing 4.4a/4.4b exposure row has no
+timezone provenance at all and is **never backfilled** with a guessed
+value — a historical `NULL` means "provenance unavailable," and a
+future ACTED_ON evaluator must treat that as unknown/skip, never guess.
+
+**Validation**: the exact same `zoneinfo`/IANA discipline Checkpoint
+4.2's own `generate_signals` already established — an unresolvable name
+raises `InvalidTimezoneError` *before* anything is persisted (proven:
+zero rows are created on a rejected value). `record_exposure`'s
+`timezone_name` parameter has no default value at all (proven by a
+structural signature test) — never a server timezone, never
+`datetime.now().astimezone()`, never a hard-coded fallback.
+
+**Unaffected by this change** (proven by the full, unmodified 4.4a/4.4b
+test suites still passing): `load_suppression_states`'s own output
+(`SuppressionState` has no `timezone_name` field at all — suppression
+was never timezone-dependent), `record_snooze`, `record_dismiss`,
+cooldown, stale-exposure handling, and score/policy provenance.
+
+Still not implemented: the ACTED_ON evaluator itself, any mutation-time
+hooks into Task/CalendarEvent/InboxItem, and the same-transaction vs.
+`SAVEPOINT`-isolated write question the 4.4c architecture inspection
+raised. **One accepted correction to that inspection, recorded here
+for the implementation that follows**: ACTED_ON attribution must never
+be allowed to make an otherwise-valid Task/CalendarEvent/InboxItem
+mutation fail — domain truth outranks derived Attention evidence. The
+inspection's proposed same-transaction, all-or-nothing atomicity was
+**not** accepted; a later checkpoint (4.4c-3) must instead use a local
+isolation mechanism (e.g. a Postgres `SAVEPOINT`/SQLAlchemy nested
+transaction) so an Attention-attribution failure can roll back only the
+derived Attention write while the authoritative domain mutation still
+succeeds. Not implemented in this slice.
+
 ## Run locally (without Docker)
 
 ```bash
