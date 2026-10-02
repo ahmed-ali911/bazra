@@ -2041,6 +2041,60 @@ example.
   something this checkpoint's narrow narration-wording changes attempt
   to fix.
 
+### Phase 4 — Attention & Proactive Presence: CLOSED (Checkpoint 4.8)
+
+Final acceptance audit (code + tests + a thin, cross-component
+Phase 4 scenario matrix — `attention/tests/test_phase4_closure.py`)
+confirmed the full accepted pipeline behaves coherently as one
+product, with zero production-code defects found. **Zero
+production-code changes were made in this checkpoint** — it is a
+verification/closure gate only.
+
+**V1 policy constants** (product policy, not learned behavior):
+`PROACTIVE_FREQUENCY_WINDOW = 30min`, `ACTIVE_CONVERSATION_WINDOW =
+10min`, `SAME_CONCERN_REPEAT_WINDOW = 24h` (all in
+`attention/app_opened.py`); per-source `_COOLDOWN = 12h` and
+`app_opened` scoring threshold `= 45` (both in `attention/scoring.py`).
+
+**BAZRA can:**
+- deterministically identify attention-worthy current concerns
+- decide to remain silent (a normal, successful outcome, never an error)
+- proactively surface at most one selected concern on the V1
+  APP_OPENED trigger
+- avoid excessive repetition both globally (any proactive topic) and
+  per-concern (the same unresolved concern specifically)
+- narrate the concern naturally through the model, with independent
+  mutation-claim verification before any model text is trusted
+- revalidate the selected concern against live state immediately
+  before surfacing, under the same short advisory-locked transaction
+  that persists it
+- persist a proactive opening atomically (one `ChatMessage` + one
+  `AttentionExposure`, together or not at all) into the normal
+  conversation stream — no special proactive bubble
+- attribute resolution (`acted_on_at`) to a prior exposure when a
+  qualifying domain mutation resolves its concern
+
+**BAZRA cannot yet** (explicitly deferred, not accidentally solved):
+- reliably know that Ahmed genuinely returned after a meaningful
+  absence — APP_OPENED remains a V1 evaluation *trigger*, never
+  presence proof; true Attention Resume is unimplemented
+- proactively notify outside the open app (no push/SMS/email/
+  Telegram/WhatsApp delivery, no background scheduler)
+- run a Daily Brief
+- perform full Read-the-Room / personality adaptation (a casual,
+  social remark should not automatically become a productivity nudge —
+  documented as real-use evidence, not fixed)
+- detect or prevent semantic/near-duplicate Task rows (confirmed root
+  cause of an earlier real-use repetition report — two distinct
+  `task_id` values, not a cooldown defect)
+- survive Anthropic provider/credit exhaustion through alternate
+  model/provider routing, cheap-vs-powerful routing, or deterministic
+  zero-LLM fallbacks for ordinary chat
+- gain any new action authority merely by proactively speaking — all
+  write authority remains exclusively Phase 3's explicit
+  mutation-intent → `ProposedAction` → adjacent confirmation →
+  `confirm_and_execute` chain, unchanged
+
 ## Phase 3 — Transaction Hardening
 
 ### Checkpoint 3.H1
