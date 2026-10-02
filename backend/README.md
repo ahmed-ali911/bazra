@@ -1861,6 +1861,97 @@ Attention Resume (presence/session tracking), Daily Brief, background
 notifications, push/SMS/email/Telegram/WhatsApp delivery, a full
 Personality/Emotion Engine, and any learned/adaptive ranking.
 
+### Checkpoint 4.6 — Chat Presentation Hardening
+
+Presentation-only hardening of the existing Chat screen (`ChatPage.tsx`,
+now split into `ChatMessageBubble.tsx`/`DaySeparator.tsx`/
+`groupMessagesByDay.ts`/`formatMessageDate.ts`) plus one narrow backend
+prompt fix — no Attention/narration/action-authority architecture
+touched.
+
+**Chat supports bilingual, bidi-aware content** — Arabic, English, and
+mixed-language messages (an English task title inside an Arabic
+sentence, an Arabic quotation inside an English sentence, inline
+identifiers like `RCIP-6`) all render naturally. This uses only
+standards-based browser bidi resolution (`dir="auto"` on each
+block-level element — paragraph, list, list item — so each one resolves
+its own direction independently from its own first strong character)
+plus CSS logical properties (`padding-inline-start`) and
+`unicode-bidi: isolate` for inline code/identifiers — never a manual
+language detector, regex layout hack, or inserted Unicode direction
+mark. Message bubble PLACEMENT (which side) is tied to the sender's
+`role` alone, exactly as before — content direction never swaps bubble
+ownership.
+
+**Assistant Markdown is rendered safely** — a new, narrow dependency,
+`react-markdown` (+ `remark-breaks` for single-newline soft breaks),
+renders paragraphs/bold/italic/lists/inline code as real semantic HTML
+(`<strong>`/`<ul>`/`<li>`/`<code>`, never literal `**`/`-`/`` ` ``
+characters or decorative bullet strings). Raw HTML is never rendered as
+live elements (`skipHtml` is passed explicitly, not relied on as an
+implicit default) — a `<script>`, an `<img onerror>`, or a
+`javascript:` link in ChatMessage content (which may originate from the
+user, the model, or deterministic application text, and is always
+treated as untrusted presentation content) can never execute. User
+messages are preserved faithfully as plain text (bidi/newline-aware,
+but never Markdown-transformed) — what Ahmed types is never
+reinterpreted into something semantically different.
+
+**Message timestamps use the persisted `ChatMessage.created_at`** —
+never frontend render time, browser "now", or APP_OPENED evaluation
+time — formatted as a small, quiet, secondary local time (e.g. `4:27
+PM`), via the browser's own local-timezone `Date` behavior (the same
+convention `localDayBoundaries.ts` already established — no separate
+IANA timezone string, no new timezone preference system). **Day
+separators** ("Today" / "Yesterday" / a short explicit date) group the
+conversation by local calendar day, derived the same way, with the
+relative Today/Yesterday classification parameterized by an explicit
+reference instant so it stays deterministically testable rather than
+depending on real wall-clock time in tests.
+
+**Internal identifiers are not normal user-facing prose.** The
+`(task_id=N)` / `(event_id=N)` annotations `chat/context.py`'s
+`_format_task_line`/`_format_agenda_line` still legitimately emit into
+"Current Data" remain unchanged and necessary — they are the model's
+own internal targeting reference for `propose_update_task`/
+`propose_delete_task`/etc. The fix is a new, explicit instruction in
+the shared chat system prompt (`orchestrator/service.py`):
+these raw identifiers exist only for tool-call targeting and must never
+appear in the natural-language text shown to the user, who should hear
+about an item by its title, the way a person would. This is a
+prompt-level discipline fix at the generation boundary, deliberately
+**not** a frontend regex/CSS strip of `(task_id=...)` text (which would
+hide the symptom without fixing the actual contract, and could as
+easily mis-strip legitimate content) — the same class of limitation as
+narration's own mutation-claim verifier: the instruction is real and
+tested to be present in every chat system prompt, but, like any prompt
+instruction, is not a hard code-level guarantee against every possible
+model output.
+
+**APP_OPENED proactive messages use the exact same Chat renderer** —
+they are persisted as ordinary `role="assistant"` `ChatMessage` rows
+(unchanged from 4.5e) and rendered by the same `ChatMessageBubble`
+every other assistant message uses; no special proactive bubble type
+exists. The one narrow change here is to the proactive narration
+prompt's own wording (`_PROACTIVE_NARRATION_INSTRUCTIONS`): describe
+the authoritative stored concern directly rather than presuming the
+user forgot or remembers it, and vary the invitation phrasing rather
+than reaching for one fixed template — a conversational-quality
+adjustment, not new personality architecture, and not a change to
+4.5c's decision policy, 4.5d's verifier, or 4.5e's revalidation/
+persistence.
+
+**No schema change, no migration** — every table already existed;
+historical plain-text `ChatMessage` rows continue rendering safely
+through the same renderer (Markdown/bidi/timestamp handling is applied
+at presentation time only, never backfilled into stored content).
+
+Deliberately **not** done here: any Attention/ranking/action-authority
+change, a broader Chat visual redesign (navigation, composer, color
+system), Personality Engine work, or a real-provider live gate (none
+was needed or run — the prompt wording change is covered entirely by
+existing mocked tests).
+
 ## Phase 3 — Transaction Hardening
 
 ### Checkpoint 3.H1

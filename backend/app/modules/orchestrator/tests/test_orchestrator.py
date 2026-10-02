@@ -63,6 +63,33 @@ def test_generate_reply_builds_correct_message_list_and_system_prompt(monkeypatc
     assert "NO ability to edit, delete, mark complete" in captured["system"]
 
 
+def test_system_prompt_instructs_never_to_surface_internal_ids_in_prose(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 4.6 — the regression at the layer where the task_id=N/
+    event_id=N leak originates: chat/context.py's own _format_task_line
+    still legitimately emits "(task_id=N)" into "Current Data" (the
+    model's OWN internal targeting reference for propose_* tools — see
+    that module's docstring, unchanged here), but the shared system
+    prompt every chat turn uses must explicitly forbid repeating that
+    raw id in the model's user-facing natural-language reply."""
+    captured = {}
+
+    def _fake_complete(*, purpose, messages, system=None, tools=None):
+        captured["system"] = system
+        return _FakeModelResponse(text="canned reply")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    orchestrator_service.generate_reply(
+        history=[], context="- Call Hussein (task_id=12)", user_message="what's open?",
+        current_datetime_local=_ANCHOR,
+    )
+
+    system = captured["system"]
+    assert "never show one of these raw identifiers" in system
+    assert "task_id=N" in system  # names the exact annotation this forbids repeating
+    assert "by their title or name" in system
+
+
 def test_generate_reply_with_tools_offered_returns_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
@@ -749,6 +776,32 @@ def test_generate_app_opened_narration_text_uses_identity_and_one_topic_instruct
     assert "ONE attention topic" in system
     assert "never phrase it as asking permission to execute one specific write" in system
     assert "Never mention scores, thresholds, signal types, ranking, suppression" in system
+
+
+def test_proactive_narration_instructs_direct_concern_description_over_presumptuous_framing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 4.6 — narrow factual/conversational hardening: never
+    infer that the user forgot/remembers/discussed/promised, and vary
+    the invitation wording rather than reaching for one fixed phrase."""
+    captured = {}
+
+    def _fake_complete(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(text="x")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    orchestrator_service.generate_app_opened_narration_text(
+        signal_type="TASK_OVERDUE", title="Call Hussein", priority="high"
+    )
+
+    system = captured["system"]
+    assert (
+        "never infer or imply that the user forgot it, still remembers it, "
+        "previously discussed it, promised someone" in system
+    )
+    assert "Vary this invitation's own wording naturally" in system
 
 
 # ---- Checkpoint 3.25: independent mutation-claim verifier -------------------

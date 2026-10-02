@@ -5,6 +5,9 @@ import { Button } from "../../design-system/components/Button";
 import { EmptyState } from "../../design-system/components/EmptyState";
 import { ErrorState } from "../../design-system/components/ErrorState";
 import { LoadingState } from "../../design-system/components/LoadingState";
+import { ChatMessageBubble } from "./ChatMessageBubble";
+import { DaySeparator } from "./DaySeparator";
+import { groupMessagesByDay } from "./groupMessagesByDay";
 import { useChatMessages } from "./useChatMessages";
 import { useSendChatMessage } from "./useSendChatMessage";
 
@@ -38,22 +41,13 @@ export function ChatPage() {
 
       {messages && messages.length > 0 ? (
         <div style={{ display: "flex", flexDirection: "column", gap: "var(--space-2)" }} role="list">
-          {messages.map((message) => (
-            <div
-              key={message.id}
-              role="listitem"
-              aria-label={`${message.role} message`}
-              style={{
-                alignSelf: message.role === "user" ? "flex-end" : "flex-start",
-                background: message.role === "user" ? "var(--color-bg-accent-subtle)" : "var(--color-bg-subtle)",
-                padding: "var(--space-3)",
-                borderRadius: "var(--radius-md)",
-                maxWidth: "70%",
-              }}
-            >
-              <p className="text-[var(--color-text-body)]">{message.content}</p>
-            </div>
-          ))}
+          {groupMessagesByDay(messages).map((entry) =>
+            entry.kind === "separator" ? (
+              <DaySeparator key={entry.key} label={entry.label} />
+            ) : (
+              <ChatMessageBubble key={entry.key} message={entry.message} />
+            ),
+          )}
         </div>
       ) : (
         <EmptyState
