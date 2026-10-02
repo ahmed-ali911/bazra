@@ -1654,6 +1654,58 @@ on top of `confirm_and_execute`.
 temporal/state association evidence only — never a success score,
 never causal credit, never a signal of user preference.
 
+### Checkpoint 4.5c
+
+Added `attention/app_opened.py` — a pure, read-only
+`evaluate_app_opened(db, space_id, user_id, now, timezone_name) ->
+AppOpenedDecision` deciding whether BAZRA should speak first the next
+time the app opens, and about what. Zero commits, zero writes (no
+`AttentionExposure`, `ChatMessage`, domain, or `ProposedAction` row is
+ever touched), zero provider/model calls, zero new migration.
+
+**Terminology, locked**: this is a **Proactive Frequency Gate**
+(`PROACTIVE_FREQUENCY_WINDOW = 30min`), never "Attention Resume." It
+does not detect that Ahmed genuinely returned after an absence — there
+is no session/presence/heartbeat/last-seen state anywhere in this
+repository, and this checkpoint deliberately adds none. It only asks
+"has `app_opened` already surfaced something recently enough (derived
+solely from `MAX(AttentionExposure.surfaced_at) WHERE surface=
+'app_opened'`, scoped by space, never by source) that it should stay
+quiet regardless of what triggered this evaluation?" A future
+frontend "app opened" event is only ever a trigger to *re-run this
+policy* — never itself evidence of genuine human return. True
+Attention Resume remains out of scope, undesigned, and unscheduled.
+
+**Gate order** (each short-circuits the next): Proactive Frequency →
+Moment Quality (pending `ProposedAction` via the existing, unmodified
+`actions_service.get_latest_pending`; an active conversation — any
+`ChatMessage` within the last 10 minutes, a new self-contained query) →
+Attention Selection (the existing, unmodified `generate_signals` →
+`load_suppression_states` → `rank_for_surface(..., surface=
+"app_opened")` pipeline). "No eligible candidate" is an Attention
+Selection outcome, not a Moment Quality failure — it has its own reason
+code.
+
+**Winner Invariant**: a non-empty `rank_for_surface` result does not
+imply a winner (eligible candidates sort first, but suppressed ones
+still follow in the same list) — the first candidate with
+`suppression.suppressed is False` is selected; `ranked[0]` is never
+assumed to be it.
+
+**No quiet-hours gate** — opening the app is an explicit, intentional
+action, not an unsolicited push; an eligible winner at 2 AM local time
+still produces `outcome="speak"`.
+
+**Boundary conventions, both symmetric** ("exactly N old" does **not**
+block): an exposure exactly 30 minutes old passes the frequency gate; a
+`ChatMessage` exactly 10 minutes old does not count as an active
+conversation. Both proven at the exact boundary, not just nearby.
+
+Deliberately **not** implemented here (later checkpoints): any
+production wiring (API endpoint, frontend trigger), narration, actually
+calling `record_exposure`, advisory locking, user-message-wins-a-race
+handling, or stale-candidate revalidation.
+
 ## Phase 3 — Transaction Hardening
 
 ### Checkpoint 3.H1
