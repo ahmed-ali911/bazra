@@ -1706,6 +1706,66 @@ production wiring (API endpoint, frontend trigger), narration, actually
 calling `record_exposure`, advisory locking, user-message-wins-a-race
 handling, or stale-candidate revalidation.
 
+### Checkpoint 4.5d
+
+Added `narration/service.py` (`generate_app_opened_narration`) and a
+narrow `orchestrator_service.generate_app_opened_narration_text`
+addition — the **HOW** layer that turns one already-selected 4.5c
+`AttentionCandidate` into one short, natural opening line. **WHAT**
+deserves attention and **WHETHER** BAZRA should speak remain entirely
+owned by 4.5c, unchanged — this checkpoint consumes that decision's own
+output; it never re-runs `generate_signals`/`load_suppression_states`/
+`rank_for_surface`, and has no `db` dependency at all.
+
+**Privacy minimization**: only three scalar facts ever reach the model
+— `signal_type`, `title`, and `priority` (omitted entirely for non-task
+signals) — read directly off the selected candidate's own `Signal`.
+No score, reason codes, snapshot, source id, timestamp, Context
+Assembly, Memory, or chat history is ever sent.
+
+**Every model-authored narration passes the existing, unmodified
+Checkpoint 3.25 `verify_no_mutation_claim`** before it may be returned
+as `source="model"` — the same fail-closed policy `chat_service`'s own
+`_candidate_reply_is_safe_to_show` already established (a verifier
+contract failure is treated exactly like an explicit unsafe
+certification; never retried, never "repaired", never a second
+narration call). **Limitation, stated explicitly rather than implied**:
+this verifier proves only that the text doesn't claim BAZRA already
+completed a mutation — it is *not* a general factual-grounding check.
+V1's mitigation is structural, not a second verifier: the model is
+handed so little that there is almost nothing left to hallucinate
+about.
+
+**Any failure before a model narration is fully certified** —
+provider error, empty/malformed result, an explicit unsafe
+certification, or a verifier contract failure — discards the model
+text completely and returns a **deterministic, application-authored
+fallback** instead, built only from the same candidate facts (one
+fixed Arabic template per locked v1 signal type, plus a
+"(أولوية عالية)" suffix only when the candidate's own `priority` is
+literally `"high"`). The fallback is never passed through the
+verifier — it is not model-authored, so there is nothing to verify.
+
+**Provider call budget**: a successful model path is exactly one
+narration call plus one verification call. A narration provider
+failure is exactly one call attempt and zero verification calls. A
+verifier block or verifier failure is exactly one narration call plus
+one verification call. There is never a retry, a repair call, or a
+second provider.
+
+**Zero persistence** — no `ChatMessage`, `AttentionExposure`,
+`ProposedAction`, or domain write of any kind; no `db.commit()`
+anywhere in this module. `proactive_narration` was added as a new
+`ModelCallPurpose` (model_router's own closed, extensible set) using
+the existing default model — no new provider, no routing architecture
+change, no migration (`AiTrace.purpose` is a plain String column).
+
+Deliberately **not** implemented here (later checkpoints): the actual
+production API endpoint/frontend trigger, persisting a narrated
+opening as a real `ChatMessage`/`AttentionExposure`, final source
+revalidation immediately before surfacing (`candidate_became_stale`,
+`user_message_won_race`), and any advisory-lock wiring.
+
 ## Phase 3 — Transaction Hardening
 
 ### Checkpoint 3.H1

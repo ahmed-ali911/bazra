@@ -665,6 +665,92 @@ def test_generate_tool_result_reply_wraps_model_router_error(monkeypatch: pytest
         )
 
 
+# ---- Checkpoint 4.5d: proactive narration (HOW only) -----------------------
+
+
+def test_generate_app_opened_narration_text_sends_only_the_three_scalar_facts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def _fake_complete(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(text="عندك مهمة متأخرة تستاهل نبص عليها.")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    result = orchestrator_service.generate_app_opened_narration_text(
+        signal_type="TASK_OVERDUE", title="Call Hussein", priority="high"
+    )
+
+    assert result == "عندك مهمة متأخرة تستاهل نبص عليها."
+    assert captured["purpose"] == "proactive_narration"
+    assert captured["tools"] is None
+    assert captured["messages"] == [
+        {"role": "user", "content": "Selected attention topic:\nsignal_type: TASK_OVERDUE\ntitle: Call Hussein\npriority: high"}
+    ]
+    assert "Call Hussein" in captured["messages"][0]["content"]
+    # Privacy boundary: nothing beyond the three scalar facts ever
+    # appears anywhere in the outbound call.
+    assert "score" not in captured["messages"][0]["content"]
+    assert "source_id" not in captured["messages"][0]["content"]
+
+
+def test_generate_app_opened_narration_text_omits_priority_when_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def _fake_complete(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(text="عندك موعد قريب.")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    orchestrator_service.generate_app_opened_narration_text(
+        signal_type="EVENT_UPCOMING", title="Team sync", priority=None
+    )
+
+    assert captured["messages"] == [
+        {"role": "user", "content": "Selected attention topic:\nsignal_type: EVENT_UPCOMING\ntitle: Team sync"}
+    ]
+    assert "priority" not in captured["messages"][0]["content"]
+
+
+def test_generate_app_opened_narration_text_raises_orchestrator_error_on_provider_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(**kwargs):
+        raise orchestrator_service.model_router_service.ModelRouterError("provider_error")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
+
+    with pytest.raises(orchestrator_service.OrchestratorError):
+        orchestrator_service.generate_app_opened_narration_text(
+            signal_type="TASK_OVERDUE", title="Call Hussein", priority="high"
+        )
+
+
+def test_generate_app_opened_narration_text_uses_identity_and_one_topic_instructions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = {}
+
+    def _fake_complete(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(text="عندك مهمة متأخرة.")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    orchestrator_service.generate_app_opened_narration_text(
+        signal_type="TASK_OVERDUE", title="Call Hussein", priority="high"
+    )
+
+    system = captured["system"]
+    assert "Who you are" in system  # BAZRA_IDENTITY_INSTRUCTIONS reused verbatim
+    assert "ONE attention topic" in system
+    assert "never phrase it as asking permission to execute one specific write" in system
+    assert "Never mention scores, thresholds, signal types, ranking, suppression" in system
+
+
 # ---- Checkpoint 3.25: independent mutation-claim verifier -------------------
 
 

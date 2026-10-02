@@ -9,9 +9,11 @@ from typing import Literal
 # verifier in Checkpoint 3.25) rather than accepting an arbitrary string.
 ModelCallPurpose = Literal[
     "chat_completion", "memory_extraction", "tool_result_reasoning", "claim_verification",
+    "proactive_narration",
 ]
 VALID_PURPOSES: frozenset[str] = frozenset({
     "chat_completion", "memory_extraction", "tool_result_reasoning", "claim_verification",
+    "proactive_narration",
 })
 
 
