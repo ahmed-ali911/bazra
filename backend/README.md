@@ -1766,6 +1766,101 @@ opening as a real `ChatMessage`/`AttentionExposure`, final source
 revalidation immediately before surfacing (`candidate_became_stale`,
 `user_message_won_race`), and any advisory-lock wiring.
 
+### Checkpoint 4.5e
+
+Wires 4.5c (WHAT/WHETHER) and 4.5d (HOW) into the first production
+flow where BAZRA may actually persist and surface an assistant-
+initiated opening: `POST /api/v1/attention/app-opened` →
+`attention/surfacing.py::evaluate_and_surface_app_opened`.
+
+**V1 trigger, not Attention Resume** — unchanged terminology from
+4.5c: the frontend calls this endpoint once per fresh `AppShell` mount
+(see `useAppOpenedTrigger`), which persists across Home/My
+World/Chat navigation via React Router's own `<Outlet>` (AppShell
+itself never remounts on route change) and is never retriggered by
+background→foreground or network reconnect — no visibility/focus/
+online/reconnect listener exists anywhere in this codebase. A
+module-scoped once-per-page-load guard on the frontend exists purely
+as an optimization against React StrictMode's dev-only double-invoke;
+it is **never** the correctness boundary and is backed by no
+browser storage. The backend's own Proactive Frequency Gate is the
+only real authority over whether another opening is allowed.
+
+**Locked pipeline** (see `surfacing.py`'s own module docstring for the
+full picture): Phase A (no advisory lock) captures the evaluation
+anchor and calls the unmodified `evaluate_app_opened`; a 4.5c SILENCE
+returns immediately with zero narration/verifier calls and zero
+writes. Phase B (still no advisory lock) calls the unmodified
+`generate_app_opened_narration` — the only phase that may take real
+provider-latency seconds. Phase C acquires the **exact same**
+`(space_id, user_id)` advisory-lock key `chat_service`'s own
+conversation turns already use (via a new, thin, behavior-identical
+`chat_service.acquire_conversation_lock` public wrapper around the
+existing private lock helper) and, under that lock, re-checks — fresh,
+against current state — **user-message-wins** (a real persisted
+`ChatMessage.id` anchor captured at the very start, never a client or
+wall-clock timestamp), **pending-action-appeared**, a **surface-wide
+frequency recheck** (a new `app_opened.frequency_gate_passes` public
+wrapper around the exact same, unmodified 30-minute gate 4.5c already
+applies), and **selected-candidate revalidation** (a new
+`attention/revalidation.py`, reusing the existing, unmodified
+Checkpoint 4.4c-2 `resolution.evaluate_acted_on` per-signal-type
+lifecycle predicate rather than duplicating it — a source that no
+longer exists, per its own scoped getter returning `None`, or whose
+concern `evaluate_acted_on` reports `RESOLVED`, is stale). If and only
+if all four pass, the assistant `ChatMessage` and the `AttentionExposure`
+are persisted together, `commit=False` on both, under **one**
+authoritative `db.commit()`.
+
+**Stale-candidate policy, locked**: any finalization failure is
+SILENCE — never a cascade to a runner-up candidate, never a second
+narration call, never a rerank. The narration in hand describes
+exactly the one candidate that was selected; surfacing it about a
+different one would be a truth mismatch.
+
+**Exposure semantics, locked**: a successful `AttentionExposure` write
+means the backend committed a proactive item intended for
+presentation — it does **not** prove the frontend rendered it or that
+Ahmed actually saw it. No `rendered_at`/`seen_at`/delivery-receipt
+exists or is planned for V1.
+
+**Action authority, unchanged and absolute**: this checkpoint creates
+no `ProposedAction`, ever. The persisted assistant `ChatMessage` is a
+genuine, normal conversational turn in the exact same stream and table
+ordinary chat uses — not a fake user message, not special-cased — so a
+later bare "yes" is ordinary chat input, routed entirely by
+`chat_service`'s own existing logic, with no new action authority of
+any kind. An older, still-genuinely-pending confirmation prompt is
+structurally guaranteed to never coexist with a surfaced proactive
+opening in the first place — 4.5c's own Moment Quality pending-action
+gate (checked initially) and this checkpoint's own finalization recheck
+(checked again, under the same lock a new `create_pending_action` call
+would also need) both block surfacing whenever a real pending proposal
+exists; and the proactive `ChatMessage`'s own id, once persisted, folds
+into the existing `is_still_conversationally_adjacent` adjacency query
+exactly like any other message — no special-casing needed or added.
+
+**Concurrency, proven against real Postgres, not assumed**: (1) a
+second connection can acquire the same advisory-lock key *while
+narration is in flight* (Phase B), proving the lock is never held
+across provider latency; (2) two genuinely simultaneous requests for
+the same conversation both pass 4.5c and both narrate, but only one
+commits — the loser's own finalization-time frequency recheck sees the
+winner's fresh exposure and returns silence, with exactly one
+`ChatMessage` and one `AttentionExposure` row ever durable; (3) a
+forced failure of the single final `db.commit()` (after both rows were
+already flushed) leaves neither row durable, verified from a
+completely independent fresh session — the same empirical standard
+3.H2 established.
+
+**No schema change** — every table this checkpoint writes to
+(`chat_messages`, `attention_exposures`) already existed; no migration.
+
+Deliberately **not** implemented here (future checkpoints/phases): true
+Attention Resume (presence/session tracking), Daily Brief, background
+notifications, push/SMS/email/Telegram/WhatsApp delivery, a full
+Personality/Emotion Engine, and any learned/adaptive ranking.
+
 ## Phase 3 — Transaction Hardening
 
 ### Checkpoint 3.H1

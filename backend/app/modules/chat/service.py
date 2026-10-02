@@ -731,6 +731,18 @@ def _acquire_conversation_lock(db: Session, space_id: int, user_id: int) -> None
     db.execute(text("SELECT pg_advisory_xact_lock(hashtext(:lock_key))"), {"lock_key": lock_key})
 
 
+def acquire_conversation_lock(db: Session, space_id: int, user_id: int) -> None:
+    """Checkpoint 4.5e — a thin public re-export of the exact same
+    (space_id, user_id) advisory-lock primitive this module already
+    uses for its own conversation turns (see _acquire_conversation_lock
+    above) — reused as-is, never a second lock namespace, by
+    attention/surfacing.py's own finalization phase. A proactive
+    APP_OPENED opening and an ordinary chat turn for the same
+    (space_id, user_id) are, by design, serialized against the exact
+    same key."""
+    _acquire_conversation_lock(db, space_id, user_id)
+
+
 def record_user_message(
     db: Session, space_id: int, user_id: int, content: str, commit: bool = True
 ) -> ChatMessage:

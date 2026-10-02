@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1 import health
+from app.modules.attention.router import router as attention_router
 from app.modules.auth.router import router as auth_router
 from app.modules.calendar.router import router as calendar_router
 from app.modules.chat.router import router as chat_router
@@ -18,3 +19,4 @@ api_router.include_router(calendar_router, tags=["calendar"])
 api_router.include_router(inbox_router, tags=["inbox"])
 api_router.include_router(home_router, tags=["home"])
 api_router.include_router(chat_router, tags=["chat"])
+api_router.include_router(attention_router, tags=["attention"])

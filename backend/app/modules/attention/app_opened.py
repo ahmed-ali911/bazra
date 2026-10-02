@@ -151,6 +151,17 @@ def _has_recent_chat_activity(db: Session, space_id: int, user_id: int, now: dat
     return exists is not None
 
 
+def frequency_gate_passes(db: Session, space_id: int, now: datetime) -> bool:
+    """Checkpoint 4.5e — a thin public re-export of the exact same
+    Proactive Frequency Gate `evaluate_app_opened` already applies
+    below, reused (never duplicated or reimplemented) by
+    attention/surfacing.py's own finalization-time recheck — see that
+    module's own docstring for why a fresh recheck under the advisory
+    lock is required even though `evaluate_app_opened` already checked
+    this once, earlier, before narration."""
+    return _proactive_frequency_gate_passes(db, space_id, now)
+
+
 def evaluate_app_opened(
     db: Session, space_id: int, user_id: int, now: datetime, timezone_name: str
 ) -> AppOpenedDecision:

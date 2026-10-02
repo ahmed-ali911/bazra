@@ -2,6 +2,10 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from pydantic import BaseModel
+
+from app.modules.chat.schemas import ChatMessageResponse
+
 # Checkpoint 4.2 — the locked v1 signal set. Memory is deliberately
 # excluded (Architecture Contract 4.0b): every other future signal type
 # is a distinct, later architectural decision, not an oversight here.
@@ -246,3 +250,33 @@ class InboxMutationState:
 
     read_at: datetime | None
     archived_at: datetime | None
+
+
+# ==================================================
+# Checkpoint 4.5e — APP_OPENED production API contract
+# ==================================================
+#
+# The ONLY two Pydantic (API-facing) models in this file — every type
+# above this point is an internal, provider-free domain dataclass.
+# `timezone` is the sole field the client legitimately supplies (the
+# same accepted timezone mechanism chat's own SendMessageRequest
+# already uses) — the request schema structurally cannot carry a
+# candidate, score, signal type, source id, narration text,
+# surfaced_at, or a client-supplied `now`: the backend derives all of
+# those itself, and there is no field here for a client to even
+# attempt to inject them into.
+
+
+class AppOpenedRequest(BaseModel):
+    timezone: str
+
+
+class AppOpenedResponse(BaseModel):
+    """`message` is populated only when status == "surfaced". Internal
+    policy reasoning (score, suppression, fallback_reason, verifier
+    outcome, which signal_type won) is deliberately never exposed
+    here — the router maps attention.surfacing.AppOpenedSurfaceResult
+    down to exactly this narrow shape."""
+
+    status: Literal["silence", "surfaced"]
+    message: ChatMessageResponse | None = None
