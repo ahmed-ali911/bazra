@@ -798,10 +798,12 @@ def test_proactive_narration_instructs_direct_concern_description_over_presumptu
 
     system = captured["system"]
     assert (
-        "never infer or imply that the user forgot it, still remembers it, "
-        "previously discussed it, promised someone" in system
+        "never infer or imply that the user forgot it, still remembers it, was "
+        "reminded about it before, previously discussed it, promised someone, "
+        "feels guilty about it, is avoiding it" in system
     )
     assert "Vary this invitation's own wording naturally" in system
+    assert "never operational or customer-service phrasing" in system
 
 
 # ---- Checkpoint 3.25: independent mutation-claim verifier -------------------

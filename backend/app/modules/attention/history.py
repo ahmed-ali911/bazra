@@ -467,6 +467,38 @@ def _get_latest_exposure(
     ).scalars().first()
 
 
+def get_latest_exposure_for_concern(
+    db: Session, space_id: int, source_type: SourceType, source_id: int, signal_type: str, surface: AttentionSurface
+) -> AttentionExposure | None:
+    """Checkpoint 4.7 — the authoritative evidence behind the Same-Concern
+    Repeat Gate (attention/app_opened.py's own same_concern_recently_surfaced):
+    "the last time THIS surface proactively surfaced THIS EXACT signal_type
+    for THIS source" — a narrower identity than both
+    load_suppression_states' own (source_type, source_id)-only cooldown
+    scope (which deliberately ignores signal_type/surface, since it is a
+    cross-surface, cross-signal-type suppression) and _get_latest_exposure's
+    own "across all surfaces" ACTED_ON-attribution scope. Returns the real
+    row (never a derived summary) so the caller can compare its own
+    exposure_snapshot against the current Signal's snapshot — the same
+    snapshot-equality convention evaluate_gates' own DISMISSED_UNCHANGED
+    gate already established, reused here rather than inventing a second
+    "what counts as changed" rule. No new table, no new column — this is a
+    read-only query over the exact same accepted AttentionExposure history.
+    """
+    column = _SOURCE_COLUMN_BY_TYPE[source_type]
+    return db.execute(
+        select(AttentionExposure)
+        .where(
+            AttentionExposure.space_id == space_id,
+            AttentionExposure.surface == surface,
+            AttentionExposure.signal_type == signal_type,
+            column == source_id,
+        )
+        .order_by(AttentionExposure.surfaced_at.desc(), AttentionExposure.id.desc())
+        .limit(1)
+    ).scalars().first()
+
+
 def attempt_acted_on_attribution(
     db: Session,
     space_id: int,

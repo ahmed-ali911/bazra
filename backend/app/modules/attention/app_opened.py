@@ -82,8 +82,20 @@ from app.modules.chat.models import ChatMessage
 PROACTIVE_FREQUENCY_WINDOW = timedelta(minutes=30)
 ACTIVE_CONVERSATION_WINDOW = timedelta(minutes=10)
 
+#: Checkpoint 4.7 — a V1 PRODUCT POLICY CONSTANT, not a learned value and
+#: not an architectural truth. Deliberately SEPARATE from, and longer
+#: than, scoring.py's own general-purpose 12h per-source COOLDOWN (which
+#: stays unchanged and still applies across every surface, including
+#: app_opened, for every candidate regardless of signal_type/snapshot).
+#: This window answers a narrower question specific to THIS surface:
+#: "did app_opened proactively raise this EXACT same unresolved concern
+#: recently enough that repeating it would feel like nagging?" — see
+#: same_concern_recently_surfaced's own docstring.
+SAME_CONCERN_REPEAT_WINDOW = timedelta(hours=24)
+
 SilenceReason = Literal[
-    "proactive_frequency", "pending_action", "active_conversation", "no_eligible_candidate"
+    "proactive_frequency", "pending_action", "active_conversation", "no_eligible_candidate",
+    "same_concern_recently_surfaced",
 ]
 
 
@@ -151,6 +163,60 @@ def _has_recent_chat_activity(db: Session, space_id: int, user_id: int, now: dat
     return exists is not None
 
 
+def _same_concern_recently_surfaced(db: Session, space_id: int, candidate: AttentionCandidate, now: datetime) -> bool:
+    """Checkpoint 4.7 — the SAME-CONCERN REPEAT GATE: distinct from (and
+    checked IN ADDITION to) the global Proactive Frequency Gate above.
+    That gate answers "how recently did BAZRA proactively speak AT ALL on
+    this surface"; this one answers "how recently did BAZRA proactively
+    raise THIS SAME concern" — the two are independent, and both must
+    pass for a candidate to be spoken.
+
+    "Same concern" = the latest app_opened exposure for this EXACT
+    (source_type, source_id, signal_type) identity was surfaced within
+    SAME_CONCERN_REPEAT_WINDOW AND its own exposure_snapshot equals the
+    candidate's CURRENT Signal.snapshot — the identical snapshot-equality
+    convention scoring.evaluate_gates' own DISMISSED_UNCHANGED gate
+    already established (never a bespoke "which fields matter" heuristic).
+    Deliberately NEVER compares narration text, embeddings, or asks a
+    model — fully deterministic, zero provider cost either way.
+
+    Snapshot never includes `title` (see service.py's own signal
+    construction) — a title-only change can never make this method treat
+    an otherwise-unchanged concern as new, matching the conservative "be
+    careful about treating a title change as new" product policy. A
+    genuine material change (e.g. due_at pushed out) changes the
+    snapshot, correctly classifying it as a different concern; a
+    fully-resolved concern (done/archived) never reaches this function at
+    all, since fresh signal generation stops producing it upstream —
+    this gate is never the thing deciding "is the concern still real",
+    only "did we just mention this exact same thing too recently."
+
+    True = SAME concern, recently surfaced — caller must suppress
+    (SILENCE), never fall back to a runner-up candidate (locked V1
+    product decision — see module docstring / README).
+    """
+    signal = candidate.signal
+    exposure = history.get_latest_exposure_for_concern(
+        db, space_id, signal.source_type, signal.source_id, signal.signal_type, "app_opened"
+    )
+    if exposure is None:
+        return False
+    if now - exposure.surfaced_at >= SAME_CONCERN_REPEAT_WINDOW:
+        return False
+    return exposure.exposure_snapshot == signal.snapshot
+
+
+def same_concern_recently_surfaced(db: Session, space_id: int, candidate: AttentionCandidate, now: datetime) -> bool:
+    """Checkpoint 4.7 — a thin public re-export of
+    _same_concern_recently_surfaced, reused (never duplicated) by
+    attention/surfacing.py's own finalization-time recheck — the same
+    "two tabs can both pass the pre-narration check" race
+    frequency_gate_passes already protects against, applied here to the
+    narrower same-concern identity instead of the global surface-wide
+    one."""
+    return _same_concern_recently_surfaced(db, space_id, candidate, now)
+
+
 def frequency_gate_passes(db: Session, space_id: int, now: datetime) -> bool:
     """Checkpoint 4.5e — a thin public re-export of the exact same
     Proactive Frequency Gate `evaluate_app_opened` already applies
@@ -176,11 +242,12 @@ def evaluate_app_opened(
 
     Gate order (cheap, deterministic checks first — see module
     docstring): Proactive Frequency -> pending ProposedAction -> active
-    conversation -> Attention Selection. No local-time/quiet-hours gate
-    exists anywhere in this pipeline, deliberately: Ahmed actively
-    opening BAZRA is not equivalent to an unsolicited push
-    notification, so an otherwise-eligible winner at 2 AM still
-    produces outcome="speak".
+    conversation -> Attention Selection -> Same-Concern Repeat Gate
+    (Checkpoint 4.7, checked only against the already-selected winner).
+    No local-time/quiet-hours gate exists anywhere in this pipeline,
+    deliberately: Ahmed actively opening BAZRA is not equivalent to an
+    unsolicited push notification, so an otherwise-eligible winner at 2
+    AM still produces outcome="speak".
     """
     if not _proactive_frequency_gate_passes(db, space_id, now):
         return AppOpenedDecision(outcome="silence", reason="proactive_frequency")
@@ -204,5 +271,14 @@ def evaluate_app_opened(
     winner = next((candidate for candidate in ranked if candidate.suppression.suppressed is False), None)
     if winner is None:
         return AppOpenedDecision(outcome="silence", reason="no_eligible_candidate")
+
+    # Same-Concern Repeat Gate (Checkpoint 4.7) — checked ONLY against the
+    # already-selected winner, never against the ranked list generally:
+    # if the strongest candidate was just raised too recently, the
+    # correct V1 behavior is SILENCE, never a cascade to the runner-up
+    # (rotating through B, then C, then D on successive app-opens would
+    # recreate exactly the nagging feeling this gate exists to prevent).
+    if _same_concern_recently_surfaced(db, space_id, winner, now):
+        return AppOpenedDecision(outcome="silence", reason="same_concern_recently_surfaced")
 
     return AppOpenedDecision(outcome="speak", candidate=winner)

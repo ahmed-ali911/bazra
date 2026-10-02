@@ -1952,6 +1952,95 @@ system), Personality Engine work, or a real-provider live gate (none
 was needed or run — the prompt wording change is covered entirely by
 existing mocked tests).
 
+### Checkpoint 4.7 — Proactive Presence Quality Hardening
+
+**Global proactive frequency and same-concern repeat frequency are two
+separate, independent gates.** The existing 30-minute
+`PROACTIVE_FREQUENCY_WINDOW` (4.5c) answers "did BAZRA proactively
+speak AT ALL on this surface recently?" and is unchanged. This
+checkpoint adds a second, narrower gate — `SAME_CONCERN_REPEAT_WINDOW`
+(`attention/app_opened.py`, a **V1 product policy constant**, 24
+hours, not a learned value) — answering "did BAZRA proactively raise
+THIS SAME unresolved concern recently?" Both must pass independently;
+neither replaces the other, and the pre-existing, unchanged per-source
+12-hour `scoring._COOLDOWN` (which applies across every surface,
+regardless of signal_type/snapshot) still applies underneath both.
+
+**Concern identity, deliberately deterministic**: the same
+`(source_type, source_id, signal_type)` as the latest `app_opened`
+exposure, AND that exposure's own `exposure_snapshot` equal to the
+candidate's current `Signal.snapshot` — the identical snapshot-equality
+convention `evaluate_gates`'s existing `DISMISSED_UNCHANGED` gate
+already established, reused rather than inventing a second "what
+counts as changed" rule. Narration text, embeddings, and model
+judgment are never consulted. Snapshots never include `title`, so a
+title-only edit can never escape the repeat window; a genuine material
+change (e.g. `due_at` pushed out) changes the snapshot and is
+correctly treated as a new concern; a fully resolved concern (done/
+archived) never reaches this gate at all, since fresh signal
+generation stops producing it upstream. **No migration** — entirely
+derived from existing `AttentionExposure` history
+(`history.get_latest_exposure_for_concern`, a new read-only query, no
+new column or table).
+
+**Checked only against the already-selected winner, never cascading to
+a runner-up.** If the strongest candidate was just raised too
+recently, the result is `SILENCE`, never a fallback to the next-best
+candidate — repeatedly reopening the app must never rotate through the
+backlog (A, then B, then C...), which would recreate the same nagging
+feeling this gate exists to prevent. Checked first in
+`evaluate_app_opened` (zero provider cost when it blocks — narration is
+never attempted), and rechecked again inside 4.5e's existing short
+finalization transaction, under the same advisory lock, reusing the
+exact same race-safety pattern as the frequency recheck.
+
+**Silence reason**: `same_concern_recently_surfaced` — deliberately not
+named anything implying presence/view proof (`attention_resume`,
+`user_absent`, `already_seen`). `AttentionExposure` semantics are
+unchanged: it means the backend committed something intended for
+presentation, never that Ahmed physically saw it.
+
+**Narration factual discipline, narrowed further**: proactive opening
+text must not infer that the user forgot, still remembers, was
+reminded before, previously discussed, promised, feels guilty, or is
+avoiding the stored concern — describe the authoritative concern
+directly instead. Avoid operational/customer-service phrasing (e.g. "do
+you want to handle it now?") in favor of a natural, varied
+conversational invitation — this is wording discipline, not a new
+Personality Engine, and (like the mutation-claim verifier) remains a
+prompt-level instruction, never a code-level guarantee against every
+possible model output.
+
+**Real-use evidence, precisely verified, not assumed**: inspection of
+the actual dev database confirmed the originally-reported "water the
+plants" repetition (13:27 / 13:59 UTC) involved **two different**
+`task_id` values (33 and 36) — i.e. two distinct duplicate Task rows,
+not the same concern resurfacing under a cooldown bug. The existing,
+unmodified per-source identity (then and now) behaved exactly as
+designed; this specific historical incident would **not** have been
+prevented by the new Same-Concern Repeat Gate either (different
+`source_id` is, by every existing identity rule, a different concern).
+The gate implemented here is still real, valuable V1 hardening for the
+general case — repeated nagging about the literal same task — it just
+was not the mechanism that would have stopped that exact historical
+example.
+
+**Deferred, documented, not solved here**:
+- *Model Router cost + resilience*: deterministic zero-LLM responses
+  where appropriate, cheap-vs-powerful model routing, provider/model
+  fallback, graceful provider-unavailable behavior, and cost budgets
+  all remain future work — real use showed a provider-outage case
+  (exhausted credits) causing an ordinary chat reply to fail; no
+  resilience/fallback was added in this checkpoint.
+- *Read-the-Room / casual conversation behavior*: real use showed a
+  casual, social remark ("I'm bored, what should we talk about?")
+  prompting BAZRA to suggest reviewing open tasks — a companion should
+  not automatically turn every idle moment into a productivity nudge.
+  No intent/personality classifier was added here; this is recorded as
+  product evidence for future Personality/Read-the-Room work, not
+  something this checkpoint's narrow narration-wording changes attempt
+  to fix.
+
 ## Phase 3 — Transaction Hardening
 
 ### Checkpoint 3.H1

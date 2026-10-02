@@ -283,6 +283,73 @@ def test_frequency_became_fresh_during_narration_produces_silence(
 
 
 # ==================================================
+# SAME-CONCERN REPEAT GATE (Checkpoint 4.7)
+# ==================================================
+
+
+def test_same_concern_blocks_before_narration_zero_provider_calls(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 22 — a same-concern silence must cost ZERO provider
+    calls: it is decided inside evaluate_app_opened itself (Phase A),
+    before narration is ever attempted."""
+    space = _space(db_session)
+    _overdue_task(db_session, space)
+    # Build the exact same candidate a real evaluation would select, and
+    # record it 15h ago: past the pre-existing 12h per-source COOLDOWN
+    # and the 30-min global frequency gate (both would otherwise
+    # confound this test — see test_same_concern_repeat.py's own
+    # comments for the full reasoning), but still within this gate's
+    # own 24h window.
+    decision = surfacing.app_opened_service.evaluate_app_opened(
+        db_session, space.id, space.user_id, datetime.now(timezone.utc), _CAIRO
+    )
+    assert decision.outcome == "speak"  # sanity: a real winner exists before we record its exposure
+    history.record_exposure(
+        db_session, space.id, space.user_id, decision.candidate, "app_opened",
+        datetime.now(timezone.utc) - timedelta(hours=15), _CAIRO, commit=True,
+    )
+
+    captured: dict = {}
+    _stub_narration(monkeypatch, _SAFE_RESULT, captured)
+
+    result = surfacing.evaluate_and_surface_app_opened(db_session, space.id, space.user_id, _CAIRO)
+
+    assert result.status == "silence"
+    assert result.reason == "same_concern_recently_surfaced"
+    assert captured.get("calls", 0) == 0
+    assert db_session.query(ChatMessage).filter(ChatMessage.space_id == space.id).count() == 0
+    assert db_session.query(AttentionExposure).filter(AttentionExposure.space_id == space.id).count() == 1
+
+
+def test_same_concern_surfaced_by_another_request_during_narration_produces_silence(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Section 24 — the final-revalidation race specific to this new
+    gate: a concurrent request records the SAME concern (same source,
+    signal_type, and snapshot) while this request's own narration is in
+    flight; the Phase C recheck must catch it."""
+    space = _space(db_session)
+    _overdue_task(db_session, space)
+
+    def _side_effect(candidate):
+        history.record_exposure(
+            db_session, space.id, space.user_id, candidate, "app_opened",
+            datetime.now(timezone.utc) - timedelta(hours=15), _CAIRO, commit=True,
+        )
+        return _SAFE_RESULT
+
+    _stub_narration(monkeypatch, _side_effect)
+
+    result = surfacing.evaluate_and_surface_app_opened(db_session, space.id, space.user_id, _CAIRO)
+
+    assert result.status == "silence"
+    assert result.reason == "same_concern_recently_surfaced"
+    exposures = db_session.query(AttentionExposure).filter(AttentionExposure.space_id == space.id).all()
+    assert len(exposures) == 1  # only the simulated "other tab" exposure
+
+
+# ==================================================
 # FINAL COMMIT FAILURE
 # ==================================================
 

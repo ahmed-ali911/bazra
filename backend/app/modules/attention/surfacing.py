@@ -24,9 +24,10 @@ Locked pipeline (see each phase's own comment below):
       advisory-lock key chat/service.py's own conversation turns
       already use, then re-check every condition that could have
       changed while Phase B was in flight — user-message-wins,
-      pending-action-appeared, frequency-became-fresh, and selected-
-      candidate-became-stale — and, only if ALL of them still pass,
-      persist the assistant ChatMessage and the AttentionExposure
+      pending-action-appeared, frequency-became-fresh,
+      same-concern-became-recently-surfaced (Checkpoint 4.7), and
+      selected-candidate-became-stale — and, only if ALL of them still
+      pass, persist the assistant ChatMessage and the AttentionExposure
       together in ONE transaction.
 
 Core invariant, stated the way the accepted brief states it:
@@ -79,6 +80,7 @@ from app.modules.narration import service as narration_service
 #: response schema (see attention/schemas.py's own AppOpenedResponse).
 SurfaceSilenceReason = Literal[
     "proactive_frequency", "pending_action", "active_conversation", "no_eligible_candidate",
+    "same_concern_recently_surfaced",
     "user_message_won_race", "pending_action_appeared", "frequency_became_fresh", "candidate_became_stale",
 ]
 
@@ -202,6 +204,19 @@ def evaluate_and_surface_app_opened(
     if not app_opened_service.frequency_gate_passes(db, space_id, now_final):
         db.commit()
         return AppOpenedSurfaceResult(status="silence", reason="frequency_became_fresh")
+
+    # Same-Concern Repeat Gate recheck (Checkpoint 4.7) — the narrower,
+    # 24h, signal_type+snapshot-scoped counterpart to the frequency
+    # recheck above. Catches the identical two-tabs race for THIS
+    # specific gate: both requests may have passed the pre-narration
+    # same_concern_recently_surfaced check in evaluate_app_opened before
+    # either had recorded an exposure; whichever commits first here
+    # makes the loser's own recheck see that fresh exposure and
+    # correctly return silence instead of double-surfacing the same
+    # concern.
+    if app_opened_service.same_concern_recently_surfaced(db, space_id, candidate, now_final):
+        db.commit()
+        return AppOpenedSurfaceResult(status="silence", reason="same_concern_recently_surfaced")
 
     # Selected-candidate revalidation (locked): is the ONE concern this
     # narration describes still real right now? Never a rerank, never
