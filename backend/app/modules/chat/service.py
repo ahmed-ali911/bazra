@@ -15,6 +15,7 @@ from app.modules.actions.schemas import ConfirmResult
 from app.modules.calendar import service as calendar_service
 from app.modules.calendar.schemas import CalendarEventResponse
 from app.modules.chat import context as context_module
+from app.modules.chat import deterministic_retrieval
 from app.modules.chat.models import ChatMessage
 from app.modules.chat.write_intent import WRITE_UNAVAILABLE_MESSAGE, detect_clear_write_intent
 from app.modules.life_areas import service as life_areas_service
@@ -2026,7 +2027,18 @@ def send_message(
        to step 4 like any other message, still fully intact and still
        'pending' in the database, describable but not bare-yes/no-
        actionable.
-    4. Everything else -> the Orchestrator, with propose_create_task/
+    4. (Checkpoint 5.2) A narrow, zero-LLM retrieval phrase (see
+       deterministic_retrieval.build_deterministic_retrieval_reply) ->
+       authoritative local Task/Calendar/Inbox query, deterministic
+       presentation, persisted as a normal assistant ChatMessage, zero
+       model/model_router calls. Ambiguous, judgmental, mutation-
+       shaped, or simply unrecognized messages are NOT matched here —
+       they fall through to step 5 unaffected, exactly as before this
+       checkpoint. A pending proposal (if any) is left completely
+       untouched by this branch — neither confirmed, rejected, nor
+       described — it remains exactly as 'pending' as it was before
+       this message arrived.
+    5. Everything else -> the Orchestrator, with propose_create_task/
        propose_save_memory/propose_forget_memory/.../get_weather and
        (Checkpoint 3.23) respond_with_text ALL offered, and any pending
        proposal (of whichever type) folded into context, plus
@@ -2118,6 +2130,24 @@ def send_message(
     # lock) before the potentially slow Orchestrator call below, which
     # needs no lock at all.
     db.commit()
+
+    # Checkpoint 5.2 — narrow, zero-LLM retrieval recognition. Runs
+    # AFTER every authority-sensitive branch above (write-intent
+    # decline, confirm, reject — none of which this can ever steal,
+    # since they already returned above) and BEFORE Context Assembly/
+    # the Orchestrator, exactly the brief's own required ordering. None
+    # for the overwhelming majority of messages — anything ambiguous,
+    # judgmental, mutation-shaped, or simply unrecognized falls straight
+    # through to the existing model path below, completely unaffected.
+    # Zero provider/model_router calls on this branch — see
+    # deterministic_retrieval.py's own module docstring.
+    deterministic_reply = deterministic_retrieval.build_deterministic_retrieval_reply(
+        db, space_id, content, timezone_name
+    )
+    if deterministic_reply is not None:
+        assistant_message = record_assistant_message(db, space_id, user_id, deterministic_reply)
+        _log_deterministic_route("retrieval", user_message.id)
+        return user_message, assistant_message
 
     context = context_module.gather_context(db, space_id, tomorrow_start, window_end)
     memories, total_active_memories = memory_service.get_relevant_memories(db, space_id, user_id, limit=_MAX_MEMORIES)

@@ -1169,6 +1169,77 @@ CHECK constraint or native enum; pre-5.1 rows using the old vocabulary
 (`"provider_error"`, `"invalid_api_key"`, etc.) remain valid, untouched,
 historical data.
 
+### Checkpoint 5.2 — Deterministic Zero-LLM Retrieval
+
+Motivated by Checkpoint 5.0's own finding: BAZRA already owns authoritative
+local Task/Calendar/Inbox data, yet even the simplest factual question
+("what are my open tasks?") cost at least one full `chat_completion` +
+claim-verifier round trip. This checkpoint adds a narrow, auditable
+deterministic path for exactly that class of question — nothing more.
+
+**Recognition is a two-layer, precision-first classifier**
+(`chat/retrieval_intent.py`), not a general NLU engine: (1) a small set of
+negative-guard keyword patterns (mutation verbs, judgment/recommendation
+words, in Arabic and English) checked first — any hit immediately falls
+through to the existing model path; (2) a small, closed set of `fullmatch`
+regex phrase families (not `search`) — the ENTIRE normalized message must
+match one of the whitelisted forms, so any judgment/mutation clause
+appended to an otherwise-recognizable phrase already fails to match on this
+basis alone, independent of the negative guards. A real bug caught during
+this checkpoint's own implementation: "متأخرة" (overdue) and "أخر"/"أخّر"
+(postpone) share an Arabic root, so a naive substring guard treated the
+adjective as if it were the mutation verb — fixed via a left-boundary-only
+match (`\bأخر`, not `\bأخر\b`), which still catches real postpone phrasings
+with an attached pronoun suffix ("أخرها") while no longer misfiring on
+"متأخرة". Deliberately excluded: "عندي ايه النهارده؟" / "what do I have
+today" — real prior product usage shows this phrase shape can mean a
+BROADER Tasks+Calendar+Life-Area query, not Calendar alone, so it is left
+on the model path rather than guessed.
+
+**Supported V1 retrievals**, each backed by an existing, unmodified
+authoritative domain-service query (never ad-hoc SQL, never a new query
+policy): Tasks open (`tasks_service.list_tasks(status="open")`) and
+overdue (`list_open_tasks_due_before`); Calendar today
+(`calendar_service.list_events_starting_between`, EVENTS only — deliberately
+not the broader Tasks+Events agenda merge, since "مواعيد"/"calendar" means
+appointments, not a Task due that day); Inbox unread
+(`inbox_service.list_items(unread=True)`).
+
+**Memory is explicitly deferred**, not implemented: `Memory.content` is
+free-text and `type` includes `"INFERENCE"` — a model-derived inference
+about the user, not a verified fact — so a deterministic lister risks
+presenting an inference as settled fact, and the natural trigger phrase
+("إيه اللي تعرفه عني؟") is inherently a broader selection/summarization
+question rather than a narrow enumerable view the way "open tasks" is. A
+defer, not a failure.
+
+**Zero LLM calls, by construction**: `deterministic_retrieval.py` imports
+neither `orchestrator_service` nor `model_router_service` — there is no
+model/provider call this branch could make even by accident. Verified by
+tests that make `model_router_service.complete` itself raise
+`AssertionError` if reached at all. A recognized retrieval succeeds
+identically whether or not Anthropic is reachable; an unrecognized message
+still reaches the existing model path and, if the provider is down, still
+produces Checkpoint 5.1's own honest degradation — the routing boundary
+between the two is itself explicitly tested, both ways.
+
+**Mutation-safety and Attention are both untouched**: this path only ever
+calls each domain's existing LIST/read functions — it cannot create/update/
+delete a Task, Event, or Inbox item, cannot create or resolve a
+`ProposedAction`, and (since it never touches `attention/history.py`)
+cannot create an `AttentionExposure` or trigger ACTED_ON attribution merely
+because an item appeared in a listing. The deterministic reply is persisted
+as a normal assistant `ChatMessage` (unlike Checkpoint 5.1's own transport-
+level degradation message) — a successful retrieval genuinely is a real
+BAZRA conversational turn, not a transport/service error.
+
+**Known limitation, inherent to a narrow whitelist, not a defect**: this
+recognizes only the small set of phrase families listed above; any other
+phrasing of the same underlying question (different word order, an
+unlisted synonym) falls through to the existing model path rather than
+being guessed — the brief's own explicit "precision over recall" mandate
+for this checkpoint.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1

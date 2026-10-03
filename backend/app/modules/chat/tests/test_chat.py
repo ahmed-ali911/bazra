@@ -401,7 +401,14 @@ def test_chat_answers_grounded_in_real_seeded_data(
 
     monkeypatch.setattr(orchestrator_service, "generate_reply", _fake_generate_reply)
 
-    response = _send(authenticated_client, "what's overdue?")
+    # Checkpoint 5.2 — "what's overdue?" is now itself a recognized
+    # zero-LLM deterministic retrieval phrase (by design: that's this
+    # checkpoint's own point), so it would never reach generate_reply
+    # at all. This test's purpose is specifically to prove Context
+    # Assembly reaches the model with real seeded data — a judgment-
+    # shaped question that deliberately falls outside the deterministic
+    # whitelist keeps that proof intact.
+    response = _send(authenticated_client, "which of my tasks is most overdue and why?")
     assert response.status_code == 200
     assert "File Q3 taxes is overdue" in response.json()["assistant_message"]["content"]
     assert "File Q3 taxes" in captured["context"]
