@@ -1240,6 +1240,79 @@ unlisted synonym) falls through to the existing model path rather than
 being guessed — the brief's own explicit "precision over recall" mandate
 for this checkpoint.
 
+### Checkpoint 5.3 — Intelligence Tier Contract
+
+Introduces an explicit, provider-neutral **INTELLIGENCE TIER** concept —
+deliberately a third, separate dimension alongside the two that already
+existed: **PURPOSE** (why a model is called — `chat_completion`,
+`claim_verification`, `proactive_narration`, `tool_result_reasoning`,
+`memory_extraction`) and **MODEL** (which concrete product currently
+executes it — `_resolve_model`'s own purpose→model table, completely
+unchanged by this checkpoint). Tier describes the capability level a call
+conceptually requires: `"lightweight"`, `"standard"`, or `"powerful"`
+(`model_router/schemas.py::IntelligenceTier`) — provider-neutral names only,
+never a vendor product (no `HAIKU`/`SONNET`/`OPUS`).
+
+**This is the contract, not the policy**: tier does not yet control model
+selection, does not add retry or a fallback ladder (POWERFUL failing never
+retries STANDARD, etc.), and does not classify arbitrary prompt content —
+no dynamic complexity classifier, no keyword/token-count heuristic, no
+second model call to pick the first. `model_router/service.py::complete()`
+gained an optional `tier` parameter; every real production caller
+(`generate_reply`, `generate_tool_result_reply`,
+`generate_app_opened_narration_text`, `verify_no_mutation_claim`)
+deliberately **omits it**, relying on a centralized, auditable
+`_TIER_BY_PURPOSE` table — the same "small explicit override table" shape
+`_MODEL_BY_PURPOSE` already established — for its own purpose's static
+default: `claim_verification` → lightweight (a single forced boolean tool
+call over just the candidate text — the narrowest, most bounded task in
+this codebase); `proactive_narration` → lightweight (exactly three scalar
+facts in, one short opening line out, no tools — equally bounded, even
+though its current concrete model is unchanged); `chat_completion` →
+standard (the broadest task — full history, full Context Assembly, 9
+tools); `tool_result_reasoning` → standard (genuine grounded judgment, not
+narrow classification); `memory_extraction` → standard (zero production
+callers today — defaulted conservatively rather than guessed at).
+
+**Why centralized, not per-call-site**: inspection during this checkpoint's
+own discovery found several existing tests monkeypatch
+`model_router_service.complete` entirely with fixed-signature fakes (no
+`**kwargs`) — passing `tier=` explicitly from every Orchestrator call site
+would have broken ~10 of them across the orchestrator/attention/chat test
+suites for no behavioral benefit. Resolving tier purely inside the router
+(keyed on `purpose`, exactly like model resolution already is) keeps every
+Orchestrator call site's own outgoing kwargs byte-identical to before this
+checkpoint — zero existing test needed to change. Each call site still
+carries a one-line documentation comment naming its own resolved tier and
+why, for a reader auditing orchestrator/service.py directly.
+
+**Tier never influences model selection** (the hard invariant this
+checkpoint must not violate): `_resolve_model(purpose)` is untouched, has no
+new parameter, and is never passed a tier value. An explicit, even
+"conflicting" tier (e.g. `tier="powerful"` on the `claim_verification`
+purpose, which has its own explicit haiku override) still resolves to the
+exact same existing model — proven by a dedicated test, not merely assumed.
+
+**Observability without migration**: the resolved tier is exposed on
+`ModelResponse.tier` — the same in-memory, never-persisted treatment
+`stop_reason` already established (Checkpoint 3.22/3.23) — giving tests a
+real seam to prove which tier a call resolved to, without a new public API
+field, without a new AiTrace column, and without any database migration.
+`AiTrace` gains nothing; `_record_trace`'s own field set is unchanged. An
+unregistered/future purpose defaults, in the router's own defense-in-depth
+fallback, to `"standard"` — never silently to `"lightweight"` merely to
+save cost — though a dedicated test proves this fallback is unreachable in
+production today, since `_TIER_BY_PURPOSE`'s own keys are asserted to
+exactly equal `VALID_PURPOSES`.
+
+**Explicitly deferred** (require evidence/evaluation this checkpoint
+doesn't attempt): dynamic prompt complexity classification, tier-to-model
+routing, cost-aware or provider-aware routing, provider/tier fallback,
+per-user model preferences, adaptive routing from historical performance, a
+POWERFUL escalation policy, budget-aware downgrade. **Immediate cost/call
+impact: zero** — this checkpoint's whole purpose is the control plane for
+later, evidence-based optimization, not the optimization itself.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1

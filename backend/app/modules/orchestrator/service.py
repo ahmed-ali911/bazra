@@ -370,6 +370,13 @@ def generate_reply(
     if tools:
         complete_kwargs["tool_choice"] = _PRIMARY_CHAT_TOOL_CHOICE
 
+    # Checkpoint 5.3 — tier is NOT passed explicitly here; this purpose
+    # resolves to the centralized "standard" default (the broadest,
+    # most general-purpose task in this codebase: full history, full
+    # Context Assembly, 9 offered tools) via model_router's own
+    # _TIER_BY_PURPOSE — see that module for the full policy and why
+    # every call site deliberately omits this parameter rather than
+    # repeating the assignment here.
     try:
         response = model_router_service.complete(**complete_kwargs)
     except model_router_service.ModelRouterError as exc:
@@ -449,6 +456,11 @@ def generate_tool_result_reply(
         {"role": "user", "content": [ToolResultBlock(tool_use_id=tool_use_id, content=tool_result_content)]},
     ]
 
+    # Checkpoint 5.3 — tier omitted; resolves to the centralized
+    # "standard" default (genuine grounded judgment over one fetched
+    # factual result, e.g. "do I need a jacket" — real reasoning, not a
+    # narrow structured classification) via model_router's own
+    # _TIER_BY_PURPOSE.
     try:
         response = model_router_service.complete(
             purpose="tool_result_reasoning",
@@ -560,6 +572,12 @@ def generate_app_opened_narration_text(signal_type: str, title: str, priority: s
         facts_lines.append(f"priority: {priority}")
     user_message = "Selected attention topic:\n" + "\n".join(facts_lines)
 
+    # Checkpoint 5.3 — tier omitted; resolves to the centralized
+    # "lightweight" default (exactly three scalar facts in, one short
+    # opening line out, no tools — as narrow/bounded as
+    # claim_verification below, even though its CURRENT concrete model
+    # is unchanged by this checkpoint) via model_router's own
+    # _TIER_BY_PURPOSE.
     try:
         response = model_router_service.complete(
             purpose="proactive_narration",
@@ -676,6 +694,15 @@ def verify_no_mutation_claim(candidate_text: str) -> bool:
     raised failure the same as an explicit True) is the caller's own
     decision, made once, in chat_service.
     """
+    # Checkpoint 5.3 — tier omitted; resolves to the centralized
+    # "lightweight" default (a single forced boolean tool call over
+    # just the candidate text — the narrowest, most bounded task in
+    # this codebase) via model_router's own _TIER_BY_PURPOSE. This is
+    # also the one purpose with an existing explicit MODEL override
+    # (haiku) — tier and that override are independent: assigning
+    # "lightweight" here never changes, and is never changed by,
+    # _resolve_model's own purpose->model lookup (see that function
+    # and _resolve_tier's own docstrings).
     try:
         response = model_router_service.complete(
             purpose="claim_verification",

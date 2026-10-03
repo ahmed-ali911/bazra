@@ -13,6 +13,8 @@ from app.database import SessionLocal
 from app.modules.model_router.models import AiTrace
 from app.modules.model_router.schemas import (
     VALID_PURPOSES,
+    VALID_TIERS,
+    IntelligenceTier,
     ModelCallPurpose,
     ModelFailureCategory,
     ModelResponse,
@@ -52,6 +54,69 @@ _MODEL_BY_PURPOSE: dict[str, str] = {
 
 def _resolve_model(purpose: str) -> str:
     return _MODEL_BY_PURPOSE.get(purpose, _DEFAULT_MODEL)
+
+
+# Checkpoint 5.3 — the centralized, explicit, auditable purpose->tier
+# policy: a SEPARATE table from _MODEL_BY_PURPOSE above, deliberately —
+# tier (capability conceptually required) and model (which concrete
+# product executes it) are two different questions, and this checkpoint
+# introduces the contract for the first without letting it influence
+# the second (see _resolve_tier's own docstring and complete()'s own
+# docstring on tier/model independence).
+#
+# Every value here was chosen by inspecting each purpose's OWN real,
+# current task shape (not the illustrative examples in this
+# checkpoint's own brief, which explicitly warns against blind reuse):
+#   - claim_verification: a single forced boolean tool call over just
+#     the candidate text, no history/context/tools beyond one strict
+#     schema — the narrowest, most bounded task in this codebase.
+#   - proactive_narration: exactly three scalar facts in (signal_type,
+#     title, priority), one short natural-language opening line out, no
+#     tools — see generate_app_opened_narration_text's own docstring:
+#     "there is no larger object available here to accidentally leak
+#     more out of." Equally narrow/bounded as claim_verification, by
+#     the same reasoning, even though its CURRENT concrete model
+#     (unchanged by this checkpoint) differs.
+#   - chat_completion: the broadest task in this codebase — full
+#     history, full Context Assembly, 9 offered tools, general-purpose
+#     reasoning and correct tool selection.
+#   - tool_result_reasoning: grounded judgment over one fetched factual
+#     result (e.g. "do I need a jacket, given this weather") — genuine
+#     reasoning, not a narrow structured classification.
+#   - memory_extraction: declared in VALID_PURPOSES but has ZERO
+#     production call sites (confirmed by repo-wide grep during this
+#     checkpoint's own discovery) — defaulted to the conservative,
+#     capability-preserving "standard" rather than guessed at, since
+#     its real future shape is unknown.
+_TIER_BY_PURPOSE: dict[str, IntelligenceTier] = {
+    "claim_verification": "lightweight",
+    "proactive_narration": "lightweight",
+    "chat_completion": "standard",
+    "tool_result_reasoning": "standard",
+    "memory_extraction": "standard",
+}
+
+
+def _resolve_tier(purpose: str, tier: IntelligenceTier | None) -> IntelligenceTier:
+    """An explicit, caller-supplied tier always wins (no production
+    caller supplies one today — see complete()'s own docstring for
+    why) — this is the "explicit tier at each caller" half of the 5.3
+    contract, available but not currently exercised. Otherwise resolved
+    from the centralized _TIER_BY_PURPOSE table above.
+
+    The "standard" fallback for a purpose NOT in that table is
+    defense-in-depth only, never expected to actually execute in
+    production: complete()'s own purpose gate (VALID_PURPOSES) already
+    rejects any purpose this table doesn't cover before this function
+    is ever reached, and a dedicated test asserts
+    _TIER_BY_PURPOSE's own keys exactly equal VALID_PURPOSES. Per the
+    5.3 brief's own explicit requirement: an unresolvable purpose must
+    never silently become "lightweight" merely to save cost — fail
+    safe toward capability, not toward cost.
+    """
+    if tier is not None:
+        return tier
+    return _TIER_BY_PURPOSE.get(purpose, "standard")
 
 
 _MAX_TOKENS = 1024
@@ -337,6 +402,7 @@ def complete(
     tools: list[dict] | None = None,
     correlation_id: str | None = None,
     tool_choice: dict | None = None,
+    tier: IntelligenceTier | None = None,
 ) -> ModelResponse:
     """The only function other modules call to reach a model provider.
 
@@ -365,6 +431,20 @@ def complete(
     checkpoint; this module has no idea what "any" or
     disable_parallel_tool_use mean, and no BAZRA action name ever
     appears here — see _call_anthropic's own docstring.
+
+    tier (Checkpoint 5.3) is the provider-neutral INTELLIGENCE TIER
+    contract — separate from both `purpose` (why) and the concrete
+    model `_resolve_model` picks (which, currently, this parameter
+    NEVER influences — see _resolve_tier's own docstring). Optional:
+    every production caller today omits it, relying on the centralized
+    `_TIER_BY_PURPOSE` default for its own purpose; an explicit value
+    is accepted (and wins over that default) for a future caller that
+    needs to diverge, or for direct testing of the contract itself
+    (e.g. proving "powerful" is a valid value even though it has zero
+    production callers today). The RESOLVED tier is exposed on the
+    returned ModelResponse.tier for observability/tests — never
+    persisted to AiTrace (no migration in this checkpoint) and never
+    surfaced in any Chat-facing API response.
 
     correlation_id (Checkpoint 3.8) is an opaque grouping identifier for
     AiTrace rows that belong to the same logical model workflow — no
@@ -400,8 +480,11 @@ def complete(
     """
     if purpose not in VALID_PURPOSES:
         raise ValueError(f"Unknown purpose: {purpose!r}")
+    if tier is not None and tier not in VALID_TIERS:
+        raise ValueError(f"Unknown tier: {tier!r}")
 
     model = _resolve_model(purpose)
+    resolved_tier = _resolve_tier(purpose, tier)
     resolved_correlation_id = correlation_id or secrets.token_hex(16)
     start = time.monotonic()
 
@@ -497,4 +580,8 @@ def complete(
         # (AiTrace gets no new field — see _record_trace above, whose
         # own fields are completely unchanged by this checkpoint).
         stop_reason=getattr(raw, "stop_reason", None),
+        # Checkpoint 5.3 — the resolved tier, same "exposed for
+        # observability, never persisted" treatment as stop_reason
+        # above (see ModelResponse.tier's own docstring).
+        tier=resolved_tier,
     )

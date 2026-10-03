@@ -45,6 +45,21 @@ ModelFailureCategory = Literal[
     "unknown_provider_error",
 ]
 
+# Checkpoint 5.3 — a provider-neutral INTELLIGENCE TIER, a concept
+# deliberately separate from both ModelCallPurpose (WHY a call
+# happens) and the concrete model string (WHICH model currently
+# executes it — see service.py's own _resolve_model/_MODEL_BY_PURPOSE,
+# completely unchanged by this checkpoint). Tier describes the
+# capability level a call conceptually requires — never a vendor
+# product name (no HAIKU/SONNET/OPUS here), so a future mapping from
+# tier to model can change freely without callers ever needing to
+# change. This checkpoint is the CONTRACT only: nothing in this
+# codebase yet makes model selection depend on tier (see
+# service.py's own _resolve_tier — called purely for observability/
+# future use, never consulted by _resolve_model).
+IntelligenceTier = Literal["lightweight", "standard", "powerful"]
+VALID_TIERS: frozenset[str] = frozenset({"lightweight", "standard", "powerful"})
+
 
 @dataclass
 class ToolUseBlock:
@@ -110,3 +125,11 @@ class ModelResponse:
     tool_uses: list[ToolUseBlock]
     correlation_id: str
     stop_reason: str | None = None
+    # Checkpoint 5.3 — the resolved IntelligenceTier for this call,
+    # exposed the same way stop_reason already is: an in-memory,
+    # never-persisted observability/test seam (see model_router's own
+    # AiTrace — no new column; "standard" default here only matters for
+    # the one pre-5.3 direct ModelResponse(...) test construction that
+    # predates this field and doesn't care about it; complete() itself
+    # always passes an explicit, resolved value).
+    tier: IntelligenceTier = "standard"

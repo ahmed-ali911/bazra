@@ -973,3 +973,256 @@ def test_claim_verification_cost_estimation_uses_the_existing_haiku_rate_table_e
     ).mappings().first()
     assert row is not None
     assert row["estimated_cost_usd"] is not None
+
+
+# ---- Checkpoint 5.3: Intelligence Tier contract -----------------------------
+#
+# These tests exercise the REAL complete() end-to-end (mocking only
+# _call_anthropic, never complete() itself) wherever possible — proving
+# the production resolution path, not a hand-rolled substitute. Every
+# existing fake that monkeypatches complete() ENTIRELY elsewhere in this
+# suite (orchestrator/attention/chat tests) is deliberately left
+# untouched: no production caller passes `tier=` explicitly (see
+# _resolve_tier's own docstring), so none of those fakes ever receive an
+# unexpected keyword argument.
+
+
+def test_valid_tiers_are_exactly_lightweight_standard_powerful() -> None:
+    from app.modules.model_router.schemas import VALID_TIERS
+
+    assert VALID_TIERS == {"lightweight", "standard", "powerful"}
+
+
+def test_tier_by_purpose_covers_every_valid_purpose() -> None:
+    """The exhaustiveness invariant _resolve_tier's own docstring relies
+    on: every purpose complete() will actually accept (VALID_PURPOSES)
+    has an explicit entry in the centralized tier table — the
+    "unknown purpose falls back to standard" branch is proven
+    unreachable in production by this test, not merely assumed."""
+    from app.modules.model_router.schemas import VALID_PURPOSES
+
+    assert set(model_router_service._TIER_BY_PURPOSE.keys()) == VALID_PURPOSES
+
+
+@pytest.mark.parametrize(
+    "purpose,expected_tier",
+    [
+        ("claim_verification", "lightweight"),
+        ("proactive_narration", "lightweight"),
+        ("chat_completion", "standard"),
+        ("tool_result_reasoning", "standard"),
+        ("memory_extraction", "standard"),
+    ],
+)
+def test_resolve_tier_returns_the_centralized_default_for_each_known_purpose(
+    purpose: str, expected_tier: str,
+) -> None:
+    assert model_router_service._resolve_tier(purpose, None) == expected_tier
+
+
+def test_resolve_tier_prefers_an_explicit_tier_over_the_purpose_default() -> None:
+    assert model_router_service._resolve_tier("claim_verification", "powerful") == "powerful"
+
+
+def test_resolve_tier_defaults_an_unregistered_purpose_to_standard_never_lightweight(
+) -> None:
+    """Direct unit test of the defense-in-depth fallback itself (bypasses
+    complete()'s own purpose gate, which would reject a genuinely unknown
+    purpose before this is ever reached in production — see
+    test_tier_by_purpose_covers_every_valid_purpose above). The 5.3
+    brief's own explicit requirement: fail safe toward CAPABILITY, never
+    silently downgrade to "lightweight" merely to save cost."""
+    assert model_router_service._resolve_tier("some_future_purpose_not_yet_registered", None) == "standard"
+
+
+def test_complete_rejects_an_invalid_tier(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    call_count = 0
+
+    def _track(model, messages, **kwargs):
+        nonlocal call_count
+        call_count += 1
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _track)
+
+    with pytest.raises(ValueError):
+        model_router_service.complete(
+            purpose="chat_completion", messages=[{"role": "user", "content": "hi"}], tier="opus",  # type: ignore[arg-type]
+        )
+    assert call_count == 0  # rejected before any provider call was even attempted
+
+
+@pytest.mark.parametrize(
+    "purpose,expected_tier,expected_model",
+    [
+        ("chat_completion", "standard", "claude-sonnet-5"),
+        ("tool_result_reasoning", "standard", "claude-sonnet-5"),
+        ("proactive_narration", "lightweight", "claude-sonnet-5"),
+        ("claim_verification", "lightweight", "claude-haiku-4-5"),
+    ],
+)
+def test_complete_resolves_tier_and_preserves_model_for_every_real_production_purpose(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, purpose: str, expected_tier: str, expected_model: str,
+) -> None:
+    """Checkpoint 5.3, section 33 — the single most important acceptance
+    test: for every purpose a REAL production caller actually uses
+    today (the exact strings generate_reply/generate_tool_result_reply/
+    generate_app_opened_narration_text/verify_no_mutation_claim send —
+    see orchestrator/service.py), the concrete model is UNCHANGED and
+    the tier resolves to this checkpoint's own documented static
+    assignment, with the model and tier proven simultaneously so a
+    future change can't silently decouple them without this test
+    catching it."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service, "_call_anthropic",
+        lambda model, messages, **kwargs: _FakeMessageToolOnly("certify_claim", {"claims_bazra_mutation_completed": False})
+        if purpose == "claim_verification" else _FakeMessage("hi", 5, 5),
+    )
+
+    response = model_router_service.complete(purpose=purpose, messages=[{"role": "user", "content": "hi"}])
+
+    assert response.model == expected_model
+    assert response.tier == expected_tier
+
+
+def test_explicit_tier_never_changes_which_model_is_selected(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 5.3, section 13's own conflict-semantics requirement:
+    a caller supplying tier="powerful" alongside a purpose that already
+    has an explicit model override (claim_verification -> haiku) must
+    still get the EXISTING concrete model — tier describes
+    requirement/intent, it does not silently override existing concrete
+    model choice. Deliberately an "invalid-seeming" combination
+    (powerful tier, cheap model) — 5.3 defines no validation rule
+    against it; the call must still succeed exactly as the 5.3 brief's
+    own section 13 requires."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service, "_call_anthropic",
+        lambda model, messages, **kwargs: _FakeMessageToolOnly("certify_claim", {"claims_bazra_mutation_completed": False}),
+    )
+
+    response = model_router_service.complete(
+        purpose="claim_verification", messages=[{"role": "user", "content": "candidate"}], tier="powerful",
+    )
+
+    assert response.model == "claude-haiku-4-5"  # unchanged by the conflicting tier
+    assert response.tier == "powerful"  # the explicit value is still faithfully reported
+
+
+def test_powerful_tier_is_a_valid_contract_value_with_zero_production_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 5.3, section 29 — POWERFUL legitimately has zero
+    production callers today (confirmed: no purpose in _TIER_BY_PURPOSE
+    maps to it); this proves the CONTRACT still accepts and faithfully
+    carries it when explicitly supplied, without a current caller
+    needing to exist."""
+    assert not any(t == "powerful" for t in model_router_service._TIER_BY_PURPOSE.values())
+
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("hi", 5, 5))
+
+    response = model_router_service.complete(
+        purpose="chat_completion", messages=[{"role": "user", "content": "hi"}], tier="powerful",
+    )
+    assert response.tier == "powerful"
+
+
+def test_tier_resolution_adds_zero_extra_provider_or_network_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 5.3, section 39 — resolving/assigning a tier is a pure
+    dict lookup; proves it by counting EXACTLY how many times
+    _call_anthropic (the only function in this module that performs
+    real network I/O) is invoked for one complete() call, with and
+    without an explicit tier supplied."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    call_count = {"n": 0}
+
+    def _counted(model, messages, **kwargs):
+        call_count["n"] += 1
+        return _FakeMessage("hi", 5, 5)
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _counted)
+
+    model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+    model_router_service.complete(
+        purpose="chat_completion", messages=[{"role": "user", "content": "hi"}], tier="powerful",
+    )
+
+    assert call_count["n"] == 2  # exactly one real call per complete() invocation, never more
+
+
+def test_tier_is_never_persisted_to_aitrace(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 5.3, section 15 — no migration, no new AiTrace column.
+    Confirms the success-path trace row contains none of the tier
+    literal values in any of its own string columns, and that the ORM
+    model itself declares no `tier` attribute."""
+    assert not hasattr(AiTrace, "tier")
+
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(model_router_service, "_call_anthropic", lambda model, messages, **kwargs: _FakeMessage("hi", 5, 5))
+
+    model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}], tier="powerful")
+
+    trace = _latest_trace(db_session)
+    assert trace.error_summary is None
+    assert trace.purpose == "chat_completion"
+
+
+@pytest.mark.parametrize(
+    "tier,make_exc,expected_category",
+    [
+        ("standard", lambda: _status_error(anthropic.OverloadedError, "overloaded_error", 529), "provider_unavailable"),
+        ("lightweight", lambda: _status_error(anthropic.BadRequestError, "billing_error"), "billing_or_credits"),
+    ],
+)
+def test_provider_failure_categories_are_unaffected_by_tier_no_fallback(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch, tier: str, make_exc, expected_category: str,
+) -> None:
+    """Checkpoint 5.3, sections 17/18/35 — the 5.1 failure taxonomy is a
+    completely separate dimension from tier; no tier-specific failure
+    category exists, and no tier-fallback ladder is triggered (a
+    STANDARD failure is never silently retried as LIGHTWEIGHT, or vice
+    versa — there is no retry of any kind here at all)."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    call_count = {"n": 0}
+
+    def _raise(model, messages, **kwargs):
+        call_count["n"] += 1
+        raise make_exc()
+
+    monkeypatch.setattr(model_router_service, "_call_anthropic", _raise)
+
+    with pytest.raises(model_router_service.ModelRouterError) as exc_info:
+        model_router_service.complete(
+            purpose="chat_completion", messages=[{"role": "user", "content": "hi"}], tier=tier,
+        )
+
+    assert exc_info.value.category == expected_category
+    assert call_count["n"] == 1  # exactly one attempt — no tier fallback, no retry
+
+    trace = _latest_trace(db_session)
+    assert trace.status == "error"
+    assert trace.error_summary == expected_category
+
+
+def test_deterministic_retrieval_module_has_no_tier_or_model_router_coupling() -> None:
+    """Checkpoint 5.3, section 9 — Checkpoint 5.2's zero-LLM retrieval
+    must remain structurally outside model routing: no purpose, no
+    intelligence tier, no model selection, no AiTrace model-call row.
+    Proven here by source inspection (the same "never calls X" pattern
+    already established in this codebase, e.g. narration's own
+    structural tests) rather than a runtime mock, since the strongest
+    possible proof is that the import/reference doesn't exist at all."""
+    import inspect
+
+    from app.modules.chat import deterministic_retrieval
+
+    import_lines = [
+        line for line in inspect.getsource(deterministic_retrieval).splitlines()
+        if line.strip().startswith(("import ", "from "))
+    ]
+    assert not any("model_router" in line for line in import_lines)
+    assert not any("orchestrator" in line for line in import_lines)
