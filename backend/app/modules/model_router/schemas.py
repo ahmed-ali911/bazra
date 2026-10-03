@@ -16,6 +16,35 @@ VALID_PURPOSES: frozenset[str] = frozenset({
     "proactive_narration",
 })
 
+# Checkpoint 5.1 — a small, provider-neutral, stable failure taxonomy.
+# This is the ONLY vocabulary callers outside model_router/service.py
+# ever see for a failed complete() call (via ModelRouterError.category,
+# propagated through OrchestratorError.category/ClaimVerificationFailed.
+# category) — they never need to know Anthropic's own exception classes
+# or its documented error-body "type" strings. Deliberately a small,
+# stable set rather than one entry per Anthropic SDK exception class —
+# see service.py's _classify_failure for the exact, evidence-based
+# mapping and its documented precedence.
+#
+# Retryability (conceptual only — no retry is implemented anywhere as
+# of this checkpoint):
+#   NON-RETRYABLE:       authentication, billing_or_credits, invalid_request
+#   POTENTIALLY TRANSIENT: rate_limited, timeout, connection, provider_unavailable
+#   UNKNOWN (depends on cause): model_unavailable, unparseable_response,
+#                                unknown_provider_error
+ModelFailureCategory = Literal[
+    "authentication",
+    "billing_or_credits",
+    "rate_limited",
+    "timeout",
+    "connection",
+    "provider_unavailable",
+    "invalid_request",
+    "model_unavailable",
+    "unparseable_response",
+    "unknown_provider_error",
+]
+
 
 @dataclass
 class ToolUseBlock:

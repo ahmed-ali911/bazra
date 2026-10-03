@@ -170,14 +170,19 @@ def test_chat_persists_user_message_immediately_even_on_model_failure(
 ) -> None:
     monkeypatch.setattr(
         orchestrator_service, "generate_reply", lambda **kwargs: (_ for _ in ()).throw(
-            orchestrator_service.OrchestratorError("provider_error")
+            orchestrator_service.OrchestratorError("provider_unavailable")
         )
     )
 
     response = _send(authenticated_client, "what's on my calendar this month, in detail please")
     assert response.status_code == 502
-    assert response.json()["detail"]["error"] == "model_call_failed"
-    user_message_id = response.json()["detail"]["user_message_id"]
+    detail = response.json()["detail"]
+    assert detail["error"] == "model_call_failed"
+    # Checkpoint 5.1 — the normalized category and the deterministic,
+    # honest wording derived from it, both reach the HTTP error detail.
+    assert detail["reason"] == "provider_unavailable"
+    assert detail["message"] == chat_service._MODEL_DEGRADATION_TRANSIENT_MESSAGE_EN
+    user_message_id = detail["user_message_id"]
 
     row = db_session.execute(
         text("SELECT role, content FROM chat_messages WHERE id = :id"), {"id": user_message_id}
@@ -192,6 +197,180 @@ def test_chat_persists_user_message_immediately_even_on_model_failure(
         {"uid": user_message_id},
     ).scalar_one()
     assert assistant_rows == 0
+
+
+# ---- Checkpoint 5.1: provider failure taxonomy + honest degradation ------------
+
+
+@pytest.mark.parametrize(
+    "category,expected_message",
+    [
+        ("authentication", chat_service._MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN),
+        ("billing_or_credits", chat_service._MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN),
+        ("invalid_request", chat_service._MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN),
+        ("model_unavailable", chat_service._MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN),
+        ("unparseable_response", chat_service._MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN),
+        ("unknown_provider_error", chat_service._MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN),
+        ("rate_limited", chat_service._MODEL_DEGRADATION_TRANSIENT_MESSAGE_EN),
+        ("timeout", chat_service._MODEL_DEGRADATION_TRANSIENT_MESSAGE_EN),
+        ("connection", chat_service._MODEL_DEGRADATION_TRANSIENT_MESSAGE_EN),
+        ("provider_unavailable", chat_service._MODEL_DEGRADATION_TRANSIENT_MESSAGE_EN),
+    ],
+)
+def test_chat_model_failure_reason_and_wording_for_every_category(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch, category: str, expected_message: str,
+) -> None:
+    """Checkpoint 5.1 — every normalized ModelFailureCategory reaches
+    the HTTP error detail verbatim as `reason`, and `message` is the
+    correct one of exactly two deterministic wordings (transient vs
+    unavailable) — never a per-category custom string, never the raw
+    exception/provider text."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(orchestrator_service.OrchestratorError(category)),
+    )
+
+    response = _send(authenticated_client, f"what's on my calendar - 51cat_{category}")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["reason"] == category
+    assert detail["message"] == expected_message
+
+
+def test_chat_model_failure_wording_is_arabic_when_the_triggering_message_is(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The degradation wording is selected off the CURRENT triggering
+    message via the same _is_arabic mechanism every other bilingual
+    BAZRA reply already uses — a user writing in Arabic never suddenly
+    sees an English transport error."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(orchestrator_service.OrchestratorError("timeout")),
+    )
+
+    response = _send(authenticated_client, "ايه اللي عندي في الكالندر النهاردة")
+    assert response.status_code == 502
+    assert response.json()["detail"]["message"] == chat_service._MODEL_DEGRADATION_TRANSIENT_MESSAGE_AR
+
+
+def test_chat_model_failure_never_persists_a_fake_assistant_message(
+    authenticated_client: TestClient, db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 5.1, section 13 — a primary-generation provider
+    failure is NOT a conversational turn. Re-confirms (now parametrized
+    over the new taxonomy rather than the single old generic string)
+    the same guarantee test_chat_persists_user_message_immediately_even_on_model_failure
+    already covers for one category."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(orchestrator_service.OrchestratorError("billing_or_credits")),
+    )
+
+    response = _send(authenticated_client, "what's on my calendar this week - 51nofake")
+    assert response.status_code == 502
+    user_message_id = response.json()["detail"]["user_message_id"]
+
+    assistant_rows = db_session.execute(
+        text("SELECT count(*) FROM chat_messages WHERE role = 'assistant' AND id > :uid"),
+        {"uid": user_message_id},
+    ).scalar_one()
+    assert assistant_rows == 0
+
+
+def test_contract_violation_failure_reason_is_unknown_provider_error(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OrchestratorContractViolationError (zero/multiple tool calls) is
+    a response-shape anomaly, not one of Anthropic's own documented
+    exception/error-type cases — Checkpoint 5.1 maps it to
+    unknown_provider_error rather than inventing a new category for it,
+    and it must still reach Chat's existing except OrchestratorError
+    catch (it is a subclass) with that category attached."""
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(
+            orchestrator_service.OrchestratorContractViolationError("no_tool_call", 0)
+        ),
+    )
+
+    response = _send(authenticated_client, "what's on my calendar - 51contract")
+    assert response.status_code == 502
+    detail = response.json()["detail"]
+    assert detail["reason"] == "unknown_provider_error"
+    assert detail["message"] == chat_service._MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN
+
+
+def test_confirm_still_executes_with_zero_calls_when_provider_is_unavailable(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint 5.1, section 19 — Phase 3 write authority (adjacency,
+    confirm_and_execute) must remain fully reachable even when the
+    provider is completely unavailable, since the deterministic
+    confirm/reject path never calls the model at all. Simulates total
+    provider unavailability at the lowest possible layer
+    (model_router_service.complete itself, not merely orchestrator) to
+    prove this isn't just "the test double wasn't called" but that
+    nothing in this path could reach the provider even if it tried.
+    """
+    from app.modules.model_router import service as model_router_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll create a task to water the plants — confirm?",
+            tool_name="propose_create_task", arguments={"title": "Water the plants - 51confirm"},
+        ),
+    )
+    propose_response = _send(authenticated_client, "add a task to water the plants")
+    assert propose_response.status_code == 200
+
+    def _provider_down(*args, **kwargs):
+        raise model_router_service.ModelRouterError("provider_unavailable")
+
+    monkeypatch.setattr(model_router_service, "complete", _provider_down)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("orchestrator should not be reached for a bare 'yes'")),
+    )
+
+    confirm_response = _send(authenticated_client, "yes")
+    assert confirm_response.status_code == 200
+    assert "Water the plants - 51confirm" in confirm_response.json()["assistant_message"]["content"]
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert any(t["title"] == "Water the plants - 51confirm" for t in tasks)
+
+
+def test_reject_still_executes_with_zero_calls_when_provider_is_unavailable(
+    authenticated_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.modules.model_router import service as model_router_service
+
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        _mock_reply(
+            "I'll create a task to buy milk — confirm?",
+            tool_name="propose_create_task", arguments={"title": "Buy milk - 51reject"},
+        ),
+    )
+    _send(authenticated_client, "add a task to buy milk")
+
+    def _provider_down(*args, **kwargs):
+        raise model_router_service.ModelRouterError("provider_unavailable")
+
+    monkeypatch.setattr(model_router_service, "complete", _provider_down)
+    monkeypatch.setattr(
+        orchestrator_service, "generate_reply",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("orchestrator should not be reached for a bare 'no'")),
+    )
+
+    decline_response = _send(authenticated_client, "no")
+    assert decline_response.status_code == 200
+    assert decline_response.json()["assistant_message"]["content"] == chat_service._REJECTED_MESSAGE
+
+    tasks = authenticated_client.get("/api/v1/tasks").json()
+    assert not any(t["title"] == "Buy milk - 51reject" for t in tasks)
 
 
 def test_chat_answers_grounded_in_real_seeded_data(
@@ -2572,7 +2751,7 @@ def test_interpretive_weather_continuation_failure_degrades_to_factual_reply(
     monkeypatch.setattr(weather_service, "fetch_weather", lambda resolved, horizon: tonight_result)
 
     def _raise(**kwargs):
-        raise orchestrator_service.OrchestratorError("provider_error")
+        raise orchestrator_service.OrchestratorError("provider_unavailable")
 
     monkeypatch.setattr(orchestrator_service, "generate_tool_result_reply", _raise)
 

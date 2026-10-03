@@ -200,6 +200,17 @@ def test_generate_reply_raises_contract_violation_on_multiple_tool_calls(monkeyp
     assert exc_info.value.tool_call_count == 2
 
 
+def test_orchestrator_contract_violation_error_category_is_unknown_provider_error() -> None:
+    """Checkpoint 5.1 — a contract violation is a real response-shape
+    anomaly, not one of Anthropic's own documented exception/error-type
+    cases, so it is deliberately NOT given its own new
+    ModelFailureCategory — it maps to the honest unknown_provider_error
+    bucket instead."""
+    exc = orchestrator_service.OrchestratorContractViolationError("no_tool_call", 0)
+    assert exc.category == "unknown_provider_error"
+    assert isinstance(exc, orchestrator_service.OrchestratorError)
+
+
 def test_generate_reply_parses_respond_with_text_like_any_other_tool(monkeypatch: pytest.MonkeyPatch) -> None:
     """respond_with_text is not special-cased at the Orchestrator layer
     at all — it is parsed into an ordinary ToolCallRequest exactly like
@@ -252,14 +263,18 @@ def test_generate_reply_tool_only_response_has_none_text(monkeypatch: pytest.Mon
 
 def test_generate_reply_wraps_model_router_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def _raise(*, purpose, messages, system=None, tools=None):
-        raise orchestrator_service.model_router_service.ModelRouterError("provider_error")
+        raise orchestrator_service.model_router_service.ModelRouterError("billing_or_credits")
 
     monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
 
-    with pytest.raises(orchestrator_service.OrchestratorError):
+    with pytest.raises(orchestrator_service.OrchestratorError) as exc_info:
         orchestrator_service.generate_reply(
             history=[], context="", user_message="hi", current_datetime_local=_ANCHOR
         )
+    # Checkpoint 5.1 — the normalized category passes through unchanged,
+    # letting Chat build its own degradation wording without importing
+    # model_router_service directly.
+    assert exc_info.value.category == "billing_or_credits"
 
 
 def test_system_prompt_forbids_write_claims_and_data_beyond_context() -> None:
@@ -676,11 +691,11 @@ def test_generate_tool_result_reply_sends_no_tools_and_reuses_correlation_id(
 
 def test_generate_tool_result_reply_wraps_model_router_error(monkeypatch: pytest.MonkeyPatch) -> None:
     def _raise(**kwargs):
-        raise orchestrator_service.model_router_service.ModelRouterError("provider_error")
+        raise orchestrator_service.model_router_service.ModelRouterError("timeout")
 
     monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
 
-    with pytest.raises(orchestrator_service.OrchestratorError):
+    with pytest.raises(orchestrator_service.OrchestratorError) as exc_info:
         orchestrator_service.generate_tool_result_reply(
             user_message="do I need a jacket?",
             tool_use_id="toolu_1",
@@ -690,6 +705,7 @@ def test_generate_tool_result_reply_wraps_model_router_error(monkeypatch: pytest
             tool_result_content="{}",
             correlation_id="corr_x",
         )
+    assert exc_info.value.category == "timeout"
 
 
 # ---- Checkpoint 4.5d: proactive narration (HOW only) -----------------------
@@ -746,14 +762,15 @@ def test_generate_app_opened_narration_text_raises_orchestrator_error_on_provide
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _raise(**kwargs):
-        raise orchestrator_service.model_router_service.ModelRouterError("provider_error")
+        raise orchestrator_service.model_router_service.ModelRouterError("connection")
 
     monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
 
-    with pytest.raises(orchestrator_service.OrchestratorError):
+    with pytest.raises(orchestrator_service.OrchestratorError) as exc_info:
         orchestrator_service.generate_app_opened_narration_text(
             signal_type="TASK_OVERDUE", title="Call Hussein", priority="high"
         )
+    assert exc_info.value.category == "connection"
 
 
 def test_generate_app_opened_narration_text_uses_identity_and_one_topic_instructions(
@@ -857,12 +874,21 @@ def test_verify_no_mutation_claim_sends_only_the_candidate_text(monkeypatch: pyt
 
 def test_verify_no_mutation_claim_raises_on_provider_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     def _raise(**kwargs):
-        raise orchestrator_service.model_router_service.ModelRouterError("provider_error")
+        raise orchestrator_service.model_router_service.ModelRouterError("rate_limited")
 
     monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
 
-    with pytest.raises(orchestrator_service.ClaimVerificationFailed):
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed) as exc_info:
         orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+    # Checkpoint 5.1, section 18A — the durable, in-memory distinction
+    # between "could not complete because of a provider/infrastructure
+    # failure" (category is the real normalized failure, never None)
+    # and "the provider call succeeded but the business contract was
+    # violated" (category is None — see the parametrized contract-
+    # violation test below). This is the observability answer: no new
+    # schema, just this existing attribute plus AiTrace's own
+    # status=error row for the SAME call (see model_router's own tests).
+    assert exc_info.value.category == "rate_limited"
 
 
 def test_verify_no_mutation_claim_raises_on_zero_tool_calls(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -911,6 +937,45 @@ def test_verify_no_mutation_claim_raises_on_non_boolean_value(monkeypatch: pytes
     )
     with pytest.raises(orchestrator_service.ClaimVerificationFailed):
         orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+
+
+@pytest.mark.parametrize(
+    "label,fake_response",
+    [
+        ("zero_tool_calls", _FakeModelResponse(text="I think that's fine.", tool_uses=[])),
+        (
+            "multiple_tool_calls",
+            _FakeModelResponse(tool_uses=[
+                _FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": True}),
+                _FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": False}),
+            ]),
+        ),
+        ("wrong_tool_name", _FakeModelResponse(tool_uses=[_FakeToolUse("respond_with_text", {"kind": "answer", "text": "x"})])),
+        ("missing_boolean", _FakeModelResponse(tool_uses=[_FakeToolUse("certify_claim", {})])),
+        (
+            "non_boolean_value",
+            _FakeModelResponse(tool_uses=[_FakeToolUse("certify_claim", {"claims_bazra_mutation_completed": "true"})]),
+        ),
+    ],
+)
+def test_verify_no_mutation_claim_contract_violation_has_no_category(
+    monkeypatch: pytest.MonkeyPatch, label: str, fake_response,
+) -> None:
+    """Checkpoint 5.1, section 18A — the other half of the observability
+    distinction: when the underlying provider CALL itself succeeded
+    (AiTrace would show status=success for this row — see
+    model_router's own tests) but the verifier's OWN output contract
+    was violated, category is None — never mistaken for, or mislabeled
+    as, a provider/infrastructure failure. This is what makes "provider
+    failed" (category set) and "contract violated on an otherwise-
+    successful call" (category None) distinguishable after the fact,
+    without any new schema."""
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", lambda **kwargs: fake_response)
+
+    with pytest.raises(orchestrator_service.ClaimVerificationFailed) as exc_info:
+        orchestrator_service.verify_no_mutation_claim("Done — I've added it.")
+    assert exc_info.value.category is None
+
 
 
 def test_claim_verification_failed_is_not_an_orchestrator_error() -> None:

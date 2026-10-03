@@ -14,6 +14,7 @@ from app.modules.model_router.models import AiTrace
 from app.modules.model_router.schemas import (
     VALID_PURPOSES,
     ModelCallPurpose,
+    ModelFailureCategory,
     ModelResponse,
     TextBlock,
     ToolResultBlock,
@@ -68,7 +69,21 @@ _COST_PER_MILLION_TOKENS_USD: dict[str, dict[str, Decimal]] = {
 
 class ModelRouterError(Exception):
     """Raised after the failure trace has already been (best-effort)
-    recorded — see complete()'s docstring for the exact guarantee."""
+    recorded — see complete()'s docstring for the exact guarantee.
+
+    category (Checkpoint 5.1) is the normalized, provider-neutral
+    ModelFailureCategory for this failure — the exact same value
+    already written to AiTrace.error_summary for the same row (see
+    _classify_failure). Callers that need to distinguish failure kinds
+    (Chat's own degradation wording, the claim verifier's observability
+    distinction) read this attribute rather than parsing str(exc) or
+    importing anthropic's own exception classes — this module remains
+    the only place that knows those.
+    """
+
+    def __init__(self, category: ModelFailureCategory):
+        self.category = category
+        super().__init__(category)
 
 
 def _get_client() -> Anthropic:
@@ -190,24 +205,93 @@ def _safe_estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) 
         return None
 
 
-def _summarize_error(exc: Exception) -> str:
-    """Short, categorized reason — never the raw exception message,
-    which isn't safe to assume is free of request-derived detail."""
+def _classify_failure(exc: Exception) -> ModelFailureCategory:
+    """Normalized, provider-neutral failure classification (Checkpoint
+    5.1) — the ONLY place in the codebase that needs to know Anthropic's
+    own exception classes or its documented error-body "type" strings.
+    Both ModelRouterError.category and AiTrace.error_summary are always
+    this function's return value, verbatim — never a separately
+    "summarized" string, so the two stay identical by construction.
+
+    Precedence, most to least specific (Checkpoint 5.1's own explicit
+    requirement that a broad SDK parent class must never swallow a more
+    specific failure):
+
+    1. anthropic.APIStatusError.type — Anthropic's own documented,
+       stable error-body field (confirmed by live SDK inspection:
+       anthropic._exceptions.APIStatusError.__init__ populates `.type`
+       straight from the parsed JSON body's `error.type`, and
+       anthropic.types.shared.error_type.ErrorType is a closed set of 9
+       literal strings, including "billing_error" — the exact stable,
+       machine-readable signal needed to classify the real credit-
+       exhaustion incident reliably, WITHOUT brittle free-text
+       matching). Checked first because it is strictly more specific
+       than the exception's own Python class: a billing failure and a
+       plain invalid request can both arrive as the same
+       BadRequestError (HTTP 400) class, and only `.type` tells them
+       apart. NOT reproduced against a real failing call (no real
+       provider calls were made for this checkpoint, per its own
+       constraints) — this mapping rests on the SDK's own documented
+       contract, not an observed response body.
+    2. The exception's own Python class/HTTP status code, for the rarer
+       case `.type` is absent or not one of the 9 known literals (e.g.
+       a malformed error body, or a future Anthropic error type this
+       set doesn't recognize yet) — most specific subclass checked
+       first so e.g. AuthenticationError is never swallowed by checking
+       the common APIStatusError parent before it.
+    3. unknown_provider_error — the final, honest fallback for
+       anything not covered above; never guessed into a more specific,
+       falsely-precise bucket (the same "prefer honest over falsely
+       precise" instruction given for billing specifically, applied
+       here as the general policy).
+    """
     if isinstance(exc, RuntimeError) and "ANTHROPIC_API_KEY" in str(exc):
-        return "missing_api_key"
-    if isinstance(exc, anthropic.AuthenticationError):
-        return "invalid_api_key"
-    if isinstance(exc, anthropic.RateLimitError):
-        return "rate_limited"
+        return "authentication"
+
+    if isinstance(exc, anthropic.APIStatusError):
+        error_type = exc.type
+        if error_type == "billing_error":
+            return "billing_or_credits"
+        if error_type in ("authentication_error", "permission_error"):
+            return "authentication"
+        if error_type == "not_found_error":
+            return "model_unavailable"
+        if error_type == "rate_limit_error":
+            return "rate_limited"
+        if error_type == "timeout_error":
+            return "timeout"
+        if error_type in ("overloaded_error", "api_error"):
+            return "provider_unavailable"
+        if error_type == "invalid_request_error":
+            return "invalid_request"
+
+        # `.type` absent or not one of the 9 known literals — fall back
+        # to the exception's own class, most specific first.
+        if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
+            return "authentication"
+        if isinstance(exc, anthropic.NotFoundError):
+            return "model_unavailable"
+        if isinstance(exc, anthropic.RateLimitError):
+            return "rate_limited"
+        if isinstance(exc, anthropic.DeadlineExceededError):
+            return "timeout"
+        if isinstance(
+            exc, (anthropic.OverloadedError, anthropic.ServiceUnavailableError, anthropic.InternalServerError)
+        ):
+            return "provider_unavailable"
+        if isinstance(
+            exc, (anthropic.BadRequestError, anthropic.RequestTooLargeError, anthropic.UnprocessableEntityError, anthropic.ConflictError)
+        ):
+            return "invalid_request"
+        return "unknown_provider_error"
+
     if isinstance(exc, anthropic.APITimeoutError):
         return "timeout"
     if isinstance(exc, anthropic.APIConnectionError):
-        return "connection_error"
-    if isinstance(exc, anthropic.APIStatusError):
-        return "provider_error"
+        return "connection"
     if isinstance(exc, ValueError):
         return "unparseable_response"
-    return "unknown_error"
+    return "unknown_provider_error"
 
 
 def _record_trace(**fields) -> None:
@@ -330,6 +414,7 @@ def complete(
         raw = _call_anthropic(model, messages, system=system, tools=tools, tool_choice=tool_choice)
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
+        category = _classify_failure(exc)
         _safe_record_trace(
             provider="anthropic",
             model=model,
@@ -339,10 +424,10 @@ def complete(
             prompt_tokens=None,
             completion_tokens=None,
             estimated_cost_usd=None,
-            error_summary=_summarize_error(exc),
+            error_summary=category,
             correlation_id=resolved_correlation_id,
         )
-        raise ModelRouterError(_summarize_error(exc)) from exc
+        raise ModelRouterError(category) from exc
 
     latency_ms = int((time.monotonic() - start) * 1000)
 
@@ -366,6 +451,7 @@ def complete(
             if prompt_tokens is not None and completion_tokens is not None
             else None
         )
+        category = _classify_failure(exc)
         _safe_record_trace(
             provider="anthropic",
             model=model,
@@ -375,10 +461,10 @@ def complete(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             estimated_cost_usd=estimated_cost_usd,
-            error_summary=_summarize_error(exc),
+            error_summary=category,
             correlation_id=resolved_correlation_id,
         )
-        raise ModelRouterError(_summarize_error(exc)) from exc
+        raise ModelRouterError(category) from exc
 
     # Boundary 3: the call succeeded and parsed cleanly. Cost estimation
     # and trace persistence each get their own failure boundary — if

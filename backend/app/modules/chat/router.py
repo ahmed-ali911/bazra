@@ -28,7 +28,12 @@ def send_message(
     except service.ChatModelCallFailed as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={"error": "model_call_failed", "user_message_id": exc.user_message_id},
+            detail={
+                "error": "model_call_failed",
+                "reason": exc.category,
+                "message": exc.degradation_message,
+                "user_message_id": exc.user_message_id,
+            },
         ) from exc
     except ValueError as exc:
         # Propagated from home_service.build_home_summary's own

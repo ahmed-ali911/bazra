@@ -246,7 +246,20 @@ _SYSTEM_INSTRUCTIONS = (
 
 class OrchestratorError(Exception):
     """Wraps model_router_service.ModelRouterError so callers of this
-    module don't need to import model_router directly."""
+    module don't need to import model_router directly.
+
+    category (Checkpoint 5.1) carries ModelRouterError.category through
+    unchanged — the same normalized ModelFailureCategory value, so Chat
+    can build an honest degradation message without importing
+    model_router itself. OrchestratorContractViolationError (below)
+    sets this to "unknown_provider_error" itself, since a contract
+    violation is a real response shape anomaly, not one of Anthropic's
+    own documented exception/error-type cases.
+    """
+
+    def __init__(self, category: str):
+        self.category = category
+        super().__init__(category)
 
 
 class OrchestratorContractViolationError(OrchestratorError):
@@ -269,7 +282,8 @@ class OrchestratorContractViolationError(OrchestratorError):
     def __init__(self, reason: str, tool_call_count: int):
         self.reason = reason
         self.tool_call_count = tool_call_count
-        super().__init__(f"{reason} (tool_call_count={tool_call_count})")
+        self.category = "unknown_provider_error"
+        Exception.__init__(self, f"{reason} (tool_call_count={tool_call_count})")
 
 
 def _build_system_prompt(context: str, current_datetime_local: str) -> str:
@@ -359,7 +373,7 @@ def generate_reply(
     try:
         response = model_router_service.complete(**complete_kwargs)
     except model_router_service.ModelRouterError as exc:
-        raise OrchestratorError(str(exc)) from exc
+        raise OrchestratorError(exc.category) from exc
 
     # Checkpoint 3.23 — exactly-one-tool-call enforcement. Applied only
     # when tools were actually offered (tool_choice was only set in
@@ -444,7 +458,7 @@ def generate_tool_result_reply(
             correlation_id=correlation_id,
         )
     except model_router_service.ModelRouterError as exc:
-        raise OrchestratorError(str(exc)) from exc
+        raise OrchestratorError(exc.category) from exc
 
     return response.text
 
@@ -554,7 +568,7 @@ def generate_app_opened_narration_text(signal_type: str, title: str, priority: s
             tools=None,
         )
     except model_router_service.ModelRouterError as exc:
-        raise OrchestratorError(str(exc)) from exc
+        raise OrchestratorError(exc.category) from exc
 
     return response.text
 
@@ -569,7 +583,28 @@ class ClaimVerificationFailed(Exception):
     as ChatModelCallFailed/502) from a genuine primary-chat-call
     failure, so the two exception hierarchies are kept separate to
     make conflating them a type error, not a silent bug.
+
+    category (Checkpoint 5.1) is the normalized ModelFailureCategory
+    when, and ONLY when, this was raised because the underlying
+    model_router call itself failed (ModelRouterError) — None for every
+    other raise site below (zero/multiple tool calls, wrong tool name,
+    missing/non-boolean field), where the provider call succeeded and
+    the failure is a business-contract violation, not a provider/
+    infrastructure failure. This is the durable, in-memory distinction
+    the 5.1 "verifier outcome vs verifier infrastructure failure"
+    observability requirement calls for: category is not None if and
+    only if verification could not even be attempted/completed due to
+    the provider; category is None if and only if the provider call
+    itself succeeded but the response violated this verifier's own
+    output contract. Neither case is a successful negative
+    certification — that path never raises at all (see
+    verify_no_mutation_claim's own return statement).
     """
+
+    def __init__(self, reason: str, category: str | None = None):
+        self.reason = reason
+        self.category = category
+        super().__init__(reason)
 
 
 # Checkpoint 3.25 — the independent mutation-claim verifier's own
@@ -664,7 +699,7 @@ def verify_no_mutation_claim(candidate_text: str) -> bool:
             tool_choice=_CERTIFY_CLAIM_TOOL_CHOICE,
         )
     except model_router_service.ModelRouterError as exc:
-        raise ClaimVerificationFailed("provider_call_failed") from exc
+        raise ClaimVerificationFailed("provider_call_failed", category=exc.category) from exc
 
     tool_uses = response.tool_uses
     if len(tool_uses) != 1:

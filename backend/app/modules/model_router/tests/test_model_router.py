@@ -1,3 +1,5 @@
+import anthropic
+import httpx2
 import pytest
 from sqlalchemy import func, select, text
 from sqlalchemy.engine import Engine
@@ -355,7 +357,11 @@ def test_missing_api_key_records_error_trace_without_calling_provider(
     assert after == before + 1
     trace = _latest_trace(db_session)
     assert trace.status == "error"
-    assert trace.error_summary == "missing_api_key"
+    # Checkpoint 5.1 — a missing API key is a configuration/credential
+    # problem, the same semantic home as a genuinely invalid key; folded
+    # into "authentication" rather than kept as its own bucket (see
+    # _classify_failure's own docstring).
+    assert trace.error_summary == "authentication"
 
 
 def test_response_parsing_failure_when_usage_unreadable_records_exactly_one_error_trace_with_null_tokens(
@@ -811,6 +817,138 @@ def test_complete_still_uses_default_model_for_chat_completion(
     model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
 
     assert captured["model"] == "claude-sonnet-5"
+
+
+# ---- Checkpoint 5.1: provider-neutral failure taxonomy ----------------------
+
+
+def _status_error(
+    cls: type[anthropic.APIStatusError], error_type: str | None, status_code: int = 400
+) -> anthropic.APIStatusError:
+    """Builds a REAL instance of one of anthropic's own APIStatusError
+    subclasses, with a real httpx2.Request/Response underneath —
+    exactly the shape _classify_failure actually receives in
+    production, not a hand-rolled stand-in. error_type=None simulates a
+    malformed/unrecognized error body (no usable `.type` at all),
+    exercising the exception-class fallback branch of _classify_failure
+    rather than the `.type`-based one."""
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    body = {"type": "error", "error": {"type": error_type, "message": "simulated"}} if error_type else {}
+    response = httpx2.Response(status_code, request=request, json=body)
+    return cls("simulated", response=response, body=body)
+
+
+@pytest.mark.parametrize(
+    "label,exc,expected_category",
+    [
+        # ---- precedence: .type (most specific, stable SDK evidence) first ----
+        ("billing_error_type_on_bad_request", _status_error(anthropic.BadRequestError, "billing_error"), "billing_or_credits"),
+        ("billing_error_type_on_permission_denied", _status_error(anthropic.PermissionDeniedError, "billing_error"), "billing_or_credits"),
+        ("authentication_error_type", _status_error(anthropic.AuthenticationError, "authentication_error", 401), "authentication"),
+        ("permission_error_type", _status_error(anthropic.PermissionDeniedError, "permission_error", 403), "authentication"),
+        ("not_found_error_type", _status_error(anthropic.NotFoundError, "not_found_error", 404), "model_unavailable"),
+        ("rate_limit_error_type", _status_error(anthropic.RateLimitError, "rate_limit_error", 429), "rate_limited"),
+        ("timeout_error_type", _status_error(anthropic.DeadlineExceededError, "timeout_error", 504), "timeout"),
+        ("overloaded_error_type", _status_error(anthropic.OverloadedError, "overloaded_error", 529), "provider_unavailable"),
+        ("api_error_type", _status_error(anthropic.InternalServerError, "api_error", 500), "provider_unavailable"),
+        ("invalid_request_error_type", _status_error(anthropic.BadRequestError, "invalid_request_error"), "invalid_request"),
+        # ---- precedence: exception class fallback when .type is absent -------
+        ("authentication_class_fallback", _status_error(anthropic.AuthenticationError, None, 401), "authentication"),
+        ("permission_denied_class_fallback", _status_error(anthropic.PermissionDeniedError, None, 403), "authentication"),
+        ("not_found_class_fallback", _status_error(anthropic.NotFoundError, None, 404), "model_unavailable"),
+        ("rate_limit_class_fallback", _status_error(anthropic.RateLimitError, None, 429), "rate_limited"),
+        ("deadline_exceeded_class_fallback", _status_error(anthropic.DeadlineExceededError, None, 504), "timeout"),
+        ("overloaded_class_fallback", _status_error(anthropic.OverloadedError, None, 529), "provider_unavailable"),
+        ("service_unavailable_class_fallback", _status_error(anthropic.ServiceUnavailableError, None, 503), "provider_unavailable"),
+        ("internal_server_error_class_fallback", _status_error(anthropic.InternalServerError, None, 500), "provider_unavailable"),
+        ("bad_request_class_fallback", _status_error(anthropic.BadRequestError, None), "invalid_request"),
+        ("request_too_large_class_fallback", _status_error(anthropic.RequestTooLargeError, None, 413), "invalid_request"),
+        ("unprocessable_entity_class_fallback", _status_error(anthropic.UnprocessableEntityError, None, 422), "invalid_request"),
+        ("conflict_class_fallback", _status_error(anthropic.ConflictError, None, 409), "invalid_request"),
+        # ---- non-status-error branches ----------------------------------------
+        ("missing_api_key", RuntimeError("ANTHROPIC_API_KEY is not configured"), "authentication"),
+        ("parsing_failure", ValueError("No text content or tool use in provider response"), "unparseable_response"),
+        ("fully_unknown_exception", KeyError("boom"), "unknown_provider_error"),
+    ],
+)
+def test_classify_failure_maps_every_known_shape_to_its_normalized_category(
+    label: str, exc: Exception, expected_category: str,
+) -> None:
+    assert model_router_service._classify_failure(exc) == expected_category
+
+
+def test_classify_failure_authentication_error_is_never_swallowed_by_api_status_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 5.1 section 7's own explicit precedence requirement:
+    a broad SDK parent class (APIStatusError) must never swallow a more
+    specific failure before the specific isinstance check runs. Proven
+    directly against the real class hierarchy, not just by inspection:
+    AuthenticationError IS an APIStatusError, and still classifies as
+    'authentication', never the generic fallback."""
+    exc = _status_error(anthropic.AuthenticationError, None, 401)
+    assert isinstance(exc, anthropic.APIStatusError)
+    assert model_router_service._classify_failure(exc) == "authentication"
+
+
+def test_classify_failure_timeout_error_is_checked_before_the_connection_error_parent() -> None:
+    """anthropic.APITimeoutError subclasses APIConnectionError — proves
+    the more specific 'timeout' category wins, never the broader
+    'connection' category a naive single isinstance(APIConnectionError)
+    check would produce."""
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    exc = anthropic.APITimeoutError(request=request)
+    assert isinstance(exc, anthropic.APIConnectionError)
+    assert model_router_service._classify_failure(exc) == "timeout"
+
+
+def test_classify_failure_plain_connection_error_is_not_classified_as_timeout() -> None:
+    request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    exc = anthropic.APIConnectionError(request=request)
+    assert model_router_service._classify_failure(exc) == "connection"
+
+
+def test_model_router_error_exposes_category_and_matches_str(monkeypatch: pytest.MonkeyPatch) -> None:
+    exc = model_router_service.ModelRouterError("billing_or_credits")
+    assert exc.category == "billing_or_credits"
+    assert str(exc) == "billing_or_credits"
+
+
+def test_complete_failure_records_the_normalized_category_in_both_trace_and_exception(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: the SAME normalized category reaches both
+    AiTrace.error_summary (durable) and ModelRouterError.category
+    (in-memory, for the caller) — never a separately re-derived value
+    that could drift between the two."""
+    monkeypatch.setattr(model_router_service.settings, "anthropic_api_key", "test-key")
+    monkeypatch.setattr(
+        model_router_service, "_call_anthropic",
+        _raise(_status_error(anthropic.BadRequestError, "billing_error")),
+    )
+
+    with pytest.raises(model_router_service.ModelRouterError) as exc_info:
+        model_router_service.complete(purpose="chat_completion", messages=[{"role": "user", "content": "hi"}])
+
+    assert exc_info.value.category == "billing_or_credits"
+    trace = _latest_trace(db_session)
+    assert trace.status == "error"
+    assert trace.error_summary == "billing_or_credits"
+
+
+def test_historical_pre_5_1_error_summary_values_remain_valid(db_session: Session) -> None:
+    """Checkpoint 5.1, section 6 — error_summary is a plain String
+    column with no CHECK constraint/native enum (confirmed by reading
+    models.py directly) — a pre-5.1 row using the OLD vocabulary
+    (e.g. "provider_error", "invalid_api_key") must still read back
+    correctly, unchanged, requiring no migration or backfill."""
+    row = AiTrace(
+        provider="anthropic", model="claude-sonnet-5", purpose="chat_completion",
+        status="error", latency_ms=50, error_summary="provider_error",
+    )
+    db_session.add(row)
+    db_session.commit()
+    db_session.refresh(row)
+
+    assert row.error_summary == "provider_error"
 
 
 def test_claim_verification_cost_estimation_uses_the_existing_haiku_rate_table_entry(

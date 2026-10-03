@@ -1087,6 +1087,88 @@ CODE-INFERRED BEHAVIOR (deduced from reading the source, not observed at
 runtime), and NOT RETAINED / NOT AVAILABLE. Code-inferred behavior should
 never be presented as captured runtime evidence.
 
+## Phase 5 — Model Intelligence Routing, Cost & Resilience
+
+### Checkpoint 5.1 — Provider Failure Taxonomy + Honest Deterministic Degradation
+
+Motivated by a real incident: Anthropic organization credits were exhausted,
+and the only user-visible result was a generic `"Something went wrong
+sending that message."` — the Model Router's own `_summarize_error`
+collapsed every `anthropic.APIStatusError` subtype except auth/rate-limit
+into one generic `"provider_error"` bucket, losing the one distinction that
+actually mattered.
+
+**A small, stable, provider-neutral failure taxonomy** now lives at the
+Model Router boundary (`model_router/schemas.py::ModelFailureCategory`):
+`authentication`, `billing_or_credits`, `rate_limited`, `timeout`,
+`connection`, `provider_unavailable`, `invalid_request`,
+`model_unavailable`, `unparseable_response`, `unknown_provider_error`.
+Callers outside `model_router` never need to know Anthropic's own exception
+classes — they read `ModelRouterError.category`
+(`OrchestratorError.category`, `ChatModelCallFailed.category`), the same
+value already persisted to `AiTrace.error_summary` for that row.
+
+**Classification evidence, not guesswork**: live SDK inspection confirmed
+`anthropic.APIStatusError.type` is populated from the API's own documented,
+closed-set error-body field (`anthropic.types.shared.error_type.ErrorType`
+— 9 literal strings, including `"billing_error"`). This is the stable,
+machine-readable signal used to classify billing/credit failures reliably,
+never brittle free-text matching against a provider error message.
+`model_router/service.py::_classify_failure` checks `.type` first (most
+specific), falls back to the exception's own class (most-specific subclass
+checked before its common `APIStatusError` parent, so e.g.
+`AuthenticationError` is never swallowed by the generic case), and only
+then falls back to the honest `unknown_provider_error` — never a
+falsely-precise guess. This mapping rests on the SDK's documented contract;
+no real provider call was made to reproduce it (none were permitted for
+this checkpoint).
+
+**Honest deterministic degradation, never a fake conversational turn**: a
+primary-generation failure (`ChatModelCallFailed`) returns an HTTP 502 with
+`{"error": "model_call_failed", "reason": <category>, "message": <wording>,
+"user_message_id": N}` — additive to the existing contract, not a rename.
+`message` is one of exactly two deterministic, bilingual (Arabic/English,
+matching the user's own triggering message via the same `_is_arabic`
+mechanism every other BAZRA-authored reply uses) wordings —
+"try again shortly" only for the categories where that's honest
+(`rate_limited`/`timeout`/`connection`/`provider_unavailable`), "not
+available right now" for everything else — never ten robotic messages for
+ten internal categories. This wording is **never persisted as a
+`ChatMessage`**: a transport/provider failure is not a conversational turn,
+and conversation history must never contain BAZRA "speech" that never
+actually happened. The user's own message remains durably persisted exactly
+as before; no retry is attempted anywhere.
+
+**Verifier outcome vs. verifier infrastructure failure** (an observability
+distinction, not a safety change): `ClaimVerificationFailed.category` is the
+normalized `ModelFailureCategory` when, and only when, the verifier's own
+provider call failed — `None` when the provider call succeeded but the
+verifier's output contract was violated (wrong tool count/name, missing/
+non-boolean field). A successful negative certification
+(`claims_bazra_mutation_completed=False`) never raises at all. These three
+outcomes are durably distinguishable after the fact from existing evidence
+alone (`ClaimVerificationFailed.category` plus the same-call `AiTrace`
+row's `status`/`error_summary`) — no new schema, no new column, no new
+table. The existing fail-closed, user-facing safety behavior (an untrusted
+or failed verification is treated exactly like an explicit unsafe
+certification) is unchanged.
+
+**Unaffected by design** (existing accepted behavior, re-confirmed, not
+touched): APP_OPENED narration/verifier failure still degrades to its
+deterministic fallback template and is revalidated exactly as Phase 4 left
+it; weather reason-mode still degrades to the already-fetched factual reply
+on a reasoning-continuation failure; Phase 3 write authority
+(`confirm_and_execute`/`reject`/adjacency) has zero model/provider coupling
+and executes identically whether or not the provider is reachable at all.
+
+**Not in this checkpoint** (by design, not oversight): no retry, no second
+provider, no intelligence tiers, no zero-LLM retrieval routing, no cost
+dashboard/reporting endpoint, no per-user/per-space cost tracking. No
+migration — `AiTrace.error_summary` is a plain `String` column with no
+CHECK constraint or native enum; pre-5.1 rows using the old vocabulary
+(`"provider_error"`, `"invalid_api_key"`, etc.) remain valid, untouched,
+historical data.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1

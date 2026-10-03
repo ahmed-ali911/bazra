@@ -604,6 +604,42 @@ _UNVERIFIED_MUTATION_CLAIM_MESSAGE_AR = "أنا ما عملتش التغيير �
 
 _NO_REPLY_FALLBACK_MESSAGE = "Sorry, I don't have a reply for that."
 
+# Checkpoint 5.1 — honest, deterministic degradation wording for a
+# primary-generation model-call failure (ChatModelCallFailed). NEVER
+# persisted as a ChatMessage (see ChatModelCallFailed's own docstring
+# for why: conversation history must contain actual conversation, not
+# a transport/service error masquerading as BAZRA speech) — these
+# strings only ever reach the user via the HTTP error detail's own
+# "message" field, for the frontend to display in its existing
+# transient error UI, exactly like _UNVERIFIED_MUTATION_CLAIM_MESSAGE_*
+# reaches the user via a real persisted reply. Deliberately just TWO
+# wordings, not one per ModelFailureCategory — distinguishing "try
+# again shortly" (only honest for a category that might plausibly
+# resolve itself) from "not available right now" (everything else,
+# including categories this code cannot promise will resolve on retry)
+# is the only distinction worth making to the user; see
+# model_router/schemas.py's own ModelFailureCategory retryability
+# grouping, mirrored by _TRANSIENT_FAILURE_CATEGORIES below.
+_MODEL_DEGRADATION_TRANSIENT_MESSAGE_EN = (
+    "I can't reach the model right now. Your message is saved — try again in a bit."
+)
+_MODEL_DEGRADATION_TRANSIENT_MESSAGE_AR = "مش قادر أوصل لمحرك الذكاء دلوقتي. رسالتك محفوظة، جرّب تاني بعد شوية."
+
+_MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN = (
+    "The model isn't available right now. Your message is saved, but I couldn't finish a reply."
+)
+_MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_AR = "محرك الذكاء مش متاح دلوقتي. رسالتك محفوظة، لكن مقدرتش أكمل الرد."
+
+# rate_limited/timeout/connection/provider_unavailable are the only
+# categories where "try again shortly" is an honest thing to say — see
+# ModelFailureCategory's own "POTENTIALLY TRANSIENT" grouping. Every
+# other category (authentication, billing_or_credits, invalid_request,
+# model_unavailable, unparseable_response, unknown_provider_error) gets
+# the plain "not available" wording, which promises nothing about
+# whether retrying will help — never falsely reassuring for a
+# non-retryable or genuinely unknown cause.
+_TRANSIENT_FAILURE_CATEGORIES = frozenset({"rate_limited", "timeout", "connection", "provider_unavailable"})
+
 _ARABIC_SCRIPT_RE = re.compile(r"[؀-ۿ]")
 
 # Type labels for the context section shown to the model — INFERENCE is
@@ -673,8 +709,17 @@ class MessageTooLongError(Exception):
 
 
 class ChatModelCallFailed(Exception):
-    def __init__(self, user_message_id: int):
+    """category/degradation_message (Checkpoint 5.1) let router.py build
+    an honest HTTP error detail without needing its own access to
+    `content` (the triggering message, needed to pick Arabic/English
+    wording) or to orchestrator_service's own exception types — both
+    are computed once, here, where `content` is already in scope (see
+    send_message's own raise site)."""
+
+    def __init__(self, user_message_id: int, category: str, degradation_message: str):
         self.user_message_id = user_message_id
+        self.category = category
+        self.degradation_message = degradation_message
         super().__init__("Model call failed")
 
 
@@ -964,6 +1009,21 @@ def _is_arabic(text: str) -> bool:
     most direct signal of what language the user is writing in right
     now."""
     return bool(_ARABIC_SCRIPT_RE.search(text))
+
+
+def _reply_for_model_unavailable(category: str, user_message: str) -> str:
+    """Checkpoint 5.1 — the ONLY place this checkpoint decides the
+    user-facing wording for a primary-generation model-call failure.
+    Never persisted — see ChatModelCallFailed's own docstring and
+    _MODEL_DEGRADATION_*'s own comment above for why. Picked the same
+    way every other bilingual BAZRA-authored string in this module is
+    (_is_arabic on the triggering message), so a user who has been
+    writing in Arabic throughout never suddenly sees an English
+    transport error."""
+    is_transient = category in _TRANSIENT_FAILURE_CATEGORIES
+    if _is_arabic(user_message):
+        return _MODEL_DEGRADATION_TRANSIENT_MESSAGE_AR if is_transient else _MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_AR
+    return _MODEL_DEGRADATION_TRANSIENT_MESSAGE_EN if is_transient else _MODEL_DEGRADATION_UNAVAILABLE_MESSAGE_EN
 
 
 def _format_due_at_local(due_at_iso: str, timezone_name: str) -> str:
@@ -2078,7 +2138,9 @@ def send_message(
             tools=_TOOLS_OFFERED,
         )
     except orchestrator_service.OrchestratorError as exc:
-        raise ChatModelCallFailed(user_message.id) from exc
+        raise ChatModelCallFailed(
+            user_message.id, exc.category, _reply_for_model_unavailable(exc.category, content)
+        ) from exc
 
     # Checkpoint 3.23 — result.tool_call is now guaranteed non-None on
     # a successful return from generate_reply (it raises
