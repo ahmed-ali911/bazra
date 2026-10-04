@@ -247,8 +247,17 @@ def check_invented_date(case: EvaluationCase) -> CheckResult:
     return CheckResult("invented_date", True, "no invented concrete date/weekday found")
 
 
-def check_on_topic(case: EvaluationCase) -> CheckResult:
-    """Proves grounding + single-topic boundedness together (A, H, I in
+def check_on_topic_v1(case: EvaluationCase) -> CheckResult:
+    """Checkpoint 5.4's original grounding check — preserved verbatim,
+    byte-for-byte, under its own versioned name (Checkpoint 5.5A). The
+    bare name `check_on_topic` (below) is kept as a plain alias to THIS
+    function, not a separate implementation, so every existing 5.4
+    fixture/test/ALL_CHECKS reference continues to resolve to the exact
+    same object with zero behavior change. See `evals.grounding_v2` for
+    the new, separately-versioned, hardened `check_on_topic_v2` — V1 is
+    never silently redefined.
+
+    Proves grounding + single-topic boundedness together (A, H, I in
     the brief's list): the candidate must contain the case's own
     authoritative `title` verbatim, and must not contain any of the
     case's own `facts["distractor_titles"]` (a small, explicit,
@@ -271,6 +280,13 @@ def check_on_topic(case: EvaluationCase) -> CheckResult:
         if distractor in text:
             return CheckResult("on_topic", False, f"candidate mentions an unrelated second concern {distractor!r}")
     return CheckResult("on_topic", True, "candidate mentions only the selected concern")
+
+
+# Checkpoint 5.5A — a plain alias, not a redefinition: every pre-
+# existing reference to `check_on_topic` (ALL_CHECKS below,
+# evals/tests/test_proactive_narration.py) continues to resolve to the
+# exact same function object, unchanged.
+check_on_topic = check_on_topic_v1
 
 
 ALL_CHECKS = (

@@ -1582,6 +1582,111 @@ existing prompt, every existing fallback path, and Phase 3 write authority
 are all untouched — re-proven by full regression, not merely assumed. No
 migration, no new dependency, no frontend change.
 
+### Checkpoint 5.5A — Grounding Evaluator Hardening
+
+**IMPROVE THE RULER. DO NOT FIT THE RULER TO THE ANSWERS WE ALREADY SAW.**
+Checkpoint 5.5's own benchmark confirmed the deterministic `on_topic` check's
+dominant failure mode was literal/exact title substring matching rejecting
+genuinely grounded natural paraphrase — not real wrong-topic narration. This
+checkpoint hardens the measuring instrument itself. It changes **zero**
+production code, model, prompt, or routing behavior; it is retrospective-only
+evidence quality work.
+
+**Strict data separation, honored throughout**: `evals/grounding_v2.py` (the
+new check) and `evals/grounding_v2_fixtures.py` (68 independently-authored
+development/validation cases — new names, new objects, never copied from the
+5.5 benchmark's own candidate wording) were designed, implemented, tested,
+and **frozen** (fixture content fingerprinted: `b0d32f9...e77f6`) *before*
+`evals/benchmarks/retrospective.py` (the holdout re-evaluation module) was
+ever written or run. The only fact carried over from the accepted 5.5 report
+was the PROBLEM CLASS ("natural paraphrase can fail literal matching") —
+never a solution vocabulary.
+
+**V1 is preserved exactly, under its own name.** `evals/proactive_narration.py`'s
+`check_on_topic` is renamed `check_on_topic_v1` with the bare name kept as a
+plain alias — every existing 5.4 fixture, test, and `ALL_CHECKS` reference
+resolves to the identical, byte-for-byte-unchanged function. V2 lives
+entirely in a new module and is never silently substituted for V1 anywhere.
+
+**V2 algorithm** (`check_on_topic_v2`): tries the strongest signal first
+(exact raw substring — V1's own mechanism), then a conservatively-normalized
+substring (Unicode NFKC, diacritic/tatweel stripping, Arabic alef-variant
+and alef-maksura unification, punctuation/whitespace/case normalization —
+never touching ة/ه, which would risk real meaning loss), then falls back to
+**content-anchor matching**: the title's own non-generic, non-function-word,
+length-≥3 tokens must ALL appear in the (normalized) candidate, with a
+bounded, documented Arabic attached-particle fallback (ال‑/ب‑/ل‑/و‑/ف‑/ك‑)
+so a dropped definite article or inseparable preposition doesn't break an
+otherwise-correct match. A title with no extractable anchor gets no
+anchor-based pass path at all — conservative by construction. Even when
+grounded, three further checks can still fail it: the existing
+`distractor_titles` mechanism (unchanged from V1), `conflicting_entity`
+(English-only — a different capitalized proper noun introduced as an
+apparent new target), and `conflicting_action` (the title's own action verb
+— normalized into one of a small set of canonical *families*, e.g.
+"اتصل"/"اتصال"/"مكالمة" all = "call", so a real paraphrase never
+self-conflicts — appears alongside a verb from a *different* family).
+Explainable reason codes throughout: `exact_title_match`,
+`normalized_title_match`, `high_confidence_grounded_overlap` (PASS);
+`insufficient_grounding_evidence`, `distractor_detected`,
+`conflicting_entity`, `conflicting_action` (FAIL) — never an opaque score.
+
+**Hard acceptance achieved**: all 68 independent fixtures (31 positive, 37
+negative) matched their declared expectation exactly — 0 false positives
+(the section-14 blocker), 0 false negatives, reached only after several
+rounds of fixing genuine gaps my own first draft had (an incomplete
+generic/function-word list; a too-narrow "ال-only" Arabic prefix exception;
+an exact-token conflicting-action check that didn't tolerate English verb
+inflection or treat true Arabic synonyms as one family) — all discovered
+and corrected using my own independently-authored fixtures, never by
+looking at holdout text.
+
+**Retrospective re-evaluation (zero provider calls)**: the stored
+Checkpoint 5.5 benchmark artifact (144 real candidate generations, saved
+locally as a rendered text report) was re-scored under V2 by parsing its
+`candidate: {text!r}` lines with `ast.literal_eval` — the exact structural
+inverse of the `repr()` that produced them, not fragile string-scraping —
+and looking up each case's original facts directly from the already-frozen
+`evals/benchmarks/scenarios.py`, never re-parsed from text. Result: Sonnet's
+hard-pass count rose from 23/72 (32%) to 30/72 (42%); Haiku's rose from
+10/72 (14%) to 24/72 (33%) — both substantial, confirming the original
+5.5 report's own hypothesis that the raw V1 numbers were dominated by an
+evaluator artifact, not a real safety gap of that magnitude. V2 also
+revealed **3 Sonnet cases that were PASS under V1 but FAIL under V2**
+(a logically expected, not contradictory, result — V2 checks for pivot
+signals V1 never checked at all); inspecting them surfaced two new, honestly
+documented blind spots (see below) rather than being used to retune V2.
+
+**New blind spots discovered during retrospective review — documented, NOT
+fixed in this checkpoint** (per its own strict ordering rule: holdout
+findings become future evidence, never a reason to retune a frozen
+evaluator): (1) `conflicting_action` doesn't understand an "or"-framed
+offer of alternatives ("call him now, **or should we postpone it**?") as a
+single coherent narration rather than a genuine pivot; (2) the 2-character
+Arabic verb "رد" (reply) can match as an accidental substring inside
+unrelated longer words (observed concretely: "النهاردة"/"today" contains
+"رد" as a literal substring) — the same class of short-token risk
+`_MIN_ANCHOR_LENGTH` already guards against for anchors, but which was
+never applied to the action-verb vocabulary. Both are precisely bounded,
+named, reproducible findings for a future checkpoint — not vague gestures.
+
+**Preserved findings, unchanged**: Haiku's one real invented-date violation
+("Hussein's birthday dinner" → fabricated "الجمعة"/Friday) and Sonnet's one
+`action_confirmation_shaped` evaluator-sensitivity case ("want me to pull up
+the details?") both still appear, unaffected — neither `invented_date` nor
+`action_confirmation_shaped` was touched by this checkpoint.
+
+**No routing authority granted.** Even with V2's higher pass rates for both
+models, **no production model, prompt, tier, or routing behavior changed,
+and none is authorized by this checkpoint** — 5.5A improves evidence
+quality only; a future, separately-approved checkpoint would be required
+before any routing decision, and would still need its own fresh evidence,
+not a retune of this one.
+
+**Zero real provider calls; zero production impact.** Retrospective
+re-evaluation reads only the already-stored local artifact. No migration,
+no new dependency, no frontend change, no production file modified.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1
