@@ -57,3 +57,10 @@ docker-compose.override.yml
 # ---- Logs ----
 *.log
 logs/
+
+# ---- Checkpoint 5.5: real-provider benchmark outputs ----
+# Benchmark code/fixtures are version-controlled; real generated
+# outputs/results are not (section 26 of the 5.5 brief) — this
+# directory holds real-provider run transcripts for local reference
+# only, never committed.
+backend/evals/benchmarks/results/

@@ -1555,16 +1555,32 @@ no arguments only prints the plan (scenario/model/repetition counts and the
 intended total generation count) and makes **0 provider calls** — always
 safe. The real benchmark only executes with an explicit `--confirm` flag,
 which must only ever be passed after Ahmed's own separate, explicit
-approval given outside this code. **This checkpoint built and tested the
-infrastructure only — the real-provider run itself was not executed**; see
-the checkpoint's own required-output report for the exact generation-budget
-consent request.
+approval given outside this code.
+
+**Real-provider execution outcome (post-approval, 144/144 generations
+attempted)**: Ahmed explicitly approved the full 144-generation budget (24
+scenarios × 2 models × 3 repetitions); all 144 were attempted and **all 144
+failed** with the normalized `invalid_request` category, for both
+`claude-sonnet-5` and `claude-haiku-4-5` uniformly — 0 usable candidate
+comparisons were produced. Cross-referencing the real production `ai_traces`
+table (read-only, no additional provider calls) showed this is **not a
+benchmark defect**: real production `claim_verification` traffic had already
+been failing with the same category continuously since 2026-10-03, and the
+last successful real provider call of any kind was 2026-10-02 — i.e., this
+benchmark faithfully reproduced a pre-existing, ongoing, account/provider-
+level outage already affecting live Chat and narration, not something this
+checkpoint introduced. The benchmark's own isolation guarantee held exactly
+as designed: the production `ai_traces` row count was identical (622) before
+and after all 144 attempts. No retry was attempted, per the approved
+conditions and this checkpoint's own no-automatic-retry design. See the
+checkpoint's own required-output report for the full evidence and
+recommendation (insufficient evidence; re-running requires a fresh, separate
+approval once the underlying provider issue is resolved).
 
 **Production impact: zero.** `_MODEL_BY_PURPOSE`, `_TIER_BY_PURPOSE`, every
 existing prompt, every existing fallback path, and Phase 3 write authority
 are all untouched — re-proven by full regression, not merely assumed. No
-migration, no new dependency, no frontend change, and (for this checkpoint's
-own implementation/test work) 0 real provider calls.
+migration, no new dependency, no frontend change.
 
 ## Phase 4 — Attention & Proactivity
 
