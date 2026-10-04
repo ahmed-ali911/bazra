@@ -1454,6 +1454,118 @@ model, tier assignment, call count, and fallback behavior is unchanged
 imported into the live request path, and no production request waits for
 evaluation. No migration, no new dependency, no frontend change.
 
+### Checkpoint 5.5 — Real Model Comparison Benchmark
+
+**MEASURE FIRST. ROUTE LATER.** Uses the 5.4 offline harness to produce the
+first real evidence comparing model candidates for exactly one purpose —
+`proactive_narration` — without changing any production routing, model
+selection, or tier behavior. Passing this benchmark is evidence, not
+authorization; a future checkpoint, with Ahmed's explicit approval, is
+required before any production model ever changes.
+
+**Scope and candidates** (discovered from the repository's own existing
+configuration, never guessed): control = `claude-sonnet-5` (the current
+production model for this purpose); candidate = `claude-haiku-4-5` — already
+the repository's own validated lightweight model, already configured in
+`_MODEL_BY_PURPOSE` (for `claim_verification`) and `_COST_PER_MILLION_TOKENS_USD`,
+so no new model string was invented for this checkpoint.
+
+**Location**: a new `backend/evals/benchmarks/` subpackage, separate from the
+5.4 offline harness (`evals/schemas.py`, `runner.py`, `proactive_narration.py`,
+`report.py`) — `python -m evals.report` and every 5.4 test remain completely
+unaffected by this subpackage merely existing (verified by a dedicated
+no-accidental-import test). Only `evals/benchmarks/generation.py` makes real
+provider calls, and only when its one function is explicitly invoked.
+
+**How real-provider calls are made without touching `complete()`**:
+`model_router_service.complete()` resolves its model exclusively from
+`purpose` (no override parameter exists), and unconditionally writes an
+AiTrace row for every call. Neither is appropriate here — forcing a model
+through `complete()` would mean either mutating production `_MODEL_BY_PURPOSE`
+state at runtime (forbidden) or adding a parameter to a production function
+purely to serve a benchmark (not genuinely necessary). Instead
+`generate_with_explicit_model` reuses three existing, already-tested,
+side-effect-free building blocks `complete()` is itself built from —
+`_call_anthropic` (the real wire-level SDK call), `_extract_response_parts`
+(the real response parser), and `_classify_failure` (the real Checkpoint 5.1
+failure taxonomy) — directly. **Zero AiTrace rows are structurally possible
+from this path** (no `_record_trace` call is reachable from it at all), and a
+provider failure is classified with the exact same categories a real
+production failure would get.
+
+**Production prompt fidelity** (no production code changed): the system
+prompt is the real, unmodified
+`orchestrator_service._build_proactive_narration_system_prompt()`, imported
+directly. The user-message construction (4 lines, inlined inside
+`generate_app_opened_narration_text` rather than its own importable function)
+is mirrored in `evals/benchmarks/prompts.py` and kept honest by a permanent
+alignment test that captures what the real production function actually
+sends (via a monkeypatched `complete`) and asserts byte-for-byte equality —
+a continuously-verified duplication, not a silent one, so any future drift
+in production fails the test loudly rather than silently going stale.
+
+**Dataset**: 24 synthetic scenarios (`evals/benchmarks/scenarios.py`) derived
+from the real production input boundary and its real constraints — every one
+of the five locked v1 `SignalType` values is represented; task-sourced
+signals always carry a real `"low"`/`"normal"`/`"high"` priority (confirmed:
+`Task.priority` is a non-nullable column with a server-side default — it can
+never be `None` in real data, a correction to an unrealistic combination the
+5.4 fixture set itself used); non-task signals always carry `priority=None`.
+Arabic, English, and mixed-language titles, including a few chosen because
+their own semantic content could plausibly tempt invented history, action-
+offering wording, or urgency exaggeration — temptation opportunities, not
+guaranteed failures.
+
+**Hard safety gate, unchanged from 5.4**: every candidate output — from
+either model — is judged by the exact same 9 deterministic checks from
+`evals/proactive_narration.py`, completely unmodified. A hard failure is
+never averaged away by nicer wording, lower cost, or success on other cases.
+
+**Failure interpretation is separate metadata, never an override**
+(`evals/benchmarks/interpretation.py`): a static, non-LLM lookup table
+assigns each FAILING check to `CLEAR_SAFETY_VIOLATION` (narrow, low-false-
+positive checks: `mutation_claim`, `unsupported_history`,
+`internal_id_leakage`, `unsupported_mood`, `invented_date`),
+`POSSIBLE_EVALUATOR_SENSITIVITY` (moderate keyword-ambiguity risk:
+`invented_priority`, `internal_architecture_terms`,
+`action_confirmation_shaped`), or `UNRESOLVED_REQUIRES_HUMAN_REVIEW`
+(`on_topic` — deliberately: a title-absence failure could be a genuine
+hallucinated wrong concern or a faithful semantic paraphrase, and this
+mapper cannot tell the two apart from the check's own reason string alone,
+so it does not guess). A PASSING check always reports `N/A_PASSED` — the
+function cannot flip a FAIL to a PASS or vice versa by construction (it
+takes `passed` only to report this, never to decide it).
+
+**Reliability over single-shot luck**: 3 repetitions per model per scenario
+(144 total intended generations: 24 scenarios × 2 models × 3 reps). A
+scenario that passes on some runs and fails on others is flagged as
+inconsistent per model — a model passing 2/3 times on a safety-sensitive
+scenario is explicitly not treated as equivalent to 3/3.
+
+**Human-review artifact** (`evals/benchmarks/report.py`): a plain-text,
+side-by-side report — every scenario, every model, every run's full
+candidate text, deterministic verdict, failed checks with reasons and
+interpretations, and separate (never combined into one score) per-model
+summary metrics (pass rate, failures by check, failures by scenario,
+inconsistent scenarios, token usage, observed latency).
+
+**Explicit consent gate, built into the command itself**
+(`python -m evals.benchmarks.proactive_narration_compare`): running it with
+no arguments only prints the plan (scenario/model/repetition counts and the
+intended total generation count) and makes **0 provider calls** — always
+safe. The real benchmark only executes with an explicit `--confirm` flag,
+which must only ever be passed after Ahmed's own separate, explicit
+approval given outside this code. **This checkpoint built and tested the
+infrastructure only — the real-provider run itself was not executed**; see
+the checkpoint's own required-output report for the exact generation-budget
+consent request.
+
+**Production impact: zero.** `_MODEL_BY_PURPOSE`, `_TIER_BY_PURPOSE`, every
+existing prompt, every existing fallback path, and Phase 3 write authority
+are all untouched — re-proven by full regression, not merely assumed. No
+migration, no new dependency, no frontend change, and (for this checkpoint's
+own implementation/test work) 0 real provider calls.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1
