@@ -1313,6 +1313,147 @@ POWERFUL escalation policy, budget-aware downgrade. **Immediate cost/call
 impact: zero** — this checkpoint's whole purpose is the control plane for
 later, evidence-based optimization, not the optimization itself.
 
+### Checkpoint 5.4 — Offline Evaluation Harness Foundation
+
+Builds the **measuring instrument** needed before any future tier-based or
+cost-based routing change can be adopted — not the routing change itself.
+Phase 5's long-term philosophy: `LOCAL FIRST → FREE/OWNED SUFFICIENT
+RESOURCE WHEN PROVEN ADEQUATE → LLM ONLY WHEN ACTUALLY NEEDED → CHEAPEST
+PROVEN SUFFICIENT INTELLIGENCE → ESCALATE ONLY WHEN NECESSARY`, and
+symmetrically for information sources: `FREE SOURCE EXISTS` is never itself
+evidence of adequacy, the same way `EXPENSIVE` is never itself evidence of
+intelligence. Future changes must follow `MEASURE → COMPARE → DECIDE →
+APPROVE → ADOPT → OBSERVE`, never `CHEAPER MODEL EXISTS → USE IT`.
+
+**Location**: a new top-level `backend/evals/` package — a sibling of
+`app/` and `tests/` (mirroring `tests/`'s own existing precedent for
+cross-cutting code that isn't owned by one `app.modules.*` package), never
+nested inside `app/modules/`. This is a structural guarantee, not just a
+convention: a dedicated test (`evals/tests/test_isolation.py`) greps every
+file under `app/` for an `evals` import and fails the build if one ever
+appears. **Nothing under `app/` imports `evals/`; `evals/` is never wired
+into any production request path.**
+
+**Offline-first, by construction**: `evals/schemas.py`, `runner.py`,
+`proactive_narration.py`, and `report.py` import neither `anthropic` nor
+`httpx`/`requests`/`sqlalchemy`/`psycopg`/`socket` — verified by a dedicated
+test, not merely by convention. Evaluation cases and their candidate
+outputs are frozen Python fixtures; **the harness evaluates supplied text,
+it does not generate it** in this checkpoint. 0 real provider calls, 0
+Search calls, 0 AiTrace rows (proven by a before/after row-count test).
+
+**Contract** (`evals/schemas.py`): `EvaluationCase` (`case_id`, `purpose`,
+`tier`, `facts`, `candidate`, `tags`, plus optional `expected_pass`/
+`expected_failed_checks` used only by this checkpoint's own frozen
+fixtures to self-test the detector), `CheckResult` (`name`, `passed`,
+`reason`, `hard`), `EvaluationResult`, `EvaluationSuite`, `SuiteResult`.
+`purpose`/`tier` are deliberately plain strings, not the real
+`ModelCallPurpose`/`IntelligenceTier` Literal types — a future tool-
+selection or source-routing case may not correspond to any model-call
+purpose at all. `candidate` is deliberately untyped (`object`, not `str`)
+for the same reason — a future case may supply a bare decision string or a
+structured dict instead of prose (proven, without implementing any real
+future evaluator, by `evals/tests/test_future_extensibility.py`'s
+throwaway inline-check unit tests). **No opaque numeric score anywhere in
+the contract** — `SuiteResult` aggregates only transparent counts (total/
+passed/failed/failures-by-check-name); a case passes only when every
+*hard* check passes, never averaged against style (section 9/10's own
+explicit "a safety failure is never offset by good style").
+
+**First suite: proactive APP_OPENED narration** (`evals/proactive_narration.py`,
+`SUITE_VERSION = "v1"`) — chosen because it's the narrowest bounded
+production model call: exactly `signal_type`/`title`/`priority` in, one
+short line out, no tools, already classified `"lightweight"` tier
+(Checkpoint 5.3) while still executing on the standard default model, with
+an existing deterministic fallback template to cross-check against. Nine
+deterministic checks, all hard: `on_topic` (grounding + single-topic,
+fixture-driven for multi-topic detection), `mutation_claim`,
+`action_confirmation_shaped`, `unsupported_history`, `unsupported_mood`,
+`internal_id_leakage`, `internal_architecture_terms`, `invented_priority`,
+`invented_date` — each derived directly from the existing, real
+`_PROACTIVE_NARRATION_INSTRUCTIONS` prompt rules, never invented from
+scratch. 13 frozen fixtures (2 PASS, 11 FAIL), each isolated to test
+exactly one violation; every fixture's actual pass/fail and failed-check
+set is asserted against its own declared expectation
+(`SuiteResult.matches_expectations`) — the core proof the harness can
+detect known regressions, not merely that it runs.
+
+**Runtime-verifier alignment, not equivalence** (section 3A): the offline
+`check_mutation_claim` and the runtime, model-backed
+`orchestrator_service.verify_no_mutation_claim` reason about the same
+behavioral concept — a first-person claim that BAZRA already completed a
+mutation — but remain two independent implementations. The offline check
+never imports `orchestrator_service` and never calls the real verifier
+(verified by a structural test). Alignment is proven by reusing the EXACT
+canonical strings already established as unsafe elsewhere in this
+repository's own test suite (`narration/tests/test_narration.py`'s own
+`"I moved the task to tomorrow."` adversarial case;
+`orchestrator/tests/test_orchestrator.py`'s own repeatedly-reused `"Done —
+I've added it."`) rather than inventing a competing definition, and
+asserting the offline check flags them too. A documented, intentional
+blind spot (`"That's all taken care of now."`) proves the two are
+*deliberately not* claimed to have identical semantic coverage — the
+runtime verifier can reason about this paraphrase; the offline regex
+cannot, and the harness says so rather than silently calling it safe.
+
+**Honesty about measurement limits** (sections 16/35/44): every check's own
+docstring states a concrete "Blind spot" — e.g. `unsupported_history`
+catches `فاكر`/`نسيت`/`remember`/`forgot` but misses a paraphrase like
+`"واضح إن الموضوع ده وقع منك قبل كده"` that asserts the identical
+unsupported inference with none of those words; `action_confirmation_shaped`
+catches an explicit `"أأجل...؟"`/`"should I...?"` offer but misses an
+indirect form like `"هل تحب أمسحها؟"`. Dedicated tests assert these are
+real misses (`passed is True`, explicitly annotated as "MISSED, not proven
+safe") — a no-detected-violation result is never claimed as a semantic
+correctness proof.
+
+**Human review**: `python -m evals.report` (or `evals/report.py::main`)
+prints a plain-text report — suite name/version, each case's candidate
+text, PASS/FAIL, every check's own pass/fail and reason, and summary
+totals. No web dashboard, no frontend work.
+
+**Web Search & Information Source Routing — deferred product architecture,
+documented here as a roadmap note only, nothing implemented**: a future
+local-first → free/owned-authoritative-retrieval-when-sufficient →
+authoritative-external-retrieval-when-freshness-requires-it →
+LLM-reasoning-only-when-necessary pipeline will eventually need a
+provider-neutral Search Router, source provenance/citations, privacy-aware
+minimum-necessary-query disclosure (never leaking more of the user's
+private context into a web query than the question itself requires),
+explicit local-vs-web precedence and ambiguity handling, a tool-selection
+evaluator (see below), a hard separation between read/retrieval capability
+and write/action authority, real evidence that a free/cheap source is
+*sufficiently accurate* before relying on it, and a defined fallback/
+escalation path when it isn't. **No provider (Brave/Tavily/Google/any
+other) is selected, no account created, no dependency added, no web call
+made** — this paragraph exists only so the direction is written down before
+it's needed.
+
+**Explicitly deferred** (sections 24–26, 49): tool-selection evaluation,
+source-routing evaluation, free/owned-source adapters, automatic routing of
+any kind, Web Search in any form, LLM-as-judge, real model benchmarking (no
+Sonnet-vs-Haiku comparison run), a universal BAZRA quality score, dynamic
+prompt complexity classification, tier-to-model routing, cost-aware
+routing. The generic case/result contract is deliberately shaped so none of
+these require replacing the harness later — proven at the type level only,
+never implemented.
+
+**Read vs. write capability principle** (section 27, documented
+architecture, no refactor performed): read capability does not mutate
+authoritative state and remains outside Phase 3's confirmation/authority
+rules; write/action capability can mutate state and stays fully governed by
+those rules, unchanged. Read-only does **not** mean selection-risk-free —
+a future tool-selection evaluator (not built here) would measure exactly
+that separate risk: a read-only tool chosen *incorrectly* (e.g. Web Search
+instead of local Task retrieval) is a real failure mode even though it
+can't mutate anything.
+
+**Production impact: zero.** Every existing journey's provider, concrete
+model, tier assignment, call count, and fallback behavior is unchanged
+(re-proven by full regression, not merely assumed) — the harness is not
+imported into the live request path, and no production request waits for
+evaluation. No migration, no new dependency, no frontend change.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1
