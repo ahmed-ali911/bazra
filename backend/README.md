@@ -1861,6 +1861,167 @@ local artifact.
 **No routing authority granted.** No production model, prompt, tier, or
 routing behavior changed, and none is authorized by this checkpoint.
 
+### Checkpoint 5.7 — Gemini Provider Adapter & Isolated Integration
+
+Adds Google Gemini as a second, real provider — **technically capable, zero
+production traffic.** Every existing production purpose (`chat_completion`,
+`tool_result_reasoning`, `proactive_narration`, `claim_verification`)
+resolves to exactly the same provider (Anthropic) and model as before this
+checkpoint; `complete()` is untouched (0 lines modified, 0 lines deleted).
+
+```
+BAZRA Model Intelligence
+
+LOCAL / DETERMINISTIC
+        |
+        v
+MODEL ROUTER
+        |
+        +--> Anthropic Provider   (complete() — production, unchanged)
+        |
+        +--> Gemini Provider      [candidate / explicit-only —
+                                   complete_with_explicit_provider /
+                                   generate_with_explicit_gemini_model]
+
+Production routing:     UNCHANGED
+Automatic fallback:      NOT IMPLEMENTED
+Gemini benchmark:        NOT YET RUN
+Local model:             DEFERRED
+Web Search:              SEPARATE FUTURE CAPABILITY
+```
+
+**Architecture**: the pre-existing `complete()` had zero provider seams —
+one module-level function, hardcoded to Anthropic, with `_classify_failure`
+import-coupled to the `anthropic` SDK directly. Rather than branch inside
+`complete()` (risking Anthropic-specific assumptions leaking in degrees),
+this checkpoint adds a **new, parallel, equally-traced function**,
+`complete_with_explicit_provider(provider, model, purpose, messages, ...)`,
+requiring BOTH an explicit provider and an explicit model — no purpose-based
+auto-resolution of either, ever. No existing call site calls it (confirmed
+by grep); it is reachable only by a caller that explicitly names a provider.
+`ModelResponse` gained a `provider: ModelProvider = "anthropic"` field
+(additive default, matching `tier`'s own precedent); `AiTrace` **already**
+had a `provider` column (written as the literal `"anthropic"` since
+Checkpoint 3.1) — **no migration needed**.
+
+**Official integration decision** (verified live against `ai.google.dev`
+and the `googleapis/python-genai` SDK source at implementation time,
+2026-10-06 — never from training memory): SDK = `google-genai` (the
+current, GA, officially-recommended Python SDK; replaces the deprecated
+`google-generativeai`). API surface = the classic, **stateless**
+`client.models.generate_content(model=, contents=, config=)` — deliberately
+NOT the newer, more heavily-promoted **Interactions API**
+(`client.interactions.create(..., previous_interaction_id=...)`), which is
+stateful (Google holds conversation state server-side between turns).
+BAZRA's entire Model Router contract is stateless per-call everywhere —
+adopting a stateful API would be a structural mismatch for no benefit.
+Exceptions: `google.genai.errors.APIError`/`ClientError`/`ServerError` —
+`.code` (HTTP status int) and `.status` (a Google RPC-style name like
+`NOT_FOUND`/`RESOURCE_EXHAUSTED`), confirmed directly against the actual
+installed SDK source (2.28.0), the same kind of structured evidence
+Anthropic's own `.type` already gives `_classify_failure`.
+
+**New module `app/modules/model_router/gemini_service.py`** — the adapter.
+Translates BAZRA's provider-neutral shape both ways:
+- Request: `messages` (role `user`/`assistant`, string or
+  `TextBlock`/`ToolUseBlock`/`ToolResultBlock` content) → Gemini's
+  `contents` (role `user`/`model`, `Part` list). Tools: Anthropic's native
+  `{name, description, input_schema}` → Gemini's `FunctionDeclaration`
+  (`parameters` instead of `input_schema`). `tool_choice`: the two real
+  shapes this codebase actually constructs (`{"type": "any", ...}`,
+  `{"type": "tool", "name": ..., ...}`) → `FunctionCallingConfig(mode=...)`;
+  an unrecognized shape is left untranslated (Gemini's own `AUTO` default
+  applies) rather than guessed at; `disable_parallel_tool_use` has no
+  documented Gemini equivalent and is honestly dropped, not faked.
+- A real structural mismatch, found and solved: Gemini's `function_response`
+  is keyed by the function's own **name**, not a call id the way
+  Anthropic's `tool_result`/BAZRA's own `ToolResultBlock` is keyed by
+  `tool_use_id` — `ToolResultBlock` carries no name field at all. Solved by
+  scanning the full message list for the matching `ToolUseBlock` (always
+  present earlier in the same list, by construction — confirmed against
+  the one real caller, `generate_tool_result_reply`) to recover the name;
+  raises clearly if no match exists, never guesses.
+- Response: `response.text` / `response.usage_metadata.{prompt,candidates}_token_count`
+  / `response.candidates[0].content.parts[*].function_call` → BAZRA's
+  `(text, tool_uses)` shape. Gemini's `FunctionCall` has no stable id by
+  default (confirmed empirically against the installed SDK) — a
+  synthetic, deterministic, response-local id is generated so a caller can
+  still reference it in a later `ToolResultBlock`; never sent back to
+  Gemini (which re-keys by name, not id).
+- Failure classification: `.code` first (401/403→authentication,
+  404→model_unavailable, 429→rate_limited, 400→invalid_request,
+  5xx→provider_unavailable), `.status` as fallback, then plain `httpx`
+  transport exceptions (the SDK is itself httpx-based — same two-tier
+  structure `_classify_failure` already uses for Anthropic, and this
+  repo's own `weather/service.py` already uses for Open-Meteo).
+  **Honestly documented ambiguity** (section 10 of this checkpoint's own
+  brief): Google's confirmed error-body shape uses a single status,
+  `RESOURCE_EXHAUSTED`, for both daily-quota exhaustion and short-term rate
+  limiting — no further structured signal exists to tell them apart (a
+  different-looking "quota_exceeded"/"rate_limit_exceeded" vocabulary
+  appears on one doc page but couldn't be confirmed against this SDK's own
+  actual `.status`-extraction code). Every 429 maps to `rate_limited`,
+  named explicitly as an open question, never silently resolved.
+
+**Gemini candidate models** (verified live against
+`ai.google.dev/gemini-api/docs/pricing`): lightweight = `gemini-3.1-flash-lite`
+(GA, $0.25/$1.50 per 1M input/output tokens); stronger = `gemini-2.5-pro`
+(GA, stable, $1.25/$10.00 ≤200k-token rate — the newest flagship,
+`gemini-3.1-pro-preview`, is `Preview` status, noted but not the primary
+pick). Standard paid-tier API pricing only, dated and sourced in-code —
+never free-tier/batch/cached rates mixed in unlabeled.
+
+**Explicit, isolated invocation path (section 20)**:
+`generate_with_explicit_gemini_model(model, messages, ...)` — requires an
+explicit model string, bypasses AiTrace entirely (mirroring
+`evals/benchmarks/generation.py`'s own existing Anthropic bypass exactly),
+exists only for a future offline Gemini-vs-Claude benchmark. Zero
+production callers.
+
+**Credentials**: `GEMINI_API_KEY` (new `Settings.gemini_api_key`,
+`.env.example` entry) — same "never logged, never persisted" guarantee as
+`anthropic_api_key`, verified by dedicated tests reading real `AiTrace` rows
+and real exception messages for the literal key string.
+
+**Dependency**: `google-genai>=2.0` added to `pyproject.toml` — justified
+over hand-rolled `httpx` (this repo's own existing pattern for Open-Meteo)
+because Gemini's request/response/tool-calling/structured-output surface is
+materially more complex, and the SDK gives structured exception classes for
+free. Verified working through both the live container (`pip install`) and
+a full `docker compose build backend` (Dockerfile-driven install path).
+
+**No automatic fallback, no routing change, no write authority**: a Gemini
+failure never triggers an Anthropic call or vice versa (tested directly —
+monkeypatched Anthropic raises `AssertionError` if ever called during a
+Gemini-path test). `IntelligenceTier` gained no new authority — tier still
+never influences model OR provider selection. Gemini tool-calling is
+structurally supported by the adapter but has zero path to BAZRA write
+authority — Phase 3's `ProposedAction`/confirmation/authority model is
+completely untouched (grep-confirmed: no production file outside
+`model_router/` references Gemini at all, by a dedicated, automated
+isolation test — distinguishing real code-level references from BAZRA's own
+pre-existing, unrelated identity-concealment prompt, which lists "Gemini"
+only as an example brand name alongside ChatGPT/OpenAI).
+
+**Local Intelligence Provider remains DEFERRED** (unchanged from 5.6) — not
+touched, not combined with this work. **Google Search grounding is NOT
+enabled** — out of scope, a separate future Information Source Routing
+decision.
+
+**Testing**: 48 new tests (`app/modules/model_router/tests/test_gemini_provider.py`)
+covering request/response translation, failure classification against
+**real** `google.genai.errors.ClientError`/`ServerError` instances (not
+hand-rolled stand-ins — same convention `test_model_router.py` already uses
+for Anthropic), the explicit/traced dispatch path, no-fallback, credential
+redaction, and the production-stability snapshot (every purpose resolves to
+the same model as the accepted 5.6 baseline). Full regression: evals suite
+unaffected, backend full suite **run twice** (1504 passed both times, up
+from the 1456 baseline), frontend suite (118 passed), `tsc -b && vite build`
+clean. **Real Gemini calls made: 0. Real Anthropic calls made: 0.**
+
+**No migration.** AiTrace's pre-existing `provider` column absorbed this
+checkpoint's entire observability need.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1

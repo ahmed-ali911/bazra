@@ -21,5 +21,10 @@ class Settings(BaseSettings):
     # log line ever contains this value.
     anthropic_api_key: str | None = None
 
+    # Checkpoint 5.7 — the second real provider's credential, same
+    # "never logged, never persisted" guarantee as anthropic_api_key
+    # above (see model_router/gemini_service.py and its own tests).
+    gemini_api_key: str | None = None
+
 
 settings = Settings()

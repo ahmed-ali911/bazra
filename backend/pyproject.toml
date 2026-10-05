@@ -18,6 +18,18 @@ dependencies = [
     "bcrypt>=4.1",
     "anthropic>=1.8",
     "httpx>=0.27",
+    # Checkpoint 5.7 — the official, unified Google Gemini API Python
+    # SDK (GA since May 2025; replaces the deprecated
+    # google-generativeai package). Verified current/official via
+    # ai.google.dev/gemini-api/docs/quickstart at implementation time
+    # (2026-10-06). A second real cloud provider, unlike Open-Meteo's
+    # (app/modules/weather/) tiny free JSON API, justifies a real SDK
+    # dependency over hand-rolled httpx: structured exception classes
+    # (google.genai.errors.APIError/.code/.status) and native tool-
+    # calling/structured-output support are exactly what section 10/16/
+    # 17 of this checkpoint's own brief ask for, and reimplementing them
+    # over raw HTTP would be redundant, brittle, high-maintenance work.
+    "google-genai>=2.0",
 ]
 
 [project.optional-dependencies]

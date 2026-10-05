@@ -45,6 +45,21 @@ ModelFailureCategory = Literal[
     "unknown_provider_error",
 ]
 
+# Checkpoint 5.7 — a provider-neutral PROVIDER identity, introduced only
+# now that a second real provider genuinely exists (section 4 of the
+# 5.7 brief: "do not create provider identity from model-name string
+# heuristics if a cleaner explicit contract is available" — this is
+# that explicit contract, not a guess derived from e.g. a model string
+# prefix). Deliberately separate from both ModelCallPurpose (WHY) and
+# IntelligenceTier (WHAT CAPABILITY) — see complete_with_explicit_provider's
+# own docstring in service.py for how this is actually supplied; every
+# EXISTING production caller (complete(), unchanged) never supplies
+# this explicitly and always resolves to "anthropic", matching AiTrace's
+# own pre-existing `provider` column, which has stored this exact
+# literal string since Checkpoint 3.1 — no migration needed.
+ModelProvider = Literal["anthropic", "google_gemini"]
+VALID_PROVIDERS: frozenset[str] = frozenset({"anthropic", "google_gemini"})
+
 # Checkpoint 5.3 — a provider-neutral INTELLIGENCE TIER, a concept
 # deliberately separate from both ModelCallPurpose (WHY a call
 # happens) and the concrete model string (WHICH model currently
@@ -133,3 +148,12 @@ class ModelResponse:
     # predates this field and doesn't care about it; complete() itself
     # always passes an explicit, resolved value).
     tier: IntelligenceTier = "standard"
+    # Checkpoint 5.7 — the provider that actually served this call.
+    # Defaults to "anthropic" for the same reason `tier` defaults to
+    # "standard" above: every production caller today only ever gets an
+    # Anthropic-served response, and a handful of pre-5.7 tests
+    # construct ModelResponse(...) directly without caring about this
+    # field. complete() always sets this explicitly (to "anthropic",
+    # unchanged); complete_with_explicit_provider (new in 5.7) sets it
+    # to whichever provider was explicitly requested.
+    provider: ModelProvider = "anthropic"

@@ -10,13 +10,16 @@ from sqlalchemy.orm import sessionmaker
 
 from app.config import settings
 from app.database import SessionLocal
+from app.modules.model_router import gemini_service
 from app.modules.model_router.models import AiTrace
 from app.modules.model_router.schemas import (
+    VALID_PROVIDERS,
     VALID_PURPOSES,
     VALID_TIERS,
     IntelligenceTier,
     ModelCallPurpose,
     ModelFailureCategory,
+    ModelProvider,
     ModelResponse,
     TextBlock,
     ToolResultBlock,
@@ -584,4 +587,181 @@ def complete(
         # observability, never persisted" treatment as stop_reason
         # above (see ModelResponse.tier's own docstring).
         tier=resolved_tier,
+        # Checkpoint 5.7 — every call through complete() is, and
+        # remains, Anthropic-served; see ModelResponse.provider's own
+        # docstring. Explicit, not merely the dataclass default, so a
+        # reader never has to wonder whether this was deliberate.
+        provider="anthropic",
+    )
+
+
+# Checkpoint 5.7 — per-provider cost-estimation dispatch, kept as one
+# small dict-of-callables rather than an if/elif chain repeated in
+# complete_with_explicit_provider's own boundary-3 step below. Anthropic's
+# estimator stays the existing, unchanged _safe_estimate_cost/_estimate_cost
+# pair (reused here verbatim) — this is purely additive wiring, not a
+# refactor of either existing function.
+def _safe_estimate_gemini_cost(model: str, prompt_tokens: int, completion_tokens: int) -> Decimal | None:
+    try:
+        return gemini_service.estimate_gemini_cost(model, prompt_tokens, completion_tokens)
+    except Exception:
+        logger.exception("model_router: Gemini cost estimation failed for model=%s", model)
+        return None
+
+
+def complete_with_explicit_provider(
+    provider: ModelProvider,
+    model: str,
+    purpose: ModelCallPurpose,
+    messages: list[dict],
+    system: str | None = None,
+    tools: list[dict] | None = None,
+    tool_choice: dict | None = None,
+    correlation_id: str | None = None,
+    tier: IntelligenceTier | None = None,
+) -> ModelResponse:
+    """Checkpoint 5.7, section 20 — the ONE deliberate, explicit,
+    traced path capable of reaching Gemini (or, symmetrically,
+    Anthropic) outside the purpose-based default `complete()` takes.
+
+    Both `provider` AND `model` are REQUIRED, explicit arguments — no
+    purpose->provider or purpose->model auto-resolution happens here at
+    all (contrast with complete()'s own _resolve_model/_MODEL_BY_PURPOSE,
+    completely untouched by this function). This is the structural
+    guarantee behind section 20's own requirements:
+    - "cannot accidentally become production default": no existing
+      production call site calls this function (confirmed: grep finds
+      zero references outside this module's own tests) — `complete()`
+      remains the only function any of the 4 real orchestrator call
+      sites use, byte-for-byte unchanged by this checkpoint.
+    - "does not inspect prompt text to choose provider": `provider` is
+      a plain, explicit parameter — nothing here ever reads `messages`
+      to decide which provider to call.
+    - "no hidden fallback": a failure on the named provider raises
+      ModelRouterError exactly like complete() does — it never silently
+      retries on the other provider.
+    - "deterministic configuration, testable with provider mocked": the
+      two provider branches below call plain, already-independently-
+      mockable module-level functions (_call_anthropic /
+      gemini_service._call_gemini) — a test can monkeypatch either in
+      isolation, the same convention this module's own existing test
+      suite already uses for _call_anthropic.
+
+    Unlike complete(), this function's AiTrace row records the REAL
+    `provider` value (never the hardcoded "anthropic" literal
+    complete() itself writes) — AiTrace's own `provider` column already
+    supports this with no migration (confirmed in this checkpoint's own
+    discovery).
+    """
+    if provider not in VALID_PROVIDERS:
+        raise ValueError(f"Unknown provider: {provider!r}")
+    if purpose not in VALID_PURPOSES:
+        raise ValueError(f"Unknown purpose: {purpose!r}")
+    if tier is not None and tier not in VALID_TIERS:
+        raise ValueError(f"Unknown tier: {tier!r}")
+
+    resolved_tier = _resolve_tier(purpose, tier)
+    resolved_correlation_id = correlation_id or secrets.token_hex(16)
+    start = time.monotonic()
+
+    # Boundary 1: the provider call itself — same "no usable response
+    # exists at all on failure" semantics as complete()'s own boundary 1.
+    try:
+        if provider == "anthropic":
+            if not settings.anthropic_api_key:
+                raise RuntimeError("ANTHROPIC_API_KEY is not configured")
+            raw = _call_anthropic(model, messages, system=system, tools=tools, tool_choice=tool_choice)
+        else:
+            if not settings.gemini_api_key:
+                raise RuntimeError("GEMINI_API_KEY is not configured")
+            raw = gemini_service._call_gemini(model, messages, system=system, tools=tools, tool_choice=tool_choice)
+    except Exception as exc:
+        latency_ms = int((time.monotonic() - start) * 1000)
+        category = _classify_failure(exc) if provider == "anthropic" else gemini_service._classify_gemini_failure(exc)
+        _safe_record_trace(
+            provider=provider,
+            model=model,
+            purpose=purpose,
+            status="error",
+            latency_ms=latency_ms,
+            prompt_tokens=None,
+            completion_tokens=None,
+            estimated_cost_usd=None,
+            error_summary=category,
+            correlation_id=resolved_correlation_id,
+        )
+        raise ModelRouterError(category) from exc
+
+    latency_ms = int((time.monotonic() - start) * 1000)
+
+    # Boundary 2: parsing the response — same "provider call already
+    # succeeded, so a parsing failure must not also be treated as a
+    # success" semantics as complete()'s own boundary 2.
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    try:
+        if provider == "anthropic":
+            prompt_tokens = raw.usage.input_tokens
+            completion_tokens = raw.usage.output_tokens
+            text, tool_uses = _extract_response_parts(raw)
+        else:
+            prompt_tokens = raw.usage_metadata.prompt_token_count if raw.usage_metadata else 0
+            completion_tokens = raw.usage_metadata.candidates_token_count if raw.usage_metadata else 0
+            text, tool_uses = gemini_service._extract_response_parts_gemini(raw)
+    except Exception as exc:
+        estimated_cost_usd = (
+            (
+                _safe_estimate_cost(model, prompt_tokens, completion_tokens)
+                if provider == "anthropic"
+                else _safe_estimate_gemini_cost(model, prompt_tokens, completion_tokens)
+            )
+            if prompt_tokens is not None and completion_tokens is not None
+            else None
+        )
+        category = _classify_failure(exc) if provider == "anthropic" else gemini_service._classify_gemini_failure(exc)
+        _safe_record_trace(
+            provider=provider,
+            model=model,
+            purpose=purpose,
+            status="error",
+            latency_ms=latency_ms,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            estimated_cost_usd=estimated_cost_usd,
+            error_summary=category,
+            correlation_id=resolved_correlation_id,
+        )
+        raise ModelRouterError(category) from exc
+
+    # Boundary 3: success — cost estimation and trace persistence each
+    # get their own failure boundary, same guarantee as complete()'s own.
+    estimated_cost_usd = (
+        _safe_estimate_cost(model, prompt_tokens, completion_tokens)
+        if provider == "anthropic"
+        else _safe_estimate_gemini_cost(model, prompt_tokens, completion_tokens)
+    )
+    if not _safe_record_trace(
+        provider=provider,
+        model=model,
+        purpose=purpose,
+        status="success",
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        estimated_cost_usd=estimated_cost_usd,
+        error_summary=None,
+        correlation_id=resolved_correlation_id,
+    ):
+        logger.error("model_router: trace persistence failed for a successful call (purpose=%s, provider=%s)", purpose, provider)
+
+    return ModelResponse(
+        text=text,
+        model=model,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        tool_uses=tool_uses,
+        correlation_id=resolved_correlation_id,
+        stop_reason=getattr(raw, "stop_reason", None),
+        tier=resolved_tier,
+        provider=provider,
     )
