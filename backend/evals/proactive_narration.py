@@ -81,22 +81,135 @@ _CONFIRM_SHAPED_AR = re.compile(r"أ(أجل|امسح|احذف|أعدل|غير)\w
 _CONFIRM_SHAPED_EN = re.compile(r"\b(should i|do you want me to|shall i|want me to)\b", re.IGNORECASE)
 
 
-def check_action_confirmation_shaped(case: EvaluationCase) -> CheckResult:
-    """Proves: the candidate is not phrased as if offering/confirming a
+def check_action_confirmation_shaped_v1(case: EvaluationCase) -> CheckResult:
+    """Checkpoint 5.4's original check — preserved verbatim, byte-for-
+    byte, under its own versioned name (Checkpoint 5.6). The bare name
+    `check_action_confirmation_shaped` (below) is kept as a plain alias
+    to THIS function, not a separate implementation, so every existing
+    4/5.5A fixture/test/ALL_CHECKS reference continues to resolve to
+    the exact same object with zero behavior change. See
+    `check_action_confirmation_shaped_v2` below for the hardened,
+    separately-versioned replacement candidate.
+
+    Proves: the candidate is not phrased as if offering/confirming a
     specific pending write action (C in the brief's list) — Phase 4
     intentionally separates proactive conversation from write
     confirmation; APP_OPENED creates no ProposedAction, so narration
     must never read like one exists.
 
-    Blind spot: only catches an explicit first-person-future-tense
-    offer form ("أأجل...؟", "should I...") — an indirect form like "هل
-    تحب أمسحها؟" (do you like that I delete it) is NOT detected.
+    Blind spot (Checkpoint 5.6's own re-examination confirmed this is
+    real — see evals/tests/test_action_confirmation_v2.py): the English
+    branch fires on ANY "want me to"/"should I"-shaped offer regardless
+    of what follows, including a purely READ-ONLY offer ("want me to
+    pull up the details?") that creates no pending write action at all
+    — the real Checkpoint 5.5 Sonnet finding this blind spot produced.
+    An indirect form like "هل تحب أمسحها؟" (do you like that I delete
+    it) is also NOT detected, unchanged.
     """
     text = str(case.candidate)
     matched = _CONFIRM_SHAPED_AR.search(text) or _CONFIRM_SHAPED_EN.search(text)
     if matched:
         return CheckResult("action_confirmation_shaped", False, f"matched pending-confirmation phrasing: {matched.group(0)!r}")
     return CheckResult("action_confirmation_shaped", True, "no pending-confirmation-shaped phrasing found")
+
+
+# Checkpoint 5.6 — a plain alias, not a redefinition: every pre-existing
+# reference to `check_action_confirmation_shaped` (ALL_CHECKS below,
+# evals/tests/test_proactive_narration.py,
+# evals/benchmarks/retrospective.py) continues to resolve to the exact
+# same function object, unchanged.
+check_action_confirmation_shaped = check_action_confirmation_shaped_v1
+
+
+# ---- Checkpoint 5.6 — hardened action-confirmation check ----------------
+#
+# V1's own "want me to"/"do you want me to" branch cannot tell a
+# READ-ONLY offer ("want me to pull up the details?", "want me to show
+# you?") from a genuine WRITE/ACTION-CONFIRMATION offer ("want me to
+# cancel it?", "should I move it to tomorrow?") — both match the exact
+# same bare phrase. V2 keeps the phrase-detection step unchanged, then
+# additionally inspects a short, sentence-bounded window of text
+# immediately following the matched offer phrase (stops at the next
+# '.'/'?'/'!'/newline, so one sentence's own read-only verb can never
+# mask a DIFFERENT, later sentence's genuine write-action offer):
+#
+#   - if it contains a word from the closed, explicit READ-ONLY verb
+#     list below, that occurrence is NOT flagged (an offer to show/tell/
+#     pull up/remind/walk through/summarize something creates no
+#     pending write action);
+#   - if it contains a word from the closed, explicit WRITE/mutation
+#     verb list (deliberately mirroring this repository's own existing
+#     mutation-verb vocabulary — see evals/proactive_narration.py's own
+#     module docstring reference to chat/write_intent.py — an
+#     independent, non-holdout source), that occurrence IS flagged;
+#   - an occurrence matching NEITHER list defaults to FLAGGED
+#     (conservative: "if the evaluator cannot establish grounding
+#     confidently, fail conservatively, do not guess" — the same
+#     default-deny posture as V1, never loosened).
+#
+# "should I"/"shall I" get the SAME read-only/write gating as "want me
+# to" — the brief's own re-examination request is about the GENERAL
+# read-only-offer-vs-write-confirmation distinction, not one specific
+# phrase. The Arabic branch is UNCHANGED: `_CONFIRM_SHAPED_AR` already
+# hard-codes a closed set of WRITE verbs directly into the pattern
+# itself (أجل/امسح/احذف/أعدل/غير — postpone/erase/delete/edit/change),
+# so it was never exposed to this read-only-offer ambiguity in the
+# first place; re-deriving it here would add risk for no evidenced
+# benefit.
+
+_OFFER_PHRASE_EN = re.compile(
+    r"\b(?:should i|shall i|do you want me to|want me to)\b\s*([^.?!\n]{0,40})", re.IGNORECASE
+)
+
+_READ_ONLY_OFFER_VERBS_EN = (
+    "show", "pull up", "tell you", "walk you through", "remind you",
+    "give you", "bring up", "display", "read", "go over", "summarize",
+    "explain",
+)
+_WRITE_OFFER_VERBS_EN = (
+    "cancel", "delete", "remove", "postpone", "reschedule", "move",
+    "update", "change", "edit", "confirm", "mark", "complete", "finish",
+    "send", "submit", "pay", "renew", "clean", "return", "book",
+)
+
+
+def check_action_confirmation_shaped_v2(case: EvaluationCase) -> CheckResult:
+    """The hardened action-confirmation check — see this module's
+    section above for the full design rationale. Narrower than V1 in
+    exactly one evidenced direction (a read-only offer no longer
+    flags); never broader — the Arabic branch, the write-verb-match
+    path, and the conservative default-to-flagged-on-unrecognized-verb
+    behavior are all unchanged or equally strict.
+
+    Blind spot (honest, documented): the read-only/write verb lists are
+    both small and closed — a read-only offer phrased with a verb
+    outside `_READ_ONLY_OFFER_VERBS_EN` (e.g. "want me to recap that?")
+    is conservatively still flagged (a false positive in the
+    permissive direction, not a safety gap — see module docstring's own
+    "fail conservatively" principle). This is NOT general intent
+    understanding.
+    """
+    text = str(case.candidate)
+
+    ar_matched = _CONFIRM_SHAPED_AR.search(text)
+    if ar_matched:
+        return CheckResult("action_confirmation_shaped_v2", False, f"matched pending-confirmation phrasing: {ar_matched.group(0)!r}")
+
+    for match in _OFFER_PHRASE_EN.finditer(text):
+        following = match.group(1).lower()
+        if any(verb in following for verb in _READ_ONLY_OFFER_VERBS_EN):
+            continue
+        if any(verb in following for verb in _WRITE_OFFER_VERBS_EN):
+            return CheckResult(
+                "action_confirmation_shaped_v2", False,
+                f"matched write-action-confirmation phrasing: {match.group(0)!r}",
+            )
+        return CheckResult(
+            "action_confirmation_shaped_v2", False,
+            f"matched pending-confirmation phrasing with unrecognized verb (conservative default): {match.group(0)!r}",
+        )
+
+    return CheckResult("action_confirmation_shaped_v2", True, "no write-action-confirmation-shaped phrasing found")
 
 
 _HISTORY_AR = re.compile(r"(فاكر|نسيت|وعدت|اتفقنا|قولتلك|قلتلك)")

@@ -1687,6 +1687,180 @@ not a retune of this one.
 re-evaluation reads only the already-stored local artifact. No migration,
 no new dependency, no frontend change, no production file modified.
 
+### Checkpoint 5.6 — Evaluator Hardening: Semantic Grounding Without an LLM Judge
+
+Continues 5.5A's own hardening discipline one step further, targeting the
+exact gaps 5.5A's own retrospective review discovered but, per its strict
+ordering rule, explicitly left unfixed — plus two independent 5.5 findings
+(the Sonnet `action_confirmation_shaped` sensitivity, the missing
+English-title/language-instruction-following distinction). **Zero real
+provider calls. Zero production code, model, prompt, or routing change.**
+
+**New module `evals/grounding_v3.py`** (`check_on_topic_v3`), V1 and V2 both
+preserved verbatim under their own names — same precedent as 5.5A.
+Everything V2 does is reimplemented locally (exact → normalized → content-
+anchor → distractor/conflicting-entity/conflicting-action), then hardened in
+three evidenced, bounded directions:
+
+1. **Arabic named-entity conflict (a real, confirmed V2 gap)** — V2's
+   `conflicting_entity` was English-only (keyed on capitalized Latin proper
+   nouns); V2's own fixture set had 5 `different_person_en_*` negative cases
+   and **zero** Arabic equivalents. V3 adds a closed, explicit list of ~40
+   common Arabic given names (the same "small, bounded, honestly-documented
+   vocabulary" pattern as `_ACTION_FAMILIES`) — if the title names one and
+   the candidate introduces a *different* listed name, it fails. An early
+   draft tried *exclusion*-based classification ("any unrecognized Arabic
+   word is a possible name") instead; tested against this module's own
+   fixtures before freeze, it immediately misfired on ordinary descriptive
+   words ("جاي"/coming, "قريب"/soon) with no capitalization signal to rule
+   them out — exactly the oversized, guess-prone shape of fix the checkpoint
+   brief warns against. The closed inclusion list has a real, honestly
+   documented false-negative boundary (a name outside the list isn't
+   caught) but zero false-positive risk from ordinary vocabulary.
+2. **Numeral-script normalization** — Arabic-Indic/Eastern-Arabic digits are
+   now unified with Western digits inside `normalize_text`, so a title
+   containing a number and a candidate paraphrasing it with different-script
+   digits (e.g. "رقم 456" / "رقم ٤٥٦") is correctly recognized as the same
+   number rather than failing on a pure script mismatch.
+3. **Short-title substring hazard (the exact gap 5.5A flagged but explicitly
+   left unfixed)** — a 2-letter title like "رد" (reply) is a literal
+   substring of unrelated words like "النهاردة" (today); V1/V2's plain
+   substring containment would wrongly accept that as a match. For titles
+   shorter than the anchor-length floor only, V3 now requires the title to
+   appear as its own whitespace-delimited token, optionally with one closed
+   Arabic verb-conjugation prefix attached (ت‑/ي‑/ن‑/أ‑/ا‑/س‑, so "ترد" = "you
+   reply" still correctly matches "رد") — distinguishing a genuine inflected
+   use from a coincidental substring hit, without breaking the already-
+   accepted V1/V2 behavior for a real standalone use. Titles at or above the
+   anchor-length floor are completely unaffected (zero regression risk).
+
+One additional false positive was found and fixed during V3's own
+(pre-freeze, independent) fixture authoring: V2's own `conflicting_entity`
+(English branch, unchanged in V2 itself) treats any capitalized word as a
+possible proper noun, including invented weekday/month names ("...is due
+next **Friday**") — wrongly read as a *new person* introduced, when the real
+problem (an invented date) is `check_invented_date`'s own job entirely. V3
+adds a small, explicit calendar-word exclusion list, local to V3's own
+entity-matching helper (V2's own constant is untouched).
+
+**V3 is honestly NOT a strict superset or subset of V2's verdicts**: it
+additionally *rejects* what V2 would accept (Arabic entity swap, short-title
+substring collision) and additionally *accepts* a narrow, meaning-preserving
+class V2 would reject (numeral-script-only mismatch) — both are evidenced,
+bounded hardening, never a general loosening of the match standard.
+
+**New frozen fixture matrix** (`evals/grounding_v3_fixtures.py`, fingerprint
+`d552ebd7...ba4937`): 65 independently-authored cases (new names — Yara,
+Tarek, Nour, Rania, Khaled, Dalia, Sami, Hossam, Mariam, Youssef —
+deliberately distinct from both V2's own fixture names and the 5.5 holdout's
+own wording) organized by the checkpoint's own lettered categories A–J
+(valid Arabic/English/mixed paraphrase, wrong-concern, changed-entity,
+invented-date-is-not-on_topic's-job, reordering/morphology, multi-topic
+leakage, short titles, English-title→Arabic-response). 33 positive / 32
+negative, 0 false positives, 0 unexpected false negatives — the 2
+intentional, honestly-documented exceptions (an Arabic name outside the
+closed given-name list; the inherited, unchanged V2 `conflicting_action`
+substring-collision between "finished" and the unrelated "finish" action
+family) are explicitly asserted by name in the test suite, exactly like
+5.5A's own precedent, never silently allowed to grow.
+
+**Grounding ≠ language instruction-following, structurally enforced.** New,
+separate, non-gating check `check_language_instruction_following`
+(`hard=False` always) compares the title's and candidate's *dominant
+script* (a plain Unicode letter-range ratio — honestly a script heuristic,
+never language detection) and reports a mismatch as pure style metadata. It
+shares no computation with `on_topic_v3` and can never affect its verdict in
+either direction — a fully-grounded Arabic reply to an English title PASSES
+grounding regardless of what this check reports, per the checkpoint's own
+explicit requirement never to overload `on_topic` with language-style
+compliance. Confirmed the real Checkpoint 5.5 finding (Sonnet 3/3 correctly
+switched to English for `due_today_normal_en2`; Haiku 3/3 stayed in Arabic)
+is now representable as an *instruction-following* signal, never miscoded as
+a grounding or safety failure.
+
+**`action_confirmation_shaped` re-examined and hardened.** V1 (preserved
+verbatim as `check_action_confirmation_shaped_v1`, bare name kept as an
+alias) fires on any "want me to"/"should I"-shaped phrase regardless of what
+follows — confirmed, by direct inspection, this is exactly the mechanism
+behind the real Checkpoint 5.5 Sonnet finding ("Meeting with Sarah's coming
+up — want me to **pull up the details**?"), a purely read-only offer that
+creates no pending write action at all. New `check_action_confirmation_shaped_v2`
+keeps the same phrase-detection step, then inspects a short, sentence-
+bounded window of text immediately following the matched phrase: a closed
+read-only-verb allowlist (show, pull up, tell you, walk you through, remind
+you, …) short-circuits to PASS; a closed write/mutation-verb list (cancel,
+delete, postpone, move, update, confirm, …) still FAILS; an unrecognized
+verb conservatively still defaults to FAILED (never silently loosened). The
+Arabic branch is **unchanged** — it already hard-codes a closed set of write
+verbs directly into the pattern itself, so it was never exposed to this
+ambiguity. Verified directly: the real Sonnet finding now PASSES under V2
+while every genuine write-offer tested ("want me to cancel it?", "should I
+move it to tomorrow?") still correctly FAILS.
+
+**Retrospective replay (zero provider calls, new artifact, original never
+touched)**: new module `evals/benchmarks/retrospective_v3.py` reuses 5.5A's
+own `retrospective.py` parser unchanged, re-scoring the same stored 144-row
+Checkpoint 5.5 artifact through V1, V2, and V3 side by side, plus both
+action-confirmation versions and the new instruction-following check. V1/V2
+columns reproduce Checkpoint 5.5A's own numbers **byte-for-byte** (23/72 →
+30/72 Sonnet, 10/72 → 24/72 Haiku) — proof this is additive, not a silent
+redefinition. V3 column: Sonnet 23/72 → **31/72** (the one extra point is
+the real action-confirmation correction, confirmed directly), Haiku 23/72 →
+**24/72** unchanged from V2 (Haiku had no action-confirmation finding to
+correct). **Zero new PASS→FAIL regressions between V2 and V3** on the real
+holdout data — confirmed directly by diffing the two comparison sets.
+Written to a new file, `retrospective_v1_v2_v3_2026-10-06.txt`
+(gitignored, local-only, same as the 5.5/5.5A artifacts); the original
+`retrospective_v1_vs_v2_2026-10-04.txt` is untouched. **Explicitly labeled:
+SAME MODEL OUTPUTS, NEW EVALUATION INSTRUMENT — not a new model benchmark.**
+
+**The one non-negotiable hard gate, verified**: Haiku's real invented-date
+finding (`event_mixed_name`, fabricated "الجمعة"/Friday for "Hussein's
+birthday dinner" with no date anywhere in facts) still fails under V3,
+confirmed by a dedicated, explicitly-named regression test
+(`test_hard_gate_haiku_invented_date_finding_still_fails_under_v3`) — had
+this flipped to PASS, the checkpoint would have been rejected outright, no
+exceptions.
+
+**`evals/benchmarks/interpretation.py`** gained explicit (additive-only)
+bucket entries for the new check names — `on_topic_v2`/`on_topic_v3` →
+`UNRESOLVED_REQUIRES_HUMAN_REVIEW` (same reasoning as `on_topic`, now
+explicit rather than relying on the default fallback), `action_confirmation_shaped_v2`/
+`language_instruction_following` → `POSSIBLE_EVALUATOR_SENSITIVITY`. Every
+existing test, and every existing interpretation, is unchanged.
+
+**Production isolation, structurally proven** (same pattern as every prior
+Phase 5 checkpoint): `evals/tests/test_isolation.py`'s existing blanket scan
+(`grep`-equivalent over all of `app/` for `import evals`/`from evals`)
+automatically covers every new module added here — zero production file
+touched, zero new dependency, zero migration, zero frontend change.
+
+**Local Intelligence Provider — DEFERRED.** BAZRA's architecture is, and
+must remain, provider-neutral (Checkpoint 5.3's own `IntelligenceTier`
+contract exists for exactly this reason: tier is a call-shape classification
+with zero model-selection authority). A local model (e.g. via Ollama or
+MLX-LM) is a real, eventually-desirable option for cost/latency/offline
+operation — but is explicitly **not** pursued now: BAZRA should reach a more
+mature functional baseline first, and the evaluation harness this phase has
+built (5.4's offline suite, 5.5's real-provider benchmark infrastructure,
+5.5A/5.6's hardened deterministic grounding) is precisely the evidence
+pipeline a future local-model comparison would need before changing
+production routing. No local provider, model download, or routing change is
+made or implied by this note — pure roadmap documentation, nothing installed,
+nothing imported, nothing changed.
+
+**Full regression**: new evaluator tests (92 for `grounding_v3`, 17 for
+`action_confirmation_shaped_v2`, 15 for the replay module + its real-artifact
+hard gate), all pre-existing 5.4/5.5/5.5A evaluator and benchmark tests
+(unchanged, all still passing), full backend suite (run twice, per this
+project's own shared-test-database discipline), frontend suite, `tsc`, and
+`vite build` all green. **Real provider calls made in this checkpoint: 0.**
+The retrospective replay is fully offline, reading only the already-stored
+local artifact.
+
+**No routing authority granted.** No production model, prompt, tier, or
+routing behavior changed, and none is authorized by this checkpoint.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1

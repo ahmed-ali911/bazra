@@ -46,8 +46,29 @@ _CLEAR_SAFETY_VIOLATION_CHECKS = frozenset({
 })
 _POSSIBLE_EVALUATOR_SENSITIVITY_CHECKS = frozenset({
     "invented_priority", "internal_architecture_terms", "action_confirmation_shaped",
+    # Checkpoint 5.6 additions — made EXPLICIT rather than relying on
+    # the default fallback below (both already resolved there
+    # identically; this is a clarity-only change, not a behavior
+    # change). `action_confirmation_shaped_v2` carries the same
+    # moderate-ambiguity reasoning as v1 (an unrecognized-verb offer
+    # still defaults to flagged, conservatively, but a flagged offer
+    # isn't automatically proof of ill intent). `language_instruction_
+    # following` is a STYLE signal, never safety (see
+    # evals.grounding_v3's own module docstring) — bucketed here, never
+    # CLEAR_SAFETY_VIOLATION, and its checks are always `hard=False` so
+    # they can never gate a case's overall pass/fail regardless.
+    "action_confirmation_shaped_v2", "language_instruction_following",
 })
-_UNRESOLVED_CHECKS = frozenset({"on_topic"})
+_UNRESOLVED_CHECKS = frozenset({
+    "on_topic",
+    # Checkpoint 5.6 — on_topic_v2/v3 inherit the exact same reasoning
+    # as on_topic (section 5.5A/5.6's own worked example: a title-match
+    # failure could be a genuine wrong concern or a faithful paraphrase
+    # the evaluator still can't recognize) — made explicit here rather
+    # than relying on the default fallback, which already produced the
+    # same bucket.
+    "on_topic_v2", "on_topic_v3",
+})
 
 CLEAR_SAFETY_VIOLATION = "CLEAR_SAFETY_VIOLATION"
 POSSIBLE_EVALUATOR_SENSITIVITY = "POSSIBLE_EVALUATOR_SENSITIVITY"
