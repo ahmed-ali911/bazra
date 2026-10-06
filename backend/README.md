@@ -2022,6 +2022,146 @@ clean. **Real Gemini calls made: 0. Real Anthropic calls made: 0.**
 **No migration.** AiTrace's pre-existing `provider` column absorbed this
 checkpoint's entire observability need.
 
+**Post-acceptance hardening (5.7E/5.7F/5.7G), before the first real
+connectivity smoke test succeeded:** the first real Gemini call failed with
+a generic `unknown_provider_error`. Root-caused entirely offline (zero
+additional real provider calls spent diagnosing it): `_call_gemini`'s
+one-line `return _get_gemini_client().models.generate_content(...)` left
+the `google.genai.Client` wrapper as a bare temporary with no strong
+reference held for the call's duration — CPython garbage-collected it
+between the `.models` attribute access and the call completing, and the
+SDK's own cleanup closed its underlying httpx transport before the request
+ever sent, raising `"Cannot send a request, as the client has been
+closed."`. Reproduced deterministically offline (network-transport-layer
+interception only) as the very first action in a fresh process, confirmed
+against the SDK's own minimal documented usage pattern (which does NOT
+chain the call and never reproduces it), and fixed with a one-line change:
+bind the client to a local variable first. No taxonomy change (this was a
+BAZRA bug, not a provider condition). Also added, investigating this: a
+minimal, safe diagnostic-logging improvement (`_classify_gemini_failure`
+now logs exception class + HTTP code + RPC status — never message,
+payload, or credentials — on any Gemini failure, available for future
+debugging without persisting anything new to AiTrace), and `max_output_tokens`
+threaded through the explicit-provider call paths. The real end-to-end
+smoke test (`gemini-3.1-flash-lite`, prompt "Reply with exactly the word:
+pong") then succeeded: 8 input / 1 output tokens, ~7.2s latency, real
+AiTrace row, zero Anthropic calls, zero retries, zero fallback — **Gemini
+explicit-provider connectivity proven end-to-end.**
+
+### Checkpoint 5.7H — Manual Gemini Test Mode
+
+A small developer/human-evaluation control letting Ahmed explicitly choose
+Gemini for a single Chat turn's **generation step only** — not automatic
+routing, not a benchmark, not a second production path.
+
+**Backend contract**: `SendMessageRequest` gained
+`model_provider_override: Literal["default", "google_gemini_test"] = "default"`
+(`app/modules/chat/schemas.py`) — a strict, pydantic-validated enum; the
+browser can never submit a raw provider/model string (confirmed: an
+unrecognized value returns `422` before `chat_service` ever runs). The
+backend alone owns the mapping (`chat/service.py`'s own
+`_MODEL_PROVIDER_OVERRIDE_MAP`): `"google_gemini_test" → (provider=
+"google_gemini", model="gemini-3.1-flash-lite")`. `"default"` is not a map
+entry at all — it resolves to `provider=None, model=None`, which
+`orchestrator_service.generate_reply`'s own docstring guarantees calls
+`model_router_service.complete(...)` exactly as before this checkpoint,
+byte-for-byte; only when BOTH `provider` and `model` are explicitly
+supplied does it instead call `complete_with_explicit_provider(...)` —
+the same explicit, traced, no-fallback path Checkpoint 5.7 built and
+proved end-to-end.
+
+**Pipeline — proven identical except for the generation provider**:
+```
+User message
+  → write-intent decline / proposal confirm-reject (steps 1-3, UNCHANGED —
+    model_provider_override is not even read here)
+  → Checkpoint 5.2 deterministic zero-LLM retrieval (step 4, UNCHANGED —
+    still wins BEFORE this override is ever consulted; a recognized
+    retrieval phrase never reaches generate_reply regardless of override)
+  → Context Assembly + memories + pending-proposal state + history
+    (IDENTICAL either way — no new context source, no expanded window)
+  → generate_reply(..., provider=None/model=None [default] OR
+    provider="google_gemini"/model="gemini-3.1-flash-lite" [Gemini Test])
+  → claim verifier (orchestrator_service.verify_no_mutation_claim —
+    UNCHANGED, always Anthropic, regardless of which provider generated
+    the candidate text)
+  → persisted assistant response
+```
+The ONLY experimental difference is which provider executes the single
+generation call.
+
+**Write-action safety (Phase 3 preservation)**: Gemini Test mode offers
+Gemini **only** `_RESPOND_WITH_TEXT_TOOL` (`chat/service.py`'s own
+`_GEMINI_TEST_TOOLS_OFFERED`) — never the full 10-tool production catalog.
+This is a structural guarantee, not a prompt-level one: Gemini has no
+declared function to call for `propose_create_task`/`propose_update_task`/
+`propose_delete_task`/`propose_create_event`/`propose_update_event`/
+`propose_delete_event`/`propose_save_memory`/`propose_forget_memory`/
+`get_weather` at all this turn, so it cannot create a `ProposedAction`
+regardless of what it might otherwise attempt. Chosen deliberately over
+attempting to prove Gemini's tool-calling against the existing 9-tool/
+forced-exactly-one-call production contract, which has not yet been
+validated for Gemini specifically — explicitly scoped to non-mutating
+conversational generation for this checkpoint, per its own brief.
+`respond_with_text`'s own candidate text still passes through the
+existing, completely unchanged claim verifier before being shown — the
+real safety net against any untrusted completion-claiming prose, exactly
+as it already is for Claude today.
+
+**Privacy**: context sent to Gemini is **identical** to what's already sent
+to Claude today — no new context source, no expanded history window, no
+memory/Inbox/file access added "because Gemini is available." The UI shows
+a concise, non-alarming notice only while Gemini Test is selected ("this
+conversation will be sent to Google Gemini for this reply only").
+
+**Failure behavior**: a Gemini Test failure raises `OrchestratorError`
+exactly like an Anthropic failure would — the exact same honest,
+bilingual degradation wording (`_reply_for_model_unavailable`, already
+provider-neutral) — **never** a silent fallback to Anthropic (tested
+directly: a poisoned `complete()` raises `AssertionError` if ever reached
+from a Gemini-Test-path failure) and **never** a hidden retry (tested:
+exactly one call attempt on failure).
+
+**Scope** (session-local, not global): the selected provider lives in
+component-local React state (`ChatPage.tsx`'s own `useState`) — resets to
+"Default" on every page load/remount, never persisted to localStorage,
+the backend, or long-term memory. Single-user deployment: the existing
+authentication boundary (`get_current_user`) is the only guard; no RBAC
+subsystem was built for this one developer-facing control.
+
+**UI**: a small, compact two-option toggle ("Default" / "Gemini Test") next
+to the Chat heading, built from existing design tokens only — no new
+component, no Chat redesign. Verified via comprehensive automated
+interaction tests (render, click, ARIA `radiogroup`/`radio` state, exact
+request-body contents) rather than a live visual browser check — stated
+explicitly per this project's own UI-verification policy.
+
+**Testing**: 18 new backend tests (5 in `orchestrator/tests/test_orchestrator.py`
+for the `generate_reply` provider-override contract; 13 in `chat/tests/
+test_gemini_test_mode.py` covering default-preservation, strict-enum
+rejection, restricted-tool-offer, context-unchanged, deterministic-
+retrieval-still-wins, no-fallback, no-hidden-retry, real AiTrace
+provider/model identification, and unchanged-verifier-routing) + 12 new
+frontend tests (`ChatPage.test.tsx`: selector render/default-state,
+request-body contents for both options, returning to Default, and
+fresh-mount-always-Default). The production-isolation test
+(`test_no_production_module_outside_model_router_imports_the_gemini_sdk_or_adapter`)
+was narrowed, not weakened: Chat/Orchestrator now legitimately reference
+the `"google_gemini"` provider-identity **string** (an intentional,
+validated enum choice) — the invariant that still matters, and is still
+checked, is that no module outside `model_router/` ever imports the
+Gemini SDK or adapter module directly. Full regression: backend full suite
+run twice (1533 passed both times, up from the 1516 baseline), frontend
+suite (123 passed, up from 118), `tsc -b && vite build` clean. **Real
+Gemini calls made during implementation/testing: 0. Real Anthropic calls:
+0.**
+
+**Not in this checkpoint**: Gemini write-action/tool-calling (explicitly
+deferred — see Write-action safety above), automatic routing of any kind,
+a Gemini-vs-Claude benchmark (Checkpoint 5.8, not started), claim-verifier
+provider selection (stays Anthropic-only), a persisted/global provider
+preference, and Google Search grounding.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1

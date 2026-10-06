@@ -63,16 +63,23 @@ def _default_safe_claim_verifier(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(orchestrator_service_module, "verify_no_mutation_claim", lambda candidate_text: False)
 
 
-def _send(client: TestClient, content: str, timezone_name: str = _DEFAULT_TIMEZONE) -> dict:
-    response = client.post(
-        "/api/v1/chat/messages",
-        json={
-            "content": content,
-            "tomorrow_start": TOMORROW_START.isoformat(),
-            "window_end": WINDOW_END.isoformat(),
-            "timezone": timezone_name,
-        },
-    )
+def _send(
+    client: TestClient, content: str, timezone_name: str = _DEFAULT_TIMEZONE,
+    model_provider_override: str | None = None,
+) -> dict:
+    body = {
+        "content": content,
+        "tomorrow_start": TOMORROW_START.isoformat(),
+        "window_end": WINDOW_END.isoformat(),
+        "timezone": timezone_name,
+    }
+    # Checkpoint 5.7H — omitted entirely (not sent as an explicit null)
+    # unless a test actually wants to exercise the override, so every
+    # pre-5.7H call site here sees a byte-for-byte unchanged request
+    # body and relies on SendMessageRequest's own "default" field default.
+    if model_provider_override is not None:
+        body["model_provider_override"] = model_provider_override
+    response = client.post("/api/v1/chat/messages", json=body)
     return response
 
 

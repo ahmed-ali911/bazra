@@ -141,6 +141,131 @@ describe("ChatPage", () => {
     expect(screen.queryByText("Something went wrong sending that message.")).not.toBeInTheDocument();
   });
 
+  // ---- Checkpoint 5.7H: Manual Gemini Test Mode selector ----------------
+
+  it("renders the AI provider selector with Default selected initially", async () => {
+    mockFetch(() => ({ ok: true, status: 200, body: [] }));
+    renderWithQueryClient(<ChatPage />);
+    await screen.findByText("No messages yet");
+
+    const group = screen.getByRole("radiogroup", { name: "AI provider" });
+    const defaultOption = screen.getByRole("radio", { name: "Default" });
+    const geminiOption = screen.getByRole("radio", { name: "Gemini Test" });
+
+    expect(group).toBeInTheDocument();
+    expect(defaultOption).toHaveAttribute("aria-checked", "true");
+    expect(geminiOption).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("sends model_provider_override: default when Default is selected (unchanged)", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockFetch((_url, options) => {
+      if (options?.method === "POST") {
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            user_message: { id: 1, role: "user", content: "hi", created_at: "2026-01-01T00:00:00Z" },
+            assistant_message: { id: 2, role: "assistant", content: "hello!", created_at: "2026-01-01T00:00:01Z" },
+          },
+        };
+      }
+      return { ok: true, status: 200, body: [] };
+    });
+
+    renderWithQueryClient(<ChatPage />);
+    await screen.findByText("No messages yet");
+
+    await user.type(screen.getByLabelText("Chat message"), "hi");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const postCall = fetchMock.mock.calls.find(([, options]) => options?.method === "POST");
+    const body = JSON.parse(postCall![1].body as string);
+    expect(body.model_provider_override).toBe("default");
+  });
+
+  it("selecting Gemini Test sends only the approved enum value", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockFetch((_url, options) => {
+      if (options?.method === "POST") {
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            user_message: { id: 1, role: "user", content: "hi", created_at: "2026-01-01T00:00:00Z" },
+            assistant_message: { id: 2, role: "assistant", content: "pong", created_at: "2026-01-01T00:00:01Z" },
+          },
+        };
+      }
+      return { ok: true, status: 200, body: [] };
+    });
+
+    renderWithQueryClient(<ChatPage />);
+    await screen.findByText("No messages yet");
+
+    await user.click(screen.getByRole("radio", { name: "Gemini Test" }));
+    expect(screen.getByRole("radio", { name: "Gemini Test" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText(/this conversation will be sent to Google Gemini/i)).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Chat message"), "hi");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const postCall = fetchMock.mock.calls.find(([, options]) => options?.method === "POST");
+    const body = JSON.parse(postCall![1].body as string);
+    expect(body.model_provider_override).toBe("google_gemini_test");
+    // Only the approved enum member — never a raw provider/model string.
+    expect(body.provider).toBeUndefined();
+    expect(body.model).toBeUndefined();
+  });
+
+  it("returning to Default restores ordinary behavior and clears the warning", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockFetch((_url, options) => {
+      if (options?.method === "POST") {
+        return {
+          ok: true,
+          status: 200,
+          body: {
+            user_message: { id: 1, role: "user", content: "hi", created_at: "2026-01-01T00:00:00Z" },
+            assistant_message: { id: 2, role: "assistant", content: "hello!", created_at: "2026-01-01T00:00:01Z" },
+          },
+        };
+      }
+      return { ok: true, status: 200, body: [] };
+    });
+
+    renderWithQueryClient(<ChatPage />);
+    await screen.findByText("No messages yet");
+
+    await user.click(screen.getByRole("radio", { name: "Gemini Test" }));
+    await user.click(screen.getByRole("radio", { name: "Default" }));
+
+    expect(screen.getByRole("radio", { name: "Default" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.queryByText(/this conversation will be sent to Google Gemini/i)).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Chat message"), "hi");
+    await user.click(screen.getByRole("button", { name: "Send" }));
+
+    const postCall = fetchMock.mock.calls.find(([, options]) => options?.method === "POST");
+    const body = JSON.parse(postCall![1].body as string);
+    expect(body.model_provider_override).toBe("default");
+  });
+
+  it("a fresh mount always starts at Default — no persisted global preference", async () => {
+    mockFetch(() => ({ ok: true, status: 200, body: [] }));
+    const { unmount } = renderWithQueryClient(<ChatPage />);
+    await screen.findByText("No messages yet");
+
+    await userEvent.setup().click(screen.getByRole("radio", { name: "Gemini Test" }));
+    expect(screen.getByRole("radio", { name: "Gemini Test" })).toHaveAttribute("aria-checked", "true");
+
+    unmount();
+
+    renderWithQueryClient(<ChatPage />);
+    await screen.findByText("No messages yet");
+    expect(screen.getByRole("radio", { name: "Default" })).toHaveAttribute("aria-checked", "true");
+  });
+
   it("falls back to the generic message for an unrelated server error", async () => {
     const user = userEvent.setup();
     mockFetch((_url, options) => {

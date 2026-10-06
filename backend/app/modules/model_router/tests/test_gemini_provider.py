@@ -741,29 +741,43 @@ def test_gemini_service_module_never_imports_anthropic() -> None:
     assert not any("anthropic" in line.lower() for line in import_lines)
 
 
-def test_no_production_module_outside_model_router_references_gemini() -> None:
-    """Structural proof (sections 12/27/28): Chat, Orchestrator,
-    Attention, ProposedAction, Memory, and every other production
-    module must have zero CODE-LEVEL awareness Gemini exists — only
-    model_router/ itself (and app/config.py's own inert settings field)
-    may reference it. Deliberately checks specific code-level tokens
-    (gemini_service / google.genai / google_gemini / GEMINI_API_KEY),
-    NOT the bare substring "gemini" — BAZRA's own identity prompt
+def test_no_production_module_outside_model_router_imports_the_gemini_sdk_or_adapter() -> None:
+    """Structural proof (sections 12/27/28, narrowed by Checkpoint
+    5.7H): Chat, Orchestrator, Attention, ProposedAction, Memory, and
+    every other production module must never import the Gemini SDK or
+    adapter module directly — provider SDK objects must never leak
+    outside model_router/. As of 5.7H (Manual Gemini Test Mode), Chat/
+    Orchestrator DO legitimately reference the bare "google_gemini"
+    PROVIDER IDENTITY STRING (chat/service.py's own
+    _MODEL_PROVIDER_OVERRIDE_MAP, a closed, backend-owned mapping from
+    a validated request enum to this string) — that is an intentional,
+    narrow exception this test deliberately does NOT flag; the
+    invariant that still matters, and is checked here, is that no
+    module outside model_router/ ever imports gemini_service itself or
+    the google-genai SDK, and none ever reads GEMINI_API_KEY directly.
+    Deliberately checks specific code-level import tokens, NOT the bare
+    substring "gemini" — BAZRA's own identity prompt
     (orchestrator/identity.py) legitimately lists "Gemini" as one of
     several brand names in its provider-concealment instructions
     ("You never identify yourself as ... ChatGPT, Gemini, Anthropic,
-    ..."), predating this checkpoint and unrelated to it; a bare
-    substring search would wrongly flag that prose as a violation."""
+    ..."), predating this checkpoint and unrelated to it."""
     import pathlib
 
     app_dir = pathlib.Path(__file__).resolve().parents[3]
     allowed = {app_dir / "config.py"}
-    needles = ("gemini_service", "google.genai", "google_gemini", "GEMINI_API_KEY", "from google import genai")
+    needles = ("gemini_service", "google.genai", "GEMINI_API_KEY", "from google import genai")
     offenders = []
     for path in app_dir.rglob("*.py"):
-        if "model_router" in path.parts or path in allowed:
+        # "tests" directories are explicitly excluded: this invariant is
+        # about PRODUCTION code paths, never test code — a test like
+        # chat/tests/test_gemini_test_mode.py's own
+        # test_gemini_test_aitrace_identifies_explicit_gemini_use
+        # legitimately mocks gemini_service._call_gemini directly to
+        # prove a real end-to-end AiTrace row, exactly as this module's
+        # own tests do for the adapter itself.
+        if "model_router" in path.parts or "tests" in path.parts or path in allowed:
             continue
         text = path.read_text(encoding="utf-8")
         if any(needle in text for needle in needles):
             offenders.append(str(path))
-    assert offenders == [], f"production code outside model_router/ must never reference Gemini: {offenders}"
+    assert offenders == [], f"production code outside model_router/ must never import the Gemini SDK/adapter: {offenders}"

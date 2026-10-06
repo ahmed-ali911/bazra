@@ -1,7 +1,7 @@
 import logging
 
 from app.modules.model_router import service as model_router_service
-from app.modules.model_router.schemas import TextBlock, ToolResultBlock, ToolUseBlock
+from app.modules.model_router.schemas import ModelProvider, TextBlock, ToolResultBlock, ToolUseBlock
 from app.modules.orchestrator.identity import BAZRA_IDENTITY_INSTRUCTIONS
 from app.modules.orchestrator.schemas import HistoryTurn, OrchestratorResult, ToolCallRequest
 
@@ -317,6 +317,8 @@ def generate_reply(
     user_message: str,
     current_datetime_local: str,
     tools: list[dict] | None = None,
+    provider: ModelProvider | None = None,
+    model: str | None = None,
 ) -> OrchestratorResult:
     """Coordinates inputs and the provider call. Never touches the
     database itself — history and context are both handed in as plain
@@ -348,6 +350,24 @@ def generate_reply(
     and the 3.23 close-out's own documented residual for the failure
     class this does not close.
 
+    provider/model (Checkpoint 5.7H) are BOTH optional and BOTH default
+    to None — the ordinary, production path. When omitted (every real
+    call site before this checkpoint, and chat_service's own "default"
+    override case), this function's behavior, including which Model
+    Router function it calls, is byte-for-byte unchanged: it calls
+    `model_router_service.complete(...)`, which resolves provider/model
+    itself from `purpose` exactly as it always has. ONLY when a caller
+    explicitly supplies BOTH `provider` and `model` (chat_service's own
+    "google_gemini_test" override case — the ONE real caller of this
+    path, via Manual Gemini Test Mode) does this function instead call
+    `model_router_service.complete_with_explicit_provider(...)` — the
+    same explicit, traced, no-fallback path Checkpoint 5.7 built and
+    proved end-to-end. This is NOT automatic routing: nothing here ever
+    decides to use a non-default provider on its own; it only ever does
+    what its caller explicitly asked for, once, with no retry and no
+    fallback to the other provider on failure (both inherited directly
+    from complete_with_explicit_provider's own existing contract).
+
     NOT a pure function: the underlying model call is a real side
     effect (network I/O, real cost, non-deterministic output). The
     history-as-argument design solves the circular-import and
@@ -378,7 +398,12 @@ def generate_reply(
     # every call site deliberately omits this parameter rather than
     # repeating the assignment here.
     try:
-        response = model_router_service.complete(**complete_kwargs)
+        if provider is not None and model is not None:
+            response = model_router_service.complete_with_explicit_provider(
+                provider=provider, model=model, **complete_kwargs
+            )
+        else:
+            response = model_router_service.complete(**complete_kwargs)
     except model_router_service.ModelRouterError as exc:
         raise OrchestratorError(exc.category) from exc
 

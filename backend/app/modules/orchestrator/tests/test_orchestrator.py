@@ -287,6 +287,97 @@ def test_system_prompt_forbids_write_claims_and_data_beyond_context() -> None:
     assert "say you don't have that information rather than guessing" in prompt
 
 
+# ---- Checkpoint 5.7H: optional provider/model override --------------------
+
+
+def test_generate_reply_without_provider_override_calls_complete_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default (provider=None, model=None — every pre-5.7H call
+    site, and chat_service's own "default" override case) must still
+    call model_router_service.complete exactly as before — never
+    complete_with_explicit_provider."""
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(text="hi")
+
+    def _must_not_be_called(**kwargs):
+        raise AssertionError("complete_with_explicit_provider must not be called when provider/model are omitted")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _capture)
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete_with_explicit_provider", _must_not_be_called)
+
+    orchestrator_service.generate_reply(history=[], context="ctx", user_message="hi", current_datetime_local=_ANCHOR)
+
+    assert captured["purpose"] == "chat_completion"
+
+
+def test_generate_reply_with_explicit_provider_calls_complete_with_explicit_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ONE real caller of this path (chat_service's own
+    "google_gemini_test" override) — confirms provider/model reach
+    complete_with_explicit_provider verbatim, and the default complete()
+    is never touched for this call."""
+    captured = {}
+
+    def _capture(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(text="pong")
+
+    def _must_not_be_called(**kwargs):
+        raise AssertionError("complete() must not be called when provider/model are both supplied")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _must_not_be_called)
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete_with_explicit_provider", _capture)
+
+    result = orchestrator_service.generate_reply(
+        history=[], context="ctx", user_message="hi", current_datetime_local=_ANCHOR,
+        provider="google_gemini", model="gemini-3.1-flash-lite",
+    )
+
+    assert captured["provider"] == "google_gemini"
+    assert captured["model"] == "gemini-3.1-flash-lite"
+    assert captured["purpose"] == "chat_completion"
+    assert result.text == "pong"
+
+
+def test_generate_reply_provider_without_model_falls_back_to_default_complete(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only BOTH provider AND model together trigger the explicit path —
+    a partial/malformed caller never accidentally reaches it."""
+    captured = {}
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", lambda **kw: captured.update(kw) or _FakeModelResponse(text="hi"))
+
+    orchestrator_service.generate_reply(
+        history=[], context="ctx", user_message="hi", current_datetime_local=_ANCHOR, provider="google_gemini", model=None,
+    )
+    assert captured  # complete() was indeed called
+
+
+def test_generate_reply_gemini_failure_raises_orchestrator_error_no_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Honest degradation (5.7H section 14): a Gemini failure raises
+    OrchestratorError exactly like an Anthropic failure would — never
+    silently retried on Anthropic instead."""
+    anthropic_called = {"value": False}
+
+    def _raise_gemini_failure(**kwargs):
+        raise orchestrator_service.model_router_service.ModelRouterError("unknown_provider_error")
+
+    def _mark_anthropic_called(**kwargs):
+        anthropic_called["value"] = True
+        raise AssertionError("must never fall back to complete()")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete_with_explicit_provider", _raise_gemini_failure)
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _mark_anthropic_called)
+
+    with pytest.raises(orchestrator_service.OrchestratorError) as exc_info:
+        orchestrator_service.generate_reply(
+            history=[], context="ctx", user_message="hi", current_datetime_local=_ANCHOR,
+            provider="google_gemini", model="gemini-3.1-flash-lite",
+        )
+
+    assert exc_info.value.category == "unknown_provider_error"
+    assert anthropic_called["value"] is False
+
+
 def test_system_prompt_describes_propose_create_task_as_a_proposal_not_an_execution() -> None:
     prompt = orchestrator_service._build_system_prompt("some context", _ANCHOR)
     assert "propose_create_task" in prompt

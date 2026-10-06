@@ -443,6 +443,40 @@ _TOOLS_OFFERED = [
     _RESPOND_WITH_TEXT_TOOL,
 ]
 
+# Checkpoint 5.7H — Manual Gemini Test Mode offers ONLY this one tool,
+# never the full _TOOLS_OFFERED catalog. respond_with_text can never
+# create a ProposedAction and never mutates anything (see its own
+# docstring above) — offering ONLY it means Gemini is structurally
+# INCAPABLE of calling propose_create_task/propose_update_task/
+# propose_delete_task/propose_create_event/propose_update_event/
+# propose_delete_event/propose_save_memory/propose_forget_memory/
+# get_weather at all this turn, regardless of what it might otherwise
+# attempt — not a trust/prompt-level restriction, a structural one (the
+# provider has no declared function to call). This is the deliberate,
+# documented scope decision from this checkpoint's own brief, section 8
+# ("acceptable to limit Gemini Test to non-mutating conversational
+# generation"): the Gemini adapter's tool-calling translation has not
+# yet been proven against this exact 9-tool/forced-exactly-one-call
+# production contract, so this checkpoint does not improvise that
+# proof — it removes the question entirely for the generation step,
+# while leaving the EXISTING, unchanged claim-verifier (see
+# _candidate_reply_is_safe_to_show) as the real safety net against any
+# untrusted completion-claiming prose respond_with_text's own text
+# might still contain, exactly as it already is for Claude today.
+_GEMINI_TEST_TOOLS_OFFERED = [_RESPOND_WITH_TEXT_TOOL]
+
+# Checkpoint 5.7H, section 12 — the backend-owned provider/model
+# mapping; the frontend only ever submits ModelProviderOverride's own
+# closed enum member name, never a provider/model string itself. Only
+# one override is currently defined; "default" never appears as a key
+# here at all — it is handled by passing provider=None/model=None to
+# generate_reply (see send_message below), which is what keeps
+# "default" byte-for-byte identical to pre-5.7H behavior rather than a
+# parallel code path that merely RESOLVES to the same thing.
+_MODEL_PROVIDER_OVERRIDE_MAP: dict[str, tuple[str, str]] = {
+    "google_gemini_test": ("google_gemini", "gemini-3.1-flash-lite"),
+}
+
 
 class RespondWithTextArguments(BaseModel):
     """Checkpoint 3.23 — the pure shape-validator for respond_with_text,
@@ -2004,6 +2038,7 @@ def send_message(
     tomorrow_start: datetime,
     window_end: datetime,
     timezone_name: str,
+    model_provider_override: str = "default",
 ) -> tuple[ChatMessage, ChatMessage]:
     """The user's own message is ALWAYS persisted immediately, before
     anything else is attempted — they genuinely sent it. An assistant
@@ -2068,6 +2103,26 @@ def send_message(
        the same deterministic reply; MODEL TEXT IS NEVER EXECUTION
        EVIDENCE either way. See _reply_for_stale_proposal_text's and
        _candidate_reply_is_safe_to_show's own docstrings.
+
+    model_provider_override (Checkpoint 5.7H, Manual Gemini Test Mode):
+    "default" (the parameter's own default) means EVERY branch above
+    and below behaves exactly as it did before this checkpoint — this
+    value is only ever consulted in step 5, nowhere else, so write-
+    intent-decline/confirm/reject/deterministic-retrieval (steps 1-4)
+    are completely unaffected by it regardless of its value (Checkpoint
+    5.2's own deterministic-local-first guarantee is structurally
+    preserved: it already runs, and already returns, BEFORE this
+    parameter is ever read). "google_gemini_test" changes exactly one
+    thing in step 5: generate_reply is called with an explicit
+    provider/model (Gemini) and a single-tool offer restricted to
+    respond_with_text only (see _GEMINI_TEST_TOOLS_OFFERED's own
+    docstring for why) — Context Assembly, conversation history, the
+    system prompt, and the claim verifier are ALL identical to the
+    default path; the only experimental difference is which provider
+    generates the reply text. A Gemini failure here raises
+    OrchestratorError exactly like an Anthropic failure would (caught
+    below, unchanged) — honest degradation, never a silent fallback to
+    Anthropic.
 
     Checkpoint 3.17: a transaction-scoped conversation advisory lock
     (_acquire_conversation_lock) is held from just before the incoming
@@ -2159,13 +2214,28 @@ def send_message(
     history_rows = list_recent_messages(db, space_id, user_id)
     history = _trim_to_char_budget(history_rows, _MAX_HISTORY_CHARS)
 
+    # Checkpoint 5.7H — "default" (the overwhelming majority of calls,
+    # and the only possibility before this checkpoint) passes
+    # provider=None/model=None, which generate_reply's own docstring
+    # guarantees is byte-for-byte its pre-5.7H call shape. Only the one
+    # explicit, closed override resolves to anything else, and even
+    # then changes ONLY the tools offered (respond_with_text alone) and
+    # the provider/model generate_reply is told to use — context,
+    # history, and the system prompt above are completely unaffected by
+    # this branch.
+    override_provider_model = _MODEL_PROVIDER_OVERRIDE_MAP.get(model_provider_override)
+    tools_for_turn = _TOOLS_OFFERED if override_provider_model is None else _GEMINI_TEST_TOOLS_OFFERED
+    override_provider, override_model = override_provider_model if override_provider_model is not None else (None, None)
+
     try:
         result = orchestrator_service.generate_reply(
             history=history,
             context=context,
             user_message=content,
             current_datetime_local=current_datetime_local,
-            tools=_TOOLS_OFFERED,
+            tools=tools_for_turn,
+            provider=override_provider,
+            model=override_model,
         )
     except orchestrator_service.OrchestratorError as exc:
         raise ChatModelCallFailed(

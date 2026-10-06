@@ -19,7 +19,8 @@ def send_message(
 ) -> SendMessageResponse:
     try:
         user_message, assistant_message = service.send_message(
-            db, space_id, user.id, body.content, body.tomorrow_start, body.window_end, body.timezone
+            db, space_id, user.id, body.content, body.tomorrow_start, body.window_end, body.timezone,
+            model_provider_override=body.model_provider_override,
         )
     except service.MessageTooLongError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=str(exc)) from exc

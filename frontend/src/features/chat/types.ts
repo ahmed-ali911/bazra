@@ -5,6 +5,14 @@ export interface ChatMessage {
   created_at: string;
 }
 
+// Checkpoint 5.7H — Manual Gemini Test Mode's own strict, closed enum,
+// matching the backend's ModelProviderOverride Literal exactly (see
+// app/modules/chat/schemas.py). "default" preserves production
+// behavior exactly; "google_gemini_test" is the one currently-
+// supported manual override. The backend alone maps this to an actual
+// provider/model — this type never carries either directly.
+export type ModelProviderOverride = "default" | "google_gemini_test";
+
 export interface SendMessageResponse {
   user_message: ChatMessage;
   assistant_message: ChatMessage;
