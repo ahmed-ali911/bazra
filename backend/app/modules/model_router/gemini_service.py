@@ -201,6 +201,7 @@ def _call_gemini(
     system: str | None = None,
     tools: list[dict] | None = None,
     tool_choice: dict | None = None,
+    max_output_tokens: int | None = None,
 ) -> types.GenerateContentResponse:
     """The only function in this module that talks to the google-genai
     SDK directly — mirrors _call_anthropic's own role exactly. Raises
@@ -209,11 +210,21 @@ def _call_gemini(
     exceptions — TimeoutException/HTTPError — on a pre-response
     transport failure, since the SDK is itself httpx-based); never
     swallows or wraps here — that is _classify_gemini_failure's job,
-    called by the caller, not this function."""
+    called by the caller, not this function.
+
+    max_output_tokens is additive and optional (unlike Anthropic's own
+    _call_anthropic, which hardcodes a single _MAX_TOKENS for every
+    call) — omitted entirely (Gemini's own default applies) unless a
+    caller explicitly bounds it, e.g. a synthetic connectivity smoke
+    test that wants a hard, small cost ceiling independent of whatever
+    the model would naturally produce.
+    """
     contents = _serialize_messages_for_gemini(messages)
     config_kwargs: dict = {}
     if system is not None:
         config_kwargs["system_instruction"] = system
+    if max_output_tokens is not None:
+        config_kwargs["max_output_tokens"] = max_output_tokens
     translated_tools = _translate_tools_for_gemini(tools)
     if translated_tools is not None:
         config_kwargs["tools"] = translated_tools
@@ -222,7 +233,30 @@ def _call_gemini(
         config_kwargs["tool_config"] = translated_tool_choice
     config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
-    return _get_gemini_client().models.generate_content(model=model, contents=contents, config=config)
+    # Checkpoint 5.7G — MUST bind the client to a local variable before
+    # calling .models.generate_content on it. The previous one-line
+    # chained form (`return _get_gemini_client().models.generate_content(...)`)
+    # left the google.genai.Client wrapper as a bare temporary with no
+    # strong reference held for the duration of the call: CPython can
+    # (and, deterministically in this runtime, does) garbage-collect
+    # that temporary between the `.models` attribute access and the
+    # `generate_content(...)` call completing, and the SDK's own
+    # cleanup/finalizer logic closes its underlying httpx transport as
+    # part of that collection — producing a real, deterministic
+    # "Cannot send a request, as the client has been closed." RuntimeError
+    # BEFORE any request is ever sent. Confirmed via Checkpoint 5.7F's
+    # own offline diagnosis (zero provider calls): the exact same two
+    # calls, written as two statements with the client bound to `client`
+    # first, reliably reach the real transport boundary every time —
+    # with a dummy key, the real key, plain-string contents, or
+    # structured Content objects; none of those ever mattered. This is
+    # a BAZRA adapter object-lifetime defect, not an SDK, network,
+    # billing, auth, or model-identifier issue — see
+    # test_gemini_provider.py's own
+    # test_call_gemini_client_lifetime_regression for the offline,
+    # non-mocked proof.
+    client = _get_gemini_client()
+    return client.models.generate_content(model=model, contents=contents, config=config)
 
 
 # ---- response translation (Gemini -> BAZRA's provider-neutral shape) ----
@@ -260,6 +294,50 @@ def _extract_response_parts_gemini(response: types.GenerateContentResponse) -> t
 
 
 # ---- failure classification --------------------------------------------
+
+
+def _log_safe_gemini_failure_diagnostics(exc: Exception) -> None:
+    """Checkpoint 5.7E — the minimum safe diagnostic improvement: logs
+    ONLY the exception's class name, and — when it is a
+    google.genai.errors.APIError (or subclass) — its `.code` (HTTP
+    status int) and `.status` (Google RPC-style status name, e.g.
+    "PERMISSION_DENIED", "RESOURCE_EXHAUSTED"). This is internal
+    debugging evidence only (this module's own docstring's own
+    "Provider details may be available internally for debugging where
+    safe, but production behavior must use normalized semantics");
+    nothing logged here is returned to any caller, persisted to
+    AiTrace, or otherwise exposed outside server logs.
+
+    Deliberately NEVER logs, under any circumstance:
+    - exc.message / str(exc) / repr(exc) — a provider error message or
+      exception string could echo back request content (e.g. a quoted
+      value from the prompt) and is NOT safe, structured evidence —
+      this is exactly the "raw provider payload" this checkpoint's own
+      brief says never to persist or print.
+    - exc.response / exc.details — the raw HTTP response object/body,
+      which could contain headers (including, in principle, auth-
+      adjacent material) or other response content never vetted as
+      safe.
+    - GEMINI_API_KEY or any credential material — this function never
+      even has access to it; it only ever sees the exception object.
+
+    This is a logging-only change — it does not alter
+    _classify_gemini_failure's return value for any input, tested
+    explicitly (see test_gemini_provider.py's own
+    test_safe_diagnostic_logging_* tests) to prove the existing
+    normalized taxonomy is completely unaffected.
+    """
+    exception_class = f"{type(exc).__module__}.{type(exc).__qualname__}"
+    if isinstance(exc, errors.APIError):
+        logger.warning(
+            "gemini_service: provider call failed (exception_class=%s, http_code=%s, rpc_status=%s)",
+            exception_class, exc.code, exc.status,
+        )
+    else:
+        logger.warning(
+            "gemini_service: provider call failed (exception_class=%s, http_code=None, rpc_status=None)",
+            exception_class,
+        )
 
 
 def _classify_gemini_failure(exc: Exception) -> ModelFailureCategory:
@@ -308,6 +386,8 @@ def _classify_gemini_failure(exc: Exception) -> ModelFailureCategory:
     contract, not an observed response body, exactly like
     _classify_failure's own billing_error precedent.
     """
+    _log_safe_gemini_failure_diagnostics(exc)
+
     if isinstance(exc, RuntimeError) and "GEMINI_API_KEY" in str(exc):
         return "authentication"
 
@@ -391,6 +471,7 @@ def generate_with_explicit_gemini_model(
     system: str | None = None,
     tools: list[dict] | None = None,
     tool_choice: dict | None = None,
+    max_output_tokens: int | None = None,
 ) -> tuple[str | None, list[ToolUseBlock], int, int, int]:
     """The ONE deliberate, explicit entry point for invoking Gemini —
     requires an explicit model string, never resolved from any purpose/
@@ -424,7 +505,10 @@ def generate_with_explicit_gemini_model(
     if not settings.gemini_api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     start = time.monotonic()
-    response = _call_gemini(model, messages, system=system, tools=tools, tool_choice=tool_choice)
+    response = _call_gemini(
+        model, messages, system=system, tools=tools, tool_choice=tool_choice,
+        max_output_tokens=max_output_tokens,
+    )
     latency_ms = int((time.monotonic() - start) * 1000)
     text, tool_uses = _extract_response_parts_gemini(response)
     prompt_tokens = response.usage_metadata.prompt_token_count if response.usage_metadata else 0

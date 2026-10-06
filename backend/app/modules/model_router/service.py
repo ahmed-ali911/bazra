@@ -619,6 +619,7 @@ def complete_with_explicit_provider(
     tool_choice: dict | None = None,
     correlation_id: str | None = None,
     tier: IntelligenceTier | None = None,
+    max_output_tokens: int | None = None,
 ) -> ModelResponse:
     """Checkpoint 5.7, section 20 — the ONE deliberate, explicit,
     traced path capable of reaching Gemini (or, symmetrically,
@@ -652,6 +653,13 @@ def complete_with_explicit_provider(
     complete() itself writes) — AiTrace's own `provider` column already
     supports this with no migration (confirmed in this checkpoint's own
     discovery).
+
+    max_output_tokens (optional) is passed through to the Gemini branch
+    only (_call_gemini's own additive parameter) — ignored for
+    provider="anthropic", which keeps using _call_anthropic's own fixed
+    _MAX_TOKENS, completely unchanged. Exists for a caller (e.g. a bounded
+    connectivity smoke test) that wants a hard, small cost ceiling
+    independent of whatever the model would naturally produce.
     """
     if provider not in VALID_PROVIDERS:
         raise ValueError(f"Unknown provider: {provider!r}")
@@ -674,7 +682,10 @@ def complete_with_explicit_provider(
         else:
             if not settings.gemini_api_key:
                 raise RuntimeError("GEMINI_API_KEY is not configured")
-            raw = gemini_service._call_gemini(model, messages, system=system, tools=tools, tool_choice=tool_choice)
+            raw = gemini_service._call_gemini(
+                model, messages, system=system, tools=tools, tool_choice=tool_choice,
+                max_output_tokens=max_output_tokens,
+            )
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
         category = _classify_failure(exc) if provider == "anthropic" else gemini_service._classify_gemini_failure(exc)

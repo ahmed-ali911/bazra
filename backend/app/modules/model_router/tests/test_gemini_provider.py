@@ -30,6 +30,26 @@ def _redirect_trace_session(test_engine: Engine, monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(model_router_service, "_trace_session_factory", sessionmaker(bind=test_engine))
 
 
+@pytest.fixture(autouse=True)
+def _reenable_gemini_logger() -> None:
+    """Checkpoint 5.7E — this suite's own session-scoped
+    `_prepare_test_database` fixture (conftest.py) runs Alembic
+    migrations in-process via `command.upgrade`, which calls
+    `migrations/env.py`'s `fileConfig(config.config_file_name)` —
+    Python's `logging.config.fileConfig` defaults to
+    `disable_existing_loggers=True`, silently disabling every logger
+    already registered at that point (including this module's own
+    `gemini_service.logger`, created at import time) that isn't
+    explicitly listed in alembic.ini's own `[loggers]` section. This is
+    a pre-existing environmental quirk of this test suite, not
+    something this checkpoint introduced — it simply never surfaced
+    before because no earlier test asserted on log CONTENT via
+    `caplog`. Re-enabling here, locally, scoped to this one test file,
+    rather than touching alembic.ini/migrations/env.py (shared
+    migration infrastructure, out of this checkpoint's own scope)."""
+    gemini_service.logger.disabled = False
+
+
 def _trace_count(db_session: Session) -> int:
     return db_session.execute(select(func.count()).select_from(AiTrace)).scalar_one()
 
@@ -212,6 +232,112 @@ def test_classify_gemini_failure_httpx_connection_error() -> None:
     assert gemini_service._classify_gemini_failure(exc) == "connection"
 
 
+# ---- Checkpoint 5.7E: safe structured diagnostic logging -----------------
+#
+# Zero real provider calls. Proves the new logging-only diagnostic
+# improvement (a) actually captures exception class + HTTP code + RPC
+# status for a real APIError, (b) never logs message/payload/secret
+# content under any circumstance, and (c) does not alter
+# _classify_gemini_failure's return value for ANY input — a pure,
+# additive, side-channel improvement.
+
+
+def test_safe_diagnostic_logging_captures_class_code_and_status_for_api_error(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="app.modules.model_router.gemini_service"):
+        category = gemini_service._classify_gemini_failure(_client_error(403, "PERMISSION_DENIED"))
+
+    assert category == "authentication"  # existing taxonomy unaffected
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "google.genai.errors.ClientError" in message
+    assert "http_code=403" in message
+    assert "rpc_status=PERMISSION_DENIED" in message
+
+
+def test_safe_diagnostic_logging_handles_non_api_error_with_no_code_or_status(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="app.modules.model_router.gemini_service"):
+        category = gemini_service._classify_gemini_failure(RuntimeError("some unexpected failure"))
+
+    assert category == "unknown_provider_error"  # honestly still unknown — no guessing
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "RuntimeError" in message
+    assert "http_code=None" in message
+    assert "rpc_status=None" in message
+
+
+def test_safe_diagnostic_logging_never_includes_exception_message_or_payload(caplog) -> None:
+    """The core redaction guarantee: a message that LOOKS like it could
+    carry sensitive content (here, a fake API-key-shaped string) must
+    never appear in the log line — only class/code/status are logged,
+    never .message/str(exc)/.details/.response."""
+    import logging
+
+    sensitive_marker = "FAKE_SECRET_SHOULD_NEVER_BE_LOGGED_abc123xyz"
+    exc = errors.ClientError(
+        code=400,
+        response_json={"error": {"code": 400, "status": "INVALID_ARGUMENT", "message": f"bad request: {sensitive_marker}"}},
+    )
+    with caplog.at_level(logging.WARNING, logger="app.modules.model_router.gemini_service"):
+        category = gemini_service._classify_gemini_failure(exc)
+
+    assert category == "invalid_request"
+    for record in caplog.records:
+        assert sensitive_marker not in record.getMessage()
+        assert sensitive_marker not in str(record)
+
+
+def test_safe_diagnostic_logging_never_includes_api_key(caplog, monkeypatch: pytest.MonkeyPatch) -> None:
+    import logging
+
+    monkeypatch.setattr(gemini_service.settings, "gemini_api_key", "totally-fake-test-key-should-never-log")
+    with caplog.at_level(logging.WARNING, logger="app.modules.model_router.gemini_service"):
+        gemini_service._classify_gemini_failure(_client_error(500, "INTERNAL"))
+
+    for record in caplog.records:
+        assert "totally-fake-test-key-should-never-log" not in record.getMessage()
+
+
+def test_diagnostic_logging_does_not_change_classification_for_any_known_case() -> None:
+    """The existing, already-tested taxonomy must be byte-for-byte
+    unaffected by the new logging call — a pure additive side effect."""
+    cases = [
+        (_client_error(401, "UNAUTHENTICATED"), "authentication"),
+        (_client_error(404, "NOT_FOUND"), "model_unavailable"),
+        (_client_error(429, "RESOURCE_EXHAUSTED"), "rate_limited"),
+        (_server_error(503, "UNAVAILABLE"), "provider_unavailable"),
+        (_client_error(0, "SOME_FUTURE_STATUS"), "unknown_provider_error"),
+        (ValueError("bad response"), "unparseable_response"),
+    ]
+    for exc, expected in cases:
+        assert gemini_service._classify_gemini_failure(exc) == expected
+
+
+def test_unknown_error_remains_honestly_unknown_not_guessed() -> None:
+    """An exception with NO recognizable structured evidence at all
+    must still resolve to unknown_provider_error — never guessed into
+    a more specific, falsely-precise bucket merely because logging now
+    captures its class name."""
+
+    class _SomeNovelSDKException(Exception):
+        pass
+
+    assert gemini_service._classify_gemini_failure(_SomeNovelSDKException("mystery failure")) == "unknown_provider_error"
+
+
+def test_no_speculative_402_mapping_exists() -> None:
+    """Explicit, asserted proof the speculative 402->billing_or_credits
+    mapping from the earlier (unconfirmed) diagnosis was NOT added —
+    an HTTP 402 with no other recognizable signal still falls through
+    to the honest unknown_provider_error fallback, exactly like any
+    other unmapped code, until real evidence confirms otherwise."""
+    assert gemini_service._classify_gemini_failure(_client_error(402, "SOME_BILLING_STATUS")) == "unknown_provider_error"
+
+
 def test_ambiguous_429_documented_not_guessed_as_billing() -> None:
     """The one honestly-documented ambiguity (section 10): an
     undifferentiated 429 maps to rate_limited, never billing_or_credits
@@ -253,6 +379,147 @@ def test_generate_with_explicit_gemini_model_returns_plain_tuple(monkeypatch: py
     assert prompt_tokens == 10
     assert completion_tokens == 5
     assert latency_ms >= 0
+
+
+def test_call_gemini_forwards_max_output_tokens_to_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The exact mechanism a bounded-cost connectivity smoke test relies
+    on — confirms max_output_tokens actually reaches
+    GenerateContentConfig rather than being silently dropped."""
+    captured = {}
+
+    class _FakeModels:
+        def generate_content(self, *, model, contents, config):
+            captured["config"] = config
+            return _fake_gemini_response(text="pong")
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    monkeypatch.setattr(gemini_service, "_get_gemini_client", lambda: _FakeClient())
+
+    gemini_service._call_gemini("gemini-3.1-flash-lite", [{"role": "user", "content": "hi"}], max_output_tokens=16)
+    assert captured["config"].max_output_tokens == 16
+
+
+def test_call_gemini_omits_max_output_tokens_when_not_specified(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    class _FakeModels:
+        def generate_content(self, *, model, contents, config):
+            captured["config"] = config
+            return _fake_gemini_response(text="hi")
+
+    class _FakeClient:
+        models = _FakeModels()
+
+    monkeypatch.setattr(gemini_service, "_get_gemini_client", lambda: _FakeClient())
+
+    gemini_service._call_gemini("gemini-3.1-flash-lite", [{"role": "user", "content": "hi"}])
+    assert captured["config"] is None
+
+
+# ---- Checkpoint 5.7G: client object-lifetime regression ------------------
+#
+# Zero real provider calls. Does NOT mock `_call_gemini`/`_get_gemini_client`
+# at all — it lets the REAL google-genai client object lifecycle run,
+# intercepting only the actual network transport (several layers below
+# the SDK's own public API), so a genuine SDK/CPython object-lifetime
+# defect would surface exactly as it did during the real Checkpoint 5.7E
+# smoke test. This is what proves the fix, rather than merely asserting
+# a mock returns success.
+
+
+def _intercept_transport(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Patches httpx's own transport layer (below the SDK's retry/
+    request-building logic, above actual socket I/O) to immediately
+    raise a distinctive sentinel instead of ever opening a real
+    connection. Returns a dict the caller can inspect afterward to
+    confirm the transport was actually reached."""
+    import httpx._transports.default as transport_mod
+
+    captured: dict = {}
+
+    def _intercept(self, request):
+        captured["reached_transport"] = True
+        raise RuntimeError("SENTINEL-NO-REAL-NETWORK-IO")
+
+    monkeypatch.setattr(transport_mod.HTTPTransport, "handle_request", _intercept)
+    return captured
+
+
+def test_call_gemini_client_lifetime_regression(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The core Checkpoint 5.7F/5.7G regression: calling the real,
+    fixed `_call_gemini` must reach the real transport boundary (proving
+    the client stayed alive through the whole call) and must NEVER
+    raise the historical "Cannot send a request, as the client has been
+    closed." RuntimeError — it must instead surface our own sentinel
+    exception, proving execution got all the way to the transport
+    layer before anything was intercepted."""
+    monkeypatch.setattr(gemini_service.settings, "gemini_api_key", "test-key-lifetime-regression")
+    captured = _intercept_transport(monkeypatch)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        gemini_service._call_gemini(
+            "gemini-3.1-flash-lite",
+            [{"role": "user", "content": "Reply with exactly the word: pong"}],
+            max_output_tokens=16,
+        )
+
+    assert captured.get("reached_transport") is True
+    assert "SENTINEL-NO-REAL-NETWORK-IO" in str(exc_info.value)
+    assert "client has been closed" not in str(exc_info.value)
+
+
+def test_call_gemini_client_lifetime_regression_with_structured_contents_and_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same proof, exercising the richer call shape (tools + tool_choice
+    + system instruction) that a real orchestrator-style call would use
+    — confirms the fix holds regardless of which optional parameters
+    are populated, not just the bare-minimum shape."""
+    monkeypatch.setattr(gemini_service.settings, "gemini_api_key", "test-key-lifetime-regression")
+    captured = _intercept_transport(monkeypatch)
+
+    messages = [
+        {"role": "user", "content": "what's the weather"},
+        {"role": "assistant", "content": [TextBlock(text="let me check"), ToolUseBlock(id="call_1", name="get_weather", input={"location": "Cairo"})]},
+        {"role": "user", "content": [ToolResultBlock(tool_use_id="call_1", content='{"temp": 25}')]},
+    ]
+    tools = [{"name": "get_weather", "description": "desc", "input_schema": {"type": "object", "properties": {}}}]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        gemini_service._call_gemini(
+            "gemini-3.1-flash-lite", messages,
+            system="You are BAZRA.", tools=tools, tool_choice={"type": "any"},
+        )
+
+    assert captured.get("reached_transport") is True
+    assert "client has been closed" not in str(exc_info.value)
+
+
+def test_historical_chained_pattern_reproduces_the_original_defect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Documents, as a frozen historical record, the EXACT defective
+    pattern Checkpoint 5.7F diagnosed (`_get_gemini_client().models.
+    generate_content(...)` as one chained expression, with no local
+    variable holding the client alive) — confirming it genuinely does
+    reproduce the "client has been closed" RuntimeError, so the fix
+    above is proven against a real, demonstrated failure mode rather
+    than a hypothetical one. This does NOT call the current (fixed)
+    `_call_gemini` — it reconstructs the old inline shape directly, so
+    it cannot regress silently if `_call_gemini` itself changes shape
+    later; it exists purely as evidence, not as a guard on production
+    code. If this one ever stops reproducing the historical failure
+    (e.g. a future SDK version changes its internal cleanup behavior),
+    that is not itself a BAZRA regression — the real guard is the two
+    tests above."""
+    monkeypatch.setattr(gemini_service.settings, "gemini_api_key", "test-key-lifetime-regression")
+    _intercept_transport(monkeypatch)
+
+    from google.genai import types as genai_types
+
+    with pytest.raises(RuntimeError, match="client has been closed"):
+        gemini_service._get_gemini_client().models.generate_content(
+            model="gemini-3.1-flash-lite", contents="hi",
+            config=genai_types.GenerateContentConfig(max_output_tokens=16),
+        )
 
 
 def test_generate_with_explicit_gemini_model_makes_zero_aitrace_rows(db_session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
