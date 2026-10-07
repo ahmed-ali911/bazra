@@ -197,6 +197,7 @@ def _call_anthropic(
     system: str | None = None,
     tools: list[dict] | None = None,
     tool_choice: dict | None = None,
+    cacheable_system_prefix: str | None = None,
 ) -> Message:
     """The only function in this module that talks to the Anthropic SDK
     directly — everything else in complete() is boundary/bookkeeping
@@ -216,11 +217,41 @@ def _call_anthropic(
     not passed, so a caller that never passes it (every purpose except
     the primary chat call) sees byte-for-byte the same request shape
     as before this checkpoint.
+
+    cacheable_system_prefix (Checkpoint 5.7J) is additive and OPTIONAL —
+    omitted (every caller before this checkpoint, and every purpose
+    except chat_completion's own default-provider path) means
+    `system`/`tools` are sent EXACTLY as before: `system` as a bare
+    string, `tools` as the plain list with no `cache_control` key
+    anywhere. Only when explicitly supplied does this function instead:
+    (1) split `system` into TWO Anthropic content blocks — the supplied
+    prefix first, marked with `cache_control: {"type": "ephemeral"}`
+    (the SDK's own stable, non-beta `CacheControlEphemeralParam` —
+    confirmed via direct SDK introspection, not a deprecated beta
+    feature), then the caller's own `system` string (if any) as a
+    second, UNMARKED block — and (2) mark the LAST element of `tools`
+    (on a COPY, never mutating the caller's own list/dicts — tools may
+    be a shared module-level constant like chat_service._TOOLS_OFFERED)
+    with the same cache_control key, so the ENTIRE tools array becomes
+    one cached prefix (Anthropic's own documented semantics: a
+    breakpoint caches everything from the start of its own parameter UP
+    TO AND INCLUDING the marked block — tools and system are separate
+    top-level parameters, so each needs its own breakpoint to both be
+    cached). This changes ONLY caching metadata and request SHAPE — the
+    semantic text content sent is byte-for-byte identical either way
+    (see test_model_router.py's own structural-equivalence tests).
     """
     kwargs = {"model": model, "max_tokens": _MAX_TOKENS, "messages": _serialize_messages(messages)}
-    if system is not None:
+    if cacheable_system_prefix is not None:
+        system_blocks = [{"type": "text", "text": cacheable_system_prefix, "cache_control": {"type": "ephemeral"}}]
+        if system is not None:
+            system_blocks.append({"type": "text", "text": system})
+        kwargs["system"] = system_blocks
+    elif system is not None:
         kwargs["system"] = system
     if tools is not None:
+        if cacheable_system_prefix is not None and tools:
+            tools = [*tools[:-1], {**tools[-1], "cache_control": {"type": "ephemeral"}}]
         kwargs["tools"] = tools
     if tool_choice is not None:
         kwargs["tool_choice"] = tool_choice
@@ -249,16 +280,65 @@ def _extract_response_parts(message: Message) -> tuple[str | None, list[ToolUseB
     return text, tool_uses
 
 
-def _estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> Decimal | None:
+# Checkpoint 5.7J — Anthropic's own documented prompt-caching price
+# multipliers, relative to the SAME model's base input price already in
+# _COST_PER_MILLION_TOKENS_USD above (verified live against
+# platform.claude.com/docs/en/build-with-claude/prompt-caching at
+# implementation time, 2026-10-07 — not guessed from training data).
+# 5-minute cache writes: 1.25x base input. 1-hour cache writes: 2x base
+# input (BAZRA never requests the 1h TTL — see _call_anthropic's own
+# cache_control, which omits `ttl` and so gets the SDK's own "5m"
+# default — this constant is recorded for completeness/documentation
+# only, never read by any code path). Cache reads: 0.1x base input,
+# with two DOCUMENTED per-model exceptions in Anthropic's own pricing
+# page ("Claude Opus 5.5"/"Claude Sonnet 5.5" read at 0.05x, "Claude
+# Fable 5.1"/"Claude Mythos 5.1" at 0.025x) — neither "claude-sonnet-5"
+# nor "claude-haiku-4-5" (this table's own two keys) is one of those
+# four named exception models, so the general 0.1x multiplier is
+# applied to both; revisit this constant by hand if Anthropic's own
+# pricing page ever lists either of BAZRA's actual model strings among
+# the exceptions.
+_CACHE_WRITE_5M_MULTIPLIER = Decimal("1.25")
+_CACHE_READ_MULTIPLIER = Decimal("0.1")
+
+
+def _estimate_cost(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+) -> Decimal | None:
+    """cache_creation_input_tokens/cache_read_input_tokens both default
+    to 0 — every pre-5.7J caller omits them, producing the exact same
+    arithmetic as before this checkpoint (adding zero changes nothing).
+    When non-zero (an Anthropic call that used cacheable_system_prefix),
+    each of the four token categories is priced at its OWN documented
+    rate — never folded into `prompt_tokens` at the base rate, which
+    would silently misstate cost in both directions (overstating a
+    cache-read turn's cost, understating a cache-write turn's cost).
+    `prompt_tokens` here is the caller's own base/non-cached count only
+    (Anthropic's own `usage.input_tokens` — confirmed via official docs
+    to EXCLUDE both cache categories, summed separately) — see
+    complete()'s own docstring for what gets persisted to AiTrace.
+    """
     rates = _COST_PER_MILLION_TOKENS_USD.get(model)
     if rates is None:
         return None
-    return (Decimal(prompt_tokens) * rates["input"] + Decimal(completion_tokens) * rates["output"]) / Decimal(
-        1_000_000
-    )
+    base_input_cost = Decimal(prompt_tokens) * rates["input"]
+    cache_write_cost = Decimal(cache_creation_input_tokens) * rates["input"] * _CACHE_WRITE_5M_MULTIPLIER
+    cache_read_cost = Decimal(cache_read_input_tokens) * rates["input"] * _CACHE_READ_MULTIPLIER
+    output_cost = Decimal(completion_tokens) * rates["output"]
+    return (base_input_cost + cache_write_cost + cache_read_cost + output_cost) / Decimal(1_000_000)
 
 
-def _safe_estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) -> Decimal | None:
+def _safe_estimate_cost(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cache_creation_input_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+) -> Decimal | None:
     """A bad rate-table lookup is a bug in bookkeeping, not a failure of
     the model call — it must not prevent a successful call from
     returning to its caller or from being traced at all. Logs the
@@ -267,7 +347,7 @@ def _safe_estimate_cost(model: str, prompt_tokens: int, completion_tokens: int) 
     propagating.
     """
     try:
-        return _estimate_cost(model, prompt_tokens, completion_tokens)
+        return _estimate_cost(model, prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens)
     except Exception:
         logger.exception("model_router: cost estimation failed for model=%s", model)
         return None
@@ -406,6 +486,7 @@ def complete(
     correlation_id: str | None = None,
     tool_choice: dict | None = None,
     tier: IntelligenceTier | None = None,
+    cacheable_system_prefix: str | None = None,
 ) -> ModelResponse:
     """The only function other modules call to reach a model provider.
 
@@ -480,6 +561,25 @@ def complete(
       CALL's own outcome, but not with respect to independent tracing-
       infrastructure failures — that is a real, stated boundary, not an
       oversold guarantee.
+
+    cacheable_system_prefix (Checkpoint 5.7J) is additive and OPTIONAL,
+    forwarded to _call_anthropic verbatim — see that function's own
+    docstring for the exact request-shape change it causes. Omitted
+    (every caller before this checkpoint) means byte-for-byte the same
+    request as before. AiTrace/cost-accounting note: Anthropic's own
+    `usage.input_tokens` EXCLUDES both `cache_creation_input_tokens` and
+    `cache_read_input_tokens` (confirmed via official docs: `total_input
+    _tokens = cache_read_input_tokens + cache_creation_input_tokens +
+    input_tokens`) — this function therefore persists the SUM of all
+    three to AiTrace's existing `prompt_tokens` column (a meaningful
+    "how much input was processed" total, not a silent undercount),
+    while the per-category BREAKDOWN is exposed only on the returned
+    ModelResponse (cache_creation_input_tokens/cache_read_input_tokens
+    — same "observability only, never persisted" treatment as `tier`/
+    `stop_reason`). Durably storing the breakdown itself would need a
+    schema migration (two new nullable integer columns) — not performed
+    in this checkpoint; see this checkpoint's own required-output report
+    for the exact minimum schema change this would require.
     """
     if purpose not in VALID_PURPOSES:
         raise ValueError(f"Unknown purpose: {purpose!r}")
@@ -497,7 +597,10 @@ def complete(
     try:
         if not settings.anthropic_api_key:
             raise RuntimeError("ANTHROPIC_API_KEY is not configured")
-        raw = _call_anthropic(model, messages, system=system, tools=tools, tool_choice=tool_choice)
+        raw = _call_anthropic(
+            model, messages, system=system, tools=tools, tool_choice=tool_choice,
+            cacheable_system_prefix=cacheable_system_prefix,
+        )
     except Exception as exc:
         latency_ms = int((time.monotonic() - start) * 1000)
         category = _classify_failure(exc)
@@ -523,17 +626,29 @@ def complete(
     # success trace has been written yet at this point.
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    cache_creation_input_tokens = 0
+    cache_read_input_tokens = 0
     try:
         prompt_tokens = raw.usage.input_tokens
         completion_tokens = raw.usage.output_tokens
+        # Checkpoint 5.7J — both default to 0 via getattr: every
+        # pre-caching response (real or test-fake) simply lacks these
+        # attributes, and 0 is the correct, honest value when no
+        # caching was requested, not a guess.
+        cache_creation_input_tokens = getattr(raw.usage, "cache_creation_input_tokens", None) or 0
+        cache_read_input_tokens = getattr(raw.usage, "cache_read_input_tokens", None) or 0
         text, tool_uses = _extract_response_parts(raw)
     except Exception as exc:
         # prompt_tokens/completion_tokens survive from above even if the
         # failure happened on the _extract_text line — real,
         # already-incurred token/cost data is preserved here rather than
         # discarded, when it was actually available.
+        total_prompt_tokens = (
+            prompt_tokens + cache_creation_input_tokens + cache_read_input_tokens
+            if prompt_tokens is not None else None
+        )
         estimated_cost_usd = (
-            _safe_estimate_cost(model, prompt_tokens, completion_tokens)
+            _safe_estimate_cost(model, prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens)
             if prompt_tokens is not None and completion_tokens is not None
             else None
         )
@@ -544,7 +659,7 @@ def complete(
             purpose=purpose,
             status="error",
             latency_ms=latency_ms,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=total_prompt_tokens,
             completion_tokens=completion_tokens,
             estimated_cost_usd=estimated_cost_usd,
             error_summary=category,
@@ -555,14 +670,22 @@ def complete(
     # Boundary 3: the call succeeded and parsed cleanly. Cost estimation
     # and trace persistence each get their own failure boundary — if
     # either fails, the caller still gets their ModelResponse.
-    estimated_cost_usd = _safe_estimate_cost(model, prompt_tokens, completion_tokens)
+    #
+    # Checkpoint 5.7J — total_prompt_tokens (= base + cache-write +
+    # cache-read) is what's persisted to AiTrace's existing
+    # `prompt_tokens` column (see this function's own docstring for why
+    # this is a meaningful total, not a silent lie); estimated_cost_usd
+    # is computed from the three categories at their own correct rates,
+    # never a flat rate applied to the total.
+    total_prompt_tokens = prompt_tokens + cache_creation_input_tokens + cache_read_input_tokens
+    estimated_cost_usd = _safe_estimate_cost(model, prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens)
     if not _safe_record_trace(
         provider="anthropic",
         model=model,
         purpose=purpose,
         status="success",
         latency_ms=latency_ms,
-        prompt_tokens=prompt_tokens,
+        prompt_tokens=total_prompt_tokens,
         completion_tokens=completion_tokens,
         estimated_cost_usd=estimated_cost_usd,
         error_summary=None,
@@ -573,10 +696,15 @@ def complete(
     return ModelResponse(
         text=text,
         model=model,
-        prompt_tokens=prompt_tokens,
+        prompt_tokens=total_prompt_tokens,
         completion_tokens=completion_tokens,
         tool_uses=tool_uses,
         correlation_id=resolved_correlation_id,
+        # Checkpoint 5.7J — the per-category breakdown, observability
+        # only (see ModelResponse.cache_creation_input_tokens's own
+        # docstring).
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
         # Checkpoint 3.23 — exposed for Orchestrator's own defensive
         # exactly-one-tool-call cross-check (see generate_reply). Read
         # straight off the raw provider response, never persisted
@@ -620,6 +748,7 @@ def complete_with_explicit_provider(
     correlation_id: str | None = None,
     tier: IntelligenceTier | None = None,
     max_output_tokens: int | None = None,
+    cacheable_system_prefix: str | None = None,
 ) -> ModelResponse:
     """Checkpoint 5.7, section 20 — the ONE deliberate, explicit,
     traced path capable of reaching Gemini (or, symmetrically,
@@ -660,6 +789,16 @@ def complete_with_explicit_provider(
     _MAX_TOKENS, completely unchanged. Exists for a caller (e.g. a bounded
     connectivity smoke test) that wants a hard, small cost ceiling
     independent of whatever the model would naturally produce.
+
+    cacheable_system_prefix (Checkpoint 5.7J) is, symmetrically, passed
+    through to the Anthropic branch only — ignored for provider=
+    "google_gemini" (Gemini's own adapter never receives or reads it; no
+    cross-provider cache abstraction is introduced, per that
+    checkpoint's own explicit instruction). No real caller passes this
+    here today (chat_completion's own caching lives in complete()'s own
+    default path, not this explicit-provider one) — added for symmetry
+    with complete()'s own identical parameter, so a future Anthropic-
+    explicit caller does not require redesigning this signature again.
     """
     if provider not in VALID_PROVIDERS:
         raise ValueError(f"Unknown provider: {provider!r}")
@@ -678,7 +817,10 @@ def complete_with_explicit_provider(
         if provider == "anthropic":
             if not settings.anthropic_api_key:
                 raise RuntimeError("ANTHROPIC_API_KEY is not configured")
-            raw = _call_anthropic(model, messages, system=system, tools=tools, tool_choice=tool_choice)
+            raw = _call_anthropic(
+                model, messages, system=system, tools=tools, tool_choice=tool_choice,
+                cacheable_system_prefix=cacheable_system_prefix,
+            )
         else:
             if not settings.gemini_api_key:
                 raise RuntimeError("GEMINI_API_KEY is not configured")
@@ -710,19 +852,27 @@ def complete_with_explicit_provider(
     # success" semantics as complete()'s own boundary 2.
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    cache_creation_input_tokens = 0
+    cache_read_input_tokens = 0
     try:
         if provider == "anthropic":
             prompt_tokens = raw.usage.input_tokens
             completion_tokens = raw.usage.output_tokens
+            cache_creation_input_tokens = getattr(raw.usage, "cache_creation_input_tokens", None) or 0
+            cache_read_input_tokens = getattr(raw.usage, "cache_read_input_tokens", None) or 0
             text, tool_uses = _extract_response_parts(raw)
         else:
             prompt_tokens = raw.usage_metadata.prompt_token_count if raw.usage_metadata else 0
             completion_tokens = raw.usage_metadata.candidates_token_count if raw.usage_metadata else 0
             text, tool_uses = gemini_service._extract_response_parts_gemini(raw)
     except Exception as exc:
+        total_prompt_tokens = (
+            prompt_tokens + cache_creation_input_tokens + cache_read_input_tokens
+            if prompt_tokens is not None else None
+        )
         estimated_cost_usd = (
             (
-                _safe_estimate_cost(model, prompt_tokens, completion_tokens)
+                _safe_estimate_cost(model, prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens)
                 if provider == "anthropic"
                 else _safe_estimate_gemini_cost(model, prompt_tokens, completion_tokens)
             )
@@ -736,7 +886,7 @@ def complete_with_explicit_provider(
             purpose=purpose,
             status="error",
             latency_ms=latency_ms,
-            prompt_tokens=prompt_tokens,
+            prompt_tokens=total_prompt_tokens,
             completion_tokens=completion_tokens,
             estimated_cost_usd=estimated_cost_usd,
             error_summary=category,
@@ -746,8 +896,9 @@ def complete_with_explicit_provider(
 
     # Boundary 3: success — cost estimation and trace persistence each
     # get their own failure boundary, same guarantee as complete()'s own.
+    total_prompt_tokens = prompt_tokens + cache_creation_input_tokens + cache_read_input_tokens
     estimated_cost_usd = (
-        _safe_estimate_cost(model, prompt_tokens, completion_tokens)
+        _safe_estimate_cost(model, prompt_tokens, completion_tokens, cache_creation_input_tokens, cache_read_input_tokens)
         if provider == "anthropic"
         else _safe_estimate_gemini_cost(model, prompt_tokens, completion_tokens)
     )
@@ -757,7 +908,7 @@ def complete_with_explicit_provider(
         purpose=purpose,
         status="success",
         latency_ms=latency_ms,
-        prompt_tokens=prompt_tokens,
+        prompt_tokens=total_prompt_tokens,
         completion_tokens=completion_tokens,
         estimated_cost_usd=estimated_cost_usd,
         error_summary=None,
@@ -768,10 +919,12 @@ def complete_with_explicit_provider(
     return ModelResponse(
         text=text,
         model=model,
-        prompt_tokens=prompt_tokens,
+        prompt_tokens=total_prompt_tokens,
         completion_tokens=completion_tokens,
         tool_uses=tool_uses,
         correlation_id=resolved_correlation_id,
+        cache_creation_input_tokens=cache_creation_input_tokens,
+        cache_read_input_tokens=cache_read_input_tokens,
         stop_reason=getattr(raw, "stop_reason", None),
         tier=resolved_tier,
         provider=provider,

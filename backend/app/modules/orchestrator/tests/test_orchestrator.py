@@ -29,11 +29,12 @@ class _FakeModelResponse:
 def test_generate_reply_builds_correct_message_list_and_system_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
-    def _fake_complete(*, purpose, messages, system=None, tools=None):
+    def _fake_complete(*, purpose, messages, system=None, tools=None, cacheable_system_prefix=None, **_ignored):
         captured["purpose"] = purpose
         captured["messages"] = messages
         captured["system"] = system
         captured["tools"] = tools
+        captured["cacheable_system_prefix"] = cacheable_system_prefix
         return _FakeModelResponse(text="canned reply")
 
     monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
@@ -58,9 +59,15 @@ def test_generate_reply_builds_correct_message_list_and_system_prompt(monkeypatc
         {"role": "assistant", "content": "earlier answer"},
         {"role": "user", "content": "what's due today?"},
     ]
+    # Checkpoint 5.7J — the dynamic context/date live in `system`; the
+    # static identity+instructions block (previously part of this same
+    # string) now lives in the separate `cacheable_system_prefix`
+    # parameter — see test_generate_reply_default_path_cache_split_is_
+    # semantically_equivalent_to_pre_5_7j_prompt below for the proof
+    # that concatenating the two reproduces the exact pre-5.7J string.
     assert "Focus Today: nothing." in captured["system"]
     assert _ANCHOR in captured["system"]
-    assert "NO ability to edit, delete, mark complete" in captured["system"]
+    assert "NO ability to edit, delete, mark complete" in captured["cacheable_system_prefix"]
 
 
 def test_system_prompt_instructs_never_to_surface_internal_ids_in_prose(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -73,8 +80,9 @@ def test_system_prompt_instructs_never_to_surface_internal_ids_in_prose(monkeypa
     raw id in the model's user-facing natural-language reply."""
     captured = {}
 
-    def _fake_complete(*, purpose, messages, system=None, tools=None):
+    def _fake_complete(*, purpose, messages, system=None, tools=None, cacheable_system_prefix=None, **_ignored):
         captured["system"] = system
+        captured["cacheable_system_prefix"] = cacheable_system_prefix
         return _FakeModelResponse(text="canned reply")
 
     monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
@@ -84,16 +92,18 @@ def test_system_prompt_instructs_never_to_surface_internal_ids_in_prose(monkeypa
         current_datetime_local=_ANCHOR,
     )
 
-    system = captured["system"]
-    assert "never show one of these raw identifiers" in system
-    assert "task_id=N" in system  # names the exact annotation this forbids repeating
-    assert "by their title or name" in system
+    # Checkpoint 5.7J — this instruction text is part of the STATIC
+    # block (_SYSTEM_INSTRUCTIONS), now carried in cacheable_system_prefix.
+    static_system = captured["cacheable_system_prefix"]
+    assert "never show one of these raw identifiers" in static_system
+    assert "task_id=N" in static_system  # names the exact annotation this forbids repeating
+    assert "by their title or name" in static_system
 
 
 def test_generate_reply_with_tools_offered_returns_tool_call(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = {}
 
-    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None):
+    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None, **_ignored):
         captured["tools"] = tools
         captured["tool_choice"] = tool_choice
         return _FakeModelResponse(
@@ -126,7 +136,7 @@ def test_generate_reply_forces_the_primary_chat_tool_choice_when_tools_offered(
     every other additive parameter here already gets."""
     captured = {}
 
-    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None):
+    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None, **_ignored):
         captured["tool_choice"] = tool_choice
         return _FakeModelResponse(tool_uses=[_FakeToolUse("respond_with_text", {"kind": "answer", "text": "hi"})])
 
@@ -262,7 +272,7 @@ def test_generate_reply_tool_only_response_has_none_text(monkeypatch: pytest.Mon
 
 
 def test_generate_reply_wraps_model_router_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    def _raise(*, purpose, messages, system=None, tools=None):
+    def _raise(*, purpose, messages, system=None, tools=None, **_ignored):
         raise orchestrator_service.model_router_service.ModelRouterError("billing_or_credits")
 
     monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _raise)
@@ -1076,6 +1086,80 @@ def test_claim_verification_failed_is_not_an_orchestrator_error() -> None:
     502) — keeping the hierarchies separate makes conflating them a
     type error, not a silent bug."""
     assert not issubclass(orchestrator_service.ClaimVerificationFailed, orchestrator_service.OrchestratorError)
+
+
+# ---- Checkpoint 5.7J: prompt-caching structural equivalence --------------
+
+
+def test_static_and_dynamic_system_parts_concatenate_to_the_original_prompt() -> None:
+    """The hard semantic-equivalence requirement: splitting the system
+    prompt for caching must never change what Claude actually receives
+    when concatenated back together — byte-for-byte identical to
+    _build_system_prompt's own pre-5.7J single-string output."""
+    context = "Focus Today: nothing.\n\nLife Areas:\n- Work: 0 open"
+    static_part = orchestrator_service._build_static_system_instructions()
+    dynamic_part = orchestrator_service._build_dynamic_system_context(context, _ANCHOR)
+    combined = f"{static_part}\n{dynamic_part}"
+    assert combined == orchestrator_service._build_system_prompt(context, _ANCHOR)
+
+
+def test_static_system_instructions_contains_identity_and_orchestration_rules() -> None:
+    static_part = orchestrator_service._build_static_system_instructions()
+    assert "You are BAZRA" in static_part
+    assert "never show one of these raw identifiers" in static_part
+
+
+def test_dynamic_system_context_contains_only_date_and_data_never_identity() -> None:
+    dynamic_part = orchestrator_service._build_dynamic_system_context("Focus Today: nothing.", _ANCHOR)
+    assert _ANCHOR in dynamic_part
+    assert "Focus Today: nothing." in dynamic_part
+    assert "You are BAZRA" not in dynamic_part
+    assert "never show one of these raw identifiers" not in dynamic_part
+
+
+def test_generate_reply_default_path_builds_cache_split_system(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def _fake_complete(**kwargs):
+        captured.update(kwargs)
+        return _FakeModelResponse(text="hi")
+
+    monkeypatch.setattr(orchestrator_service.model_router_service, "complete", _fake_complete)
+
+    orchestrator_service.generate_reply(
+        history=[], context="Focus Today: nothing.", user_message="hi", current_datetime_local=_ANCHOR,
+    )
+
+    assert captured["cacheable_system_prefix"] == orchestrator_service._build_static_system_instructions()
+    assert captured["system"] == orchestrator_service._build_dynamic_system_context("Focus Today: nothing.", _ANCHOR)
+
+
+def test_generate_reply_gemini_test_path_uses_full_single_string_system_no_caching(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Checkpoint 5.7J, section 8: Gemini Test mode is completely
+    untouched by caching — the explicit-provider branch must still pass
+    the FULL, single-string _build_system_prompt output, with NO
+    cacheable_system_prefix parameter at all (not even None-valued —
+    genuinely absent from the call, so a fake with a strict signature
+    that doesn't accept it still works, proving the call shape is
+    byte-for-byte what 5.7H originally established)."""
+    captured = {}
+
+    def _fake_complete_with_explicit_provider(*, provider, model, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None, tier=None, max_output_tokens=None):
+        captured["provider"] = provider
+        captured["system"] = system
+        return _FakeModelResponse(text="pong")
+
+    monkeypatch.setattr(
+        orchestrator_service.model_router_service, "complete_with_explicit_provider", _fake_complete_with_explicit_provider
+    )
+
+    orchestrator_service.generate_reply(
+        history=[], context="Focus Today: nothing.", user_message="hi", current_datetime_local=_ANCHOR,
+        provider="google_gemini", model="gemini-3.1-flash-lite",
+    )
+
+    assert captured["provider"] == "google_gemini"
+    assert captured["system"] == orchestrator_service._build_system_prompt("Focus Today: nothing.", _ANCHOR)
 
 
 def test_orchestrator_never_imports_a_write_capable_service_function() -> None:

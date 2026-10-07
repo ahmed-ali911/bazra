@@ -157,3 +157,18 @@ class ModelResponse:
     # unchanged); complete_with_explicit_provider (new in 5.7) sets it
     # to whichever provider was explicitly requested.
     provider: ModelProvider = "anthropic"
+    # Checkpoint 5.7J — prompt-caching token breakdown, provider-neutral
+    # naming (not "anthropic_cache_*") per that checkpoint's own
+    # instruction, since a future provider could in principle report
+    # the same concept differently. Both default to 0 — the correct,
+    # honest value for: (a) every call made before this checkpoint,
+    # (b) every Gemini call (the adapter never requests or reports
+    # caching — "Zero is acceptable for providers that do not report/
+    # use these fields," this field's own design brief, applied
+    # literally), and (c) any Anthropic call that didn't request
+    # caching at all (cacheable_system_prefix omitted). Exposed here
+    # for observability/tests only — same "never persisted to AiTrace"
+    # treatment as `tier`/`stop_reason` above; see complete()'s own
+    # docstring for exactly what IS and is NOT durably stored, and why.
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0

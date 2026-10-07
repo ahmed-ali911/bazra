@@ -286,18 +286,51 @@ class OrchestratorContractViolationError(OrchestratorError):
         Exception.__init__(self, f"{reason} (tool_call_count={tool_call_count})")
 
 
+def _build_static_system_instructions() -> str:
+    """Checkpoint 5.7J — extracted, byte-for-byte, from what
+    _build_system_prompt's own first two lines already concatenated
+    (identity + orchestration rules) — the STATIC portion of the chat
+    system prompt: identical on every ordinary chat_completion turn,
+    regardless of context/history/current message (confirmed: this
+    checkpoint's own audit, 5.7I, measured these two blocks' real
+    content and found zero per-turn variation). This is the ONE
+    function chat_completion's own caching (see generate_reply) marks
+    as the cacheable Anthropic prompt prefix. Nothing about its TEXT
+    CONTENT changes from this extraction — see
+    test_orchestrator.py's own structural-equivalence test proving
+    `_build_static_system_instructions() + "\\n" +
+    _build_dynamic_system_context(...) == _build_system_prompt(...)`
+    byte-for-byte.
+    """
+    return f"{BAZRA_IDENTITY_INSTRUCTIONS}\n{_SYSTEM_INSTRUCTIONS}"
+
+
+def _build_dynamic_system_context(context: str, current_datetime_local: str) -> str:
+    """Checkpoint 5.7J — the DYNAMIC remainder of the chat system
+    prompt: current date/time and Context Assembly's own per-turn
+    output (tasks/calendar/life-areas/memory/pending-state — all
+    already baked into `context` by chat_service before this is
+    called). Genuinely changes turn to turn (new date/time at minimum,
+    and real task/event state as it changes) — never marked cacheable.
+    """
+    return f"## Current date/time\n{current_datetime_local}\n\n## Current Data\n{context}"
+
+
 def _build_system_prompt(context: str, current_datetime_local: str) -> str:
     """Identity/personality (who BAZRA is, Checkpoint 3.5) comes first,
     establishing character before the operational tool-use/data rules —
     then the existing turn-specific rules, then the current instant, then
     the retrieved data itself.
+
+    Checkpoint 5.7J: now composed from _build_static_system_instructions()
+    + _build_dynamic_system_context(...) — a single source of truth for
+    each half, so the two can never silently drift apart. This
+    function's own return value is unchanged, byte-for-byte, from
+    before that checkpoint; it remains the ONE path Gemini Test mode
+    uses (see generate_reply's own explicit-provider branch), and the
+    reference value for structural-equivalence tests.
     """
-    return (
-        f"{BAZRA_IDENTITY_INSTRUCTIONS}\n"
-        f"{_SYSTEM_INSTRUCTIONS}\n"
-        f"## Current date/time\n{current_datetime_local}\n\n"
-        f"## Current Data\n{context}"
-    )
+    return f"{_build_static_system_instructions()}\n{_build_dynamic_system_context(context, current_datetime_local)}"
 
 
 # Checkpoint 3.23 — the primary chat call's own fixed policy: always
@@ -384,7 +417,6 @@ def generate_reply(
     complete_kwargs = {
         "purpose": "chat_completion",
         "messages": messages,
-        "system": _build_system_prompt(context, current_datetime_local),
         "tools": tools,
     }
     if tools:
@@ -399,11 +431,32 @@ def generate_reply(
     # repeating the assignment here.
     try:
         if provider is not None and model is not None:
+            # Checkpoint 5.7J — the explicit-provider branch (Gemini
+            # Test mode today) ALWAYS gets the full, single-string
+            # system prompt, exactly as before this checkpoint — no
+            # caching parameter, no request-shape change. Caching is
+            # scoped to the DEFAULT (Anthropic) path only, per that
+            # checkpoint's own explicit "do not introduce a cross-
+            # provider cache abstraction" instruction.
             response = model_router_service.complete_with_explicit_provider(
-                provider=provider, model=model, **complete_kwargs
+                provider=provider, model=model,
+                system=_build_system_prompt(context, current_datetime_local),
+                **complete_kwargs,
             )
         else:
-            response = model_router_service.complete(**complete_kwargs)
+            # Checkpoint 5.7J — the default path's own prompt-caching
+            # wiring: the static identity+orchestration block is passed
+            # as cacheable_system_prefix (marked with cache_control by
+            # _call_anthropic), and only the genuinely dynamic
+            # date/context remainder is passed as `system`. Concatenated
+            # together these are byte-for-byte identical to
+            # _build_system_prompt's own single-string return value —
+            # see test_orchestrator.py's own structural-equivalence test.
+            response = model_router_service.complete(
+                system=_build_dynamic_system_context(context, current_datetime_local),
+                cacheable_system_prefix=_build_static_system_instructions(),
+                **complete_kwargs,
+            )
     except model_router_service.ModelRouterError as exc:
         raise OrchestratorError(exc.category) from exc
 

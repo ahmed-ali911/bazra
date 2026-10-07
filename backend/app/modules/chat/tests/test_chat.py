@@ -2386,8 +2386,9 @@ def test_identity_and_personality_instructions_reach_a_real_chat_turns_system_pr
 
     captured = {}
 
-    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None):
+    def _fake_complete(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None, cacheable_system_prefix=None, **_ignored):
         captured["system"] = system
+        captured["cacheable_system_prefix"] = cacheable_system_prefix
         # Checkpoint 3.23: the real (unmocked) generate_reply now
         # requires exactly one tool_use — respond_with_text stands in
         # for "just an ordinary answer" here, the same remapping
@@ -2404,14 +2405,18 @@ def test_identity_and_personality_instructions_reach_a_real_chat_turns_system_pr
     response = _send(authenticated_client, "hi")
     assert response.status_code == 200
 
-    system_prompt = captured["system"]
-    assert "You are BAZRA" in system_prompt
-    assert "BAZRA's assistant" not in system_prompt
+    # Checkpoint 5.7J — identity/personality instructions are part of
+    # the STATIC block, now carried in cacheable_system_prefix rather
+    # than the `system` string itself (see generate_reply's own default
+    # path).
+    static_system_prompt = captured["cacheable_system_prefix"]
+    assert "You are BAZRA" in static_system_prompt
+    assert "BAZRA's assistant" not in static_system_prompt
     assert (
         "You never identify yourself as Claude, ChatGPT, Gemini, Anthropic, "
-        "OpenAI, or any other underlying provider or model, by name" in system_prompt
+        "OpenAI, or any other underlying provider or model, by name" in static_system_prompt
     )
-    assert "Never claim consciousness or subjective feelings" in system_prompt
+    assert "Never claim consciousness or subjective feelings" in static_system_prompt
 
 
 # ---- Checkpoint 3.7: get_weather — BAZRA's first External Read Tool --------------

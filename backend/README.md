@@ -2162,6 +2162,113 @@ a Gemini-vs-Claude benchmark (Checkpoint 5.8, not started), claim-verifier
 provider selection (stays Anthropic-only), a persisted/global provider
 preference, and Google Search grounding.
 
+### Checkpoint 5.7I — Context & Cost Efficiency Audit
+
+A read-only forensic audit (zero provider calls, zero code changes) of why
+an ordinary Default Chat turn costs ~11K generation input tokens. Finding:
+~77–78% of every turn's raw content is fixed/static (identity + orchestration
+instructions + the full 10-tool JSON schema catalog), resent unconditionally
+on every turn regardless of relevance — Context Assembly, memory,
+pending-state, history, and the user's own message together are only
+~22–23%. The full 10-tool catalog alone is ~41–42% of input tokens, 9 of
+which were irrelevant to the two casual turns actually measured. Also found:
+`ChatMessage` has no `source`/`kind` column, so proactive-narration-authored
+messages are indistinguishable from genuine replies once persisted, and get
+resent as chat history indefinitely. No optimization was performed — this
+audit is the baseline Checkpoint 5.7J acts on.
+
+### Checkpoint 5.7J — Anthropic Prompt Caching
+
+Caches the static portion of ordinary (Default, non-Gemini-Test)
+`chat_completion` requests — the single largest, evidenced opportunity from
+5.7I's own audit — using Anthropic's current, stable (non-beta)
+`cache_control: {"type": "ephemeral"}` mechanism (confirmed via direct SDK
+introspection: `anthropic==1.11.0`, `CacheControlEphemeralParam`,
+`ToolParam`/`TextBlockParam` both natively support it; `system` natively
+accepts `Union[str, Iterable[TextBlockParam]]`).
+
+**What's cached**: `orchestrator_service._build_static_system_instructions()`
+(BAZRA's identity + orchestration instructions — ~14,637 chars, ~88% of the
+cacheable opportunity) as a dedicated, `cache_control`-marked system block,
+plus the full tool catalog (marking only the LAST tool — Anthropic's own
+documented semantics cache everything in a parameter up to and including the
+marked block). **What's never cached**: current date/time, Context Assembly's
+own per-turn output, active memory, pending-proposal state, conversation
+history, and the current user message — all explicitly dynamic, all still
+sent fresh, unmarked, every turn. The default 5-minute TTL is used (no `ttl`
+specified) — sufficient for active back-to-back conversation turns, without
+retaining anything longer than necessary.
+
+**Mechanism**: `_build_system_prompt` is now composed from two extracted
+sub-functions (`_build_static_system_instructions` +
+`_build_dynamic_system_context`) with **zero change to its own return
+value** — a structural-equivalence test proves the concatenation is
+byte-for-byte identical to the pre-5.7J single string. `generate_reply`'s
+default path passes the static half as a new, optional
+`cacheable_system_prefix` parameter (threaded through `complete()`/
+`complete_with_explicit_provider()`/`_call_anthropic()`, defaulting to
+`None` everywhere — every pre-5.7J caller, and every purpose except
+chat_completion's own default path, is provably byte-identical to before).
+**Gemini Test mode is completely untouched**: its own branch still builds
+and sends the full, single-string `_build_system_prompt(...)` with no
+caching parameter at all — no cross-provider cache abstraction was
+introduced, confirmed by a structural test that `gemini_service.py` contains
+neither the string `cacheable_system_prefix` nor `cache_control` anywhere.
+
+**Per-purpose analysis** (section 7 of this checkpoint's own brief):
+`chat_completion` → **ENABLED** (primary target, by far the largest static
+share). `claim_verification` → **LEAVE UNCHANGED** (tiny ~880-char fixed
+prompt; caching overhead isn't worth it, and this checkpoint's own default
+preference was to leave the verifier untouched). `tool_result_reasoning` →
+**NOT BENEFICIAL** (its own narrow system prompt is deliberately small and
+offers no tools at all). `proactive_narration` → **NOT BENEFICIAL** (its own
+system prompt is separately small and bounded, unrelated to
+`_SYSTEM_INSTRUCTIONS`).
+
+**Cost accounting**: Anthropic's own documented multipliers (verified live,
+2026-10-07) — 5-minute cache writes at 1.25× base input price, cache reads
+at 0.1× — applied per-category, never a flat rate on the combined total
+(confirmed via official docs: `total_input_tokens = cache_read_input_tokens +
+cache_creation_input_tokens + input_tokens`, three genuinely disjoint
+categories). **No migration**: AiTrace's existing `prompt_tokens` column now
+stores the TOTAL (base + cache-write + cache-read) — a meaningful total, not
+a silent undercount — while the per-category breakdown is exposed only on
+`ModelResponse.cache_creation_input_tokens`/`cache_read_input_tokens`
+(defaulting to 0 for every provider/call that doesn't use caching, including
+every Gemini call), the same "observability only, never persisted" treatment
+already established for `tier`/`stop_reason`. **The exact minimum schema
+change that WOULD be needed for durable, per-category storage** (reported,
+not applied): two new nullable integer columns on `AiTrace`,
+`cache_creation_input_tokens` and `cache_read_input_tokens`.
+
+**Failure semantics unchanged**: a provider failure with caching requested
+classifies through the exact same 5.1 taxonomy, with no new fallback and no
+hidden retry (tested directly — exactly one call attempt, cache hit or
+miss or failure).
+
+**Testing**: 23 new tests — 18 in `model_router/tests/test_prompt_caching.py`
+(request-shape with/without caching, tools list/dict never mutated in
+place, frozen synthetic cost arithmetic for all four token categories, real
+AiTrace accounting, no-fallback/no-hidden-retry, Gemini/verifier
+untouched) + 5 in `orchestrator/tests/test_orchestrator.py` (structural
+equivalence, default-path cache wiring, Gemini-Test-path unaffected). 6
+pre-existing tests across `orchestrator/`, `chat/`, and `attention/` needed
+their own fixed-signature fakes extended to accept the new optional
+`cacheable_system_prefix` keyword (zero production-behavior change; purely
+a test-double update, the exact same class of fix 5.3's own checkpoint
+already established precedent for). Full regression: backend full suite run
+twice (1556 passed both times, up from the 1533 baseline), frontend suite
+unaffected (123 passed), `tsc -b && vite build` clean. **Real Anthropic
+calls: 0. Real Gemini calls: 0.**
+
+**Not in this checkpoint**: an actual real-provider cache-hit smoke test
+(requires separate explicit approval — the next, final step), durable
+per-category AiTrace storage (needs the migration reported above),
+conversation-history caching (deliberately out of scope — see 5.7I's own
+audit for why this is riskier given proactive-narration messages can be
+interleaved into history), and any change to Gemini, the claim verifier, or
+production routing.
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1

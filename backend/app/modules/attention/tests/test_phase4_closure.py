@@ -111,7 +111,7 @@ class _FakeModelResponse:
         self.stop_reason = stop_reason if stop_reason is not None else ("tool_use" if tool_uses else "end_turn")
 
 
-def _fake_complete_for_ordinary_chat(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None):
+def _fake_complete_for_ordinary_chat(*, purpose, messages, system=None, tools=None, tool_choice=None, correlation_id=None, **_ignored):
     if purpose == "claim_verification":
         return _FakeModelResponse(
             tool_uses=[ToolUseBlock(id="t1", name="certify_claim", input={"claims_bazra_mutation_completed": False})]
