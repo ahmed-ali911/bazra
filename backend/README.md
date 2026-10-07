@@ -2269,6 +2269,166 @@ audit for why this is riskier given proactive-narration messages can be
 interleaved into history), and any change to Gemini, the claim verifier, or
 production routing.
 
+### Checkpoint 5.8A — Provider Evidence Benchmark: Frozen Exam Design
+
+**Design only — zero real provider calls (Anthropic: 0, Gemini: 0), zero
+production routing/prompt/personality changes.** Builds the frozen exam a
+future, separately-approved execution checkpoint will run to answer "which
+intelligence resource is the cheapest PROVEN SUFFICIENT resource for each
+class of BAZRA workload" — explicitly not "which model is best overall,"
+and explicitly not itself a routing decision (section 25's own boundary:
+benchmark evidence produces a recommendation; a separate, Ahmed-approved
+checkpoint performs any routing change).
+
+**New package**: `evals/benchmarks/provider_evidence_*.py` (nine modules,
+all under the existing `evals/` offline-only package — never imported by
+`app/`, confirmed by a dedicated isolation test alongside the existing
+`evals/tests/test_isolation.py`).
+
+- **`provider_evidence_schemas.py`** — the case contract (section 13):
+  `ProviderEvidenceCase` (case_id/version/family/language/user_message/
+  synthetic_context/conversation_history/available_tools/expected_behavior/
+  forbidden_behavior/hard_checks/human_review_dimensions/
+  expected_resource_class/tags/is_control/pairs_with, plus one necessary
+  addition — `check_parameters`, the per-case deterministic-check inputs)
+  and `CandidateGeneration` (text/tool_name/tool_arguments — the one
+  provider-neutral shape every future real-or-replayed generation reduces
+  to, mirroring `OrchestratorResult`'s own two-part shape without importing
+  it). Deliberately separate from `evals.schemas.EvaluationCase` (the 5.4
+  generic contract, reused unchanged) and `evals.benchmarks.schemas` (the
+  5.5 real-generation-run contract, also unchanged).
+- **`provider_evidence_cases.py`** — 26 frozen cases across all twelve
+  workload families (section 10, A-L: casual/social, emotional/low-energy,
+  clear action request, ambiguous action, local fact/retrieval,
+  personal context use, complex reasoning, instruction following, factual
+  restraint, BAZRA self-description, humor/lightness, complex tool/action
+  interpretation), including both of the brief's own named contrastive
+  pairs (section 11: "أنا زهقان." vs "...اديني 3 حاجات أعملهم."؛ "فكرني
+  أكلم حسين بكرة." vs "ممكن أفكر أكلم حسين بكرة.") plus a third pair (family
+  K: an appropriate-for-humor case paired with a serious, humor-inappropriate
+  one, per section 10.K's own instruction). Two `LOCAL_FACT_RETRIEVAL`
+  cases are marked `is_control=True` with `available_tools=()` and
+  `expected_resource_class="ZERO_LLM"` — Checkpoint 5.2's own accepted
+  deterministic-retrieval architecture means these are proven structurally
+  (a code-path fact), never by spending real provider-call budget to
+  "confirm" an existing guarantee. All names/context are synthetic,
+  independently invented for this module (never Ahmed's real data) — a
+  dedicated test asserts no real name/email and no provider/model identity
+  leaks into any candidate-facing field.
+- **`provider_evidence_checks.py`** — deterministic hard checks (section
+  8). Reuses eight existing 5.4/5.6 checks verbatim where their own
+  facts/candidate contract already fits (`check_mutation_claim`,
+  `check_action_confirmation_shaped_v2`, `check_internal_id_leakage`,
+  `check_internal_architecture_terms`, `check_invented_date`,
+  `check_invented_priority`, `check_on_topic_v3`, `check_unsupported_history`)
+  — imported, never copied. Adds six new checks this benchmark's own
+  families actually need and that didn't exist anywhere in `evals/`:
+  `check_required_tool_selected`/`check_no_action_attempted` (tool-selection
+  authority checks — no prior suite's candidate was ever a tool-call
+  decision), `check_forbidden_phrase_absent` (family J's module-enumeration
+  guard), `check_no_plan_dump`/`check_line_count_constraint` (family H's
+  "متدينيش خطة"/"سطرين بس" instruction-following), and
+  `check_explicit_language_instruction_followed` (family H's "بالإنجليزي"
+  — deliberately a separate implementation from `grounding_v3`'s own
+  title-script check, a different concept). `check_unsupported_mood`
+  (proactive_narration.py) was deliberately NOT reused — it fires on any
+  mood-attribution phrasing, correct for narration's "never infer mood"
+  rule but a guaranteed false positive on Chat replies to a user who just
+  stated their own mood (exactly family B's cases). `CHECK_REGISTRY` maps
+  every check by name; `build_evaluation_case` is the tested (but
+  unused-in-5.8A) seam a future execution checkpoint will reuse rather
+  than inventing one under real-call time pressure.
+- **`provider_evidence_rubric.py`** — the frozen human-review rubric
+  (section 9): six subjective dimensions (`read_the_room`,
+  `egyptian_arabic_naturalness`, `bazra_identity_fit`, `restraint`,
+  `warmth`, `humor_fit`), each with concrete 1-5 anchors, never averaged
+  into one personality score. Carries `ATTRIBUTION_CAVEAT` verbatim
+  (section 5/20): a low score describes (model, BAZRA's CURRENT frozen
+  personality contract) as a pair, never a permanent claim about the
+  provider alone.
+- **`provider_evidence_plan.py`** + **`provider_evidence_discriminator_subset.py`**
+  — the staged execution plan (section 17: Stage 1 discriminator set →
+  Stage 2 full qualified set → Stage 3 targeted tiebreakers, capped at 36
+  extra calls worst-case) and the frozen 8-case discriminator subset
+  (covering 8 of the 12 families, including both hard-gate authority cases
+  and the 5.5-regression-class factual-restraint case). Call budgets are
+  **computed from the frozen case set**, never hand-typed — a dedicated
+  test proves `full_design_budget()` and `discriminator_design_budget()`
+  stay correct if the case set ever changes.
+- **`provider_evidence_cost_methodology.py`** — frozen BEFORE execution
+  (section 18/19). Duplicates (never imports) the real, already-reviewed
+  Anthropic/Gemini per-million-token pricing constants, with a dedicated
+  drift-detection test comparing them against
+  `model_router/service.py`/`gemini_service.py` directly. Four explicit
+  cache-fairness rules (`CACHE_FAIRNESS_RULES`): quality comparisons never
+  cite cost; a single-call economic comparison uses Anthropic's
+  **uncached** estimate (neither a proven write nor a proven hit without
+  context); a session/multi-turn comparison reports **both** the
+  cache-write and steady-state cache-read figures next to Gemini's own
+  flat figure — never only one or the other, which would make either
+  provider look artificially cheap. Gemini's own caching economics are
+  stated as `"UNKNOWN"` (not locally configured/investigated), never
+  assumed in either direction, per section 28's own instruction not to
+  invent unconfirmed pricing.
+- **`provider_evidence_decision_policy.py`** — section 24/25's rules as a
+  tested predicate: `is_proven_sufficient` (a hard-gate failure or an
+  unresolved ambiguity is disqualifying regardless of cost — cost is
+  never part of the sufficiency test) and `cheapest_sufficient` (prefers
+  the cheapest candidate only among those already proven sufficient,
+  returns `None` honestly when nothing qualifies). `ROUTING_CHANGE_BOUNDARY`
+  states plainly that nothing here may ever modify `app/`'s own routing —
+  structurally enforced by the same import-isolation test as every other
+  module here.
+- **`provider_evidence_blind_review.py`** — section 22's blind-review
+  design: `blind_slot_order` is a **deterministic, frozen shuffle**
+  (sha256-keyed by case_id, not runtime randomness — section 22's own
+  explicit preference), so a reviewer never learns "slot A is always
+  Gemini" across cases; `slot_labels` are plain "Response A/B/C," identity
+  revealed only after scoring is recorded.
+
+**Call budget** (section 28, all computed from the frozen case set — see
+`provider_evidence_plan.py`'s own tests): **FULL DESIGN = 144 real
+generation calls** (24 non-control cases: 12 at 3 reps for
+subjective/nondeterminism-sensitive cases + 12 at 1 rep for
+structural/tool-selection-dominant cases, × 3 candidates —
+`claude-sonnet-5`, `claude-haiku-4-5`, `gemini-3.1-flash-lite`).
+**REDUCED DISCRIMINATOR DESIGN (Stage 1 only) = 24 real generation calls**
+(8 cases × 1 rep × 3 candidates). The two `ZERO_LLM` control cases are
+excluded from both figures by design (proven structurally, not by
+spending call budget). Rough cost estimate (representative ~9,596-prompt/
+~76-completion token shape, taken directly from the real Checkpoint 5.7K
+smoke test, not fetched fresh from any provider): full design ≈ **$1.56
+uncached-worst-case** / ≈ **$0.39 cached-best-case** (Anthropic legs only
+benefit if calls land inside overlapping 5-minute cache windows); reduced
+discriminator design ≈ **$0.26** / ≈ **$0.09**. Both are planning
+estimates, not billing-accurate, and **no provider pricing was fetched
+live to produce them** (section 28's own instruction).
+
+**Testing**: 62 new tests across 8 files under
+`evals/benchmarks/tests/test_provider_evidence_*.py` — fixture schema
+validity, unique case IDs, frozen version, valid family/resource-class,
+every hard check registered, every subjective dimension anchored 1-5,
+available-tools-is-a-subset-of-production, ZERO_LLM controls correctly
+shaped, contrastive pairs mutually reference each other, no real
+personal data, no provider/model identity leakage, every new check
+exercised against hand-written synthetic candidate text (zero model/
+network calls), call-budget arithmetic proven to derive from the frozen
+case set, pricing-drift detection against production constants, decision-
+policy sufficiency rules, blind-review shuffle determinism, and the same
+"zero AiTrace rows" / "no provider/network/db import" structural proofs
+every existing `evals/` module already carries. Full regression: backend
+full suite green (1556 passed, unchanged from the 5.7J baseline — this
+checkpoint adds eval-only, offline modules and touches no production
+code path), frontend untouched. **Real Anthropic calls: 0. Real Gemini
+calls: 0.**
+
+**Not in this checkpoint** (explicitly deferred to a future, separately
+approved execution checkpoint): running any case against any real
+provider, argument-level tool-call correctness checks (today's
+`check_required_tool_selected` proves tool NAME only, a documented blind
+spot), any routing change, any BAZRA personality/prompt change, and any
+Gemini context-caching investigation (stated `UNKNOWN`, not solved here).
+
 ## Phase 4 — Attention & Proactivity
 
 ### Checkpoint 4.1
