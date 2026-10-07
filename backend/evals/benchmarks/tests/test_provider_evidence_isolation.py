@@ -18,6 +18,8 @@ from evals.benchmarks import (
     provider_evidence_cost_methodology,
     provider_evidence_decision_policy,
     provider_evidence_discriminator_subset,
+    provider_evidence_interpretation,
+    provider_evidence_ledger,
     provider_evidence_plan,
     provider_evidence_rubric,
     provider_evidence_schemas,
@@ -33,6 +35,8 @@ _DESIGN_ONLY_MODULES = (
     provider_evidence_decision_policy,
     provider_evidence_blind_review,
     provider_evidence_discriminator_subset,
+    provider_evidence_interpretation,
+    provider_evidence_ledger,
 )
 
 _FORBIDDEN_IMPORT_SUBSTRINGS = (
